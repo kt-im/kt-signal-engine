@@ -7424,6 +7424,7 @@ const RECEIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 /// KT (pre-keys gate, §29.6): 接收流拨号前 pre-keys 注册的等待上限。正常
 /// 注册亚秒级（服务器计数 ≥10 时零上传仅一次计数查询），30s 覆盖慢网 +
 /// §29.6 WsClosing 重试链（2×500ms）+ 一次完整重拨，超时不再死等。
+#[allow(dead_code)]
 const PREKEYS_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// KT (pre-keys gate, §29.6): 闸结局 —— `Registered` = 注册完成放行；

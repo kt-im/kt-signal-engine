@@ -53,6 +53,9 @@ pub struct OutgoingPushMessages {
     pub timestamp: u64,
     pub messages: Vec<OutgoingPushMessage>,
     pub online: bool,
+    /// Ask the server to wake the destination with a push notification.
+    /// Signal-Desktop sets this for the contact-sync request.
+    pub urgent: bool,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -586,6 +589,7 @@ where
                 timestamp,
                 messages,
                 online: false,
+                urgent: false,
             })
             .await?;
 
@@ -785,6 +789,29 @@ where
     async fn try_send_message(
         &mut self,
         recipient: ServiceId,
+        unidentified_access: Option<&UnidentifiedAccess>,
+        story: Option<&SenderCertificate>,
+        content_body: &ContentBody,
+        timestamp: u64,
+        include_pni_signature: bool,
+        online: bool,
+    ) -> SendMessageResult {
+        self.try_send_message_with_urgency(
+            recipient,
+            unidentified_access,
+            story,
+            content_body,
+            timestamp,
+            include_pni_signature,
+            online,
+            false,
+        )
+        .await
+    }
+
+    async fn try_send_message_with_urgency(
+        &mut self,
+        recipient: ServiceId,
         mut unidentified_access: Option<&UnidentifiedAccess>,
         // KT fork (stories): story 发送模式。Some = sealed sender 加密用该
         // sender certificate（不派生 UAK 头）、经 `?story=true` 传输面分发；
@@ -795,6 +822,7 @@ where
         timestamp: u64,
         include_pni_signature: bool,
         online: bool,
+        urgent: bool,
     ) -> SendMessageResult {
         trace!("trying to send a message");
 
@@ -838,6 +866,7 @@ where
                 timestamp,
                 messages,
                 online,
+                urgent,
             };
 
             let send_started = std::time::Instant::now();
@@ -1089,7 +1118,7 @@ where
             debug!(
                 "sending multi-device sync message with content {content:?}"
             );
-            self.try_send_message(
+            self.try_send_message_with_urgency(
                 self.local_aci.into(),
                 None,
                 None,
@@ -1097,6 +1126,7 @@ where
                 timestamp,
                 false,
                 false,
+                true,
             )
             .await?;
         }
