@@ -1931,14 +1931,29 @@ fn build_sync_request(
 /// 一腿补齐为官方三腿；每腿独立 best-effort（官方 Promise.all 一损俱损，
 /// 引擎零 stderr 纪律下逐腿尽力——sync 请求幂等，失败靠下次链路建立重补）。
 async fn send_initial_sync_requests(manager: &mut Manager<SqliteStore, Registered>) {
-    let _ = manager.request_contacts().await;
+    if let Err(error) = manager.request_contacts().await {
+        tracing::warn!(
+            target: "engine.receive",
+            stage = "initial_sync_contacts_request_failed",
+            error = %error,
+            "contacts sync request failed"
+        );
+    }
     let own_aci = ServiceId::Aci(manager.registration_data().service_ids.aci.into());
     for r#type in [
         presage::proto::sync_message::request::Type::Configuration,
         presage::proto::sync_message::request::Type::Blocked,
     ] {
         let body = ContentBody::SynchronizeMessage(build_sync_request(r#type));
-        let _ = manager.send_message(own_aci, body, now_ms()).await;
+        if let Err(error) = manager.send_message(own_aci, body, now_ms()).await {
+            tracing::warn!(
+                target: "engine.receive",
+                stage = "initial_sync_request_failed",
+                request = ?r#type,
+                error = %error,
+                "sync request send failed"
+            );
+        }
     }
 }
 
