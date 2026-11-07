@@ -102,6 +102,17 @@ impl EventStoreRegistry {
     }
 }
 
+pub(crate) async fn enqueue_duplicate(
+    pool: &SqlitePool,
+    epoch: i64,
+    sender: &str,
+    timestamp: u64,
+    payload: &str,
+) -> Result<i64, sqlx::Error> {
+    let key = crate::outbox_model::duplicate_dedupe_key(sender, timestamp);
+    enqueue(pool, epoch, &key, payload).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +139,12 @@ mod tests {
         assert!(!confirm(&pool, seq).await.unwrap());
         assert!(pull(&pool, 1, 0, 10).await.unwrap().is_empty());
         assert!(pull(&pool, 2, 0, 10).await.unwrap().is_empty());
+        let d = enqueue_duplicate(&pool, 1, "aci", 42, "[]").await.unwrap();
+        assert_eq!(
+            enqueue_duplicate(&pool, 1, "aci", 42, "[]").await.unwrap(),
+            d
+        );
+        assert_eq!(pull(&pool, 1, 0, 10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
