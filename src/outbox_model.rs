@@ -1,0 +1,78 @@
+//! E: protocol outbox semantics before persistence.
+//! seq is assigned in-order; dedupe_key is unique; confirm only moves forward.
+
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutboxRow {
+    pub seq: u64,
+    pub epoch: u64,
+    pub dedupe_key: String,
+    pub payload: String,
+    pub confirmed: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct OutboxModel {
+    next_seq: u64,
+    rows: BTreeMap<u64, OutboxRow>,
+}
+
+impl OutboxModel {
+    pub(crate) fn enqueue(&mut self, epoch: u64, dedupe_key: &str, payload: &str) -> u64 {
+        if let Some(existing) = self.rows.values().find(|row| row.dedupe_key == dedupe_key) {
+            return existing.seq;
+        }
+        self.next_seq += 1;
+        let seq = self.next_seq;
+        self.rows.insert(
+            seq,
+            OutboxRow {
+                seq,
+                epoch,
+                dedupe_key: dedupe_key.to_string(),
+                payload: payload.to_string(),
+                confirmed: false,
+            },
+        );
+        seq
+    }
+
+    pub(crate) fn confirm(&mut self, seq: u64) -> bool {
+        match self.rows.get_mut(&seq) {
+            Some(row) if !row.confirmed => {
+                row.confirmed = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn pull_unconfirmed(&self, after: u64, limit: usize) -> Vec<OutboxRow> {
+        self.rows
+            .range(after.saturating_add(1)..)
+            .filter(|(_, row)| !row.confirmed)
+            .take(limit)
+            .map(|(_, row)| row.clone())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbox_sequences_dedupes_confirms_and_pulls() {
+        let mut outbox = OutboxModel::default();
+        assert_eq!(outbox.enqueue(1, "a", "{}"), 1);
+        assert_eq!(outbox.enqueue(1, "a", "{}"), 1);
+        assert_eq!(outbox.enqueue(1, "b", "{}"), 2);
+        assert_eq!(outbox.pull_unconfirmed(0, 10).len(), 2);
+        assert!(outbox.confirm(1));
+        assert!(!outbox.confirm(1));
+        let rest = outbox.pull_unconfirmed(0, 10);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].seq, 2);
+    }
+}

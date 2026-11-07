@@ -35,6 +35,8 @@ mod history;
 mod jsonrpc;
 mod logfile;
 mod methods;
+#[allow(dead_code)]
+mod outbox_model;
 mod proto;
 mod service;
 mod state;
