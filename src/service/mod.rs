@@ -7657,6 +7657,7 @@ async fn serve_account_stream(
     // （纪律终止收流、拨号挂 30s、断连循环 450+ 次/日）。根修：presage
     // account_manager 改为复用活动 WS（registered.rs account_manager 传
     // require_unused=false），不再拨第二条——维护恢复默认开启。
+    let envelope_probe_until = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut maint_at = Some(tokio::time::Instant::now() + Duration::from_millis(0));
     // prekey 快速巡检（P12/R4）：30min 时间触发 + 200 信封量触发的低水位
     // 快速路径——长连接内 prekey 耗尽的发现窗从 2 天（maintenance_tick）
@@ -7934,6 +7935,43 @@ async fn serve_account_stream(
             item = stream.next() => {
                 // S2a 打点：信封级到达起点（ack 前逐臂落 RECEIVE_ENVELOPE）。
                 let envelope_started = std::time::Instant::now();
+                // Bounded link-window probe: type + server timestamp only.
+                if tokio::time::Instant::now() < envelope_probe_until {
+                    let (kind, server_ts) = match &item {
+                        Some(Received::Content(content, _)) => (
+                            "content",
+                            Some(content.metadata.client_timestamp.timestamp_millis()),
+                        ),
+                        Some(Received::Contacts(sync, _)) => (
+                            "contacts",
+                            Some(sync.content.metadata.client_timestamp.timestamp_millis()),
+                        ),
+                        Some(Received::IdentityChange(_, content, _)) => (
+                            "identity_change",
+                            Some(content.metadata.client_timestamp.timestamp_millis()),
+                        ),
+                        Some(Received::Duplicate(content, _)) => (
+                            "duplicate",
+                            Some(content.metadata.client_timestamp.timestamp_millis()),
+                        ),
+                        Some(Received::DecryptionError(_, ts, _, _)) => {
+                            ("decryption_error", ts.map(|v| v as i64))
+                        }
+                        Some(Received::QueueEmpty) => ("queue_empty", None),
+                        Some(Received::GroupSyncFailed { .. }) => ("group_sync_failed", None),
+                        None => ("stream_end", None),
+                    };
+                    let now = now_ms() as i64;
+                    tracing::warn!(
+                        target: "engine.receive",
+                        stage = "receive_envelope_probe",
+                        kind,
+                        server_ts = server_ts.unwrap_or(-1),
+                        now_ms = now,
+                        delta_ms = server_ts.map(|ts| now - ts).unwrap_or(-1),
+                        "receive envelope probe"
+                    );
+                }
                 // A1 观测：该账号接收在飞置 1（离开臂体含提前 return 自动归 0）。
                 let _inflight = account_metrics::ReceiveInflight::enter(number);
                 match item {
