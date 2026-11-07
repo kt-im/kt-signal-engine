@@ -141,6 +141,28 @@ impl DuplicateOutbox for SqliteDuplicateOutbox {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct MemoryDuplicateOutbox {
+    rows: tokio::sync::Mutex<std::collections::HashMap<String, i64>>,
+}
+
+impl DuplicateOutbox for MemoryDuplicateOutbox {
+    fn enqueue_duplicate<'a>(
+        &'a self,
+        _epoch: i64,
+        sender: &'a str,
+        timestamp: u64,
+        _payload: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<i64, sqlx::Error>> {
+        Box::pin(async move {
+            let key = crate::outbox_model::duplicate_dedupe_key(sender, timestamp);
+            let mut rows = self.rows.lock().await;
+            let next = rows.len() as i64 + 1;
+            Ok(*rows.entry(key).or_insert(next))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +195,13 @@ mod tests {
             d
         );
         assert_eq!(pull(&pool, 1, 0, 10).await.unwrap().len(), 1);
+        let memory = MemoryDuplicateOutbox::default();
+        let m1 = memory.enqueue_duplicate(1, "aci", 7, "[]").await.unwrap();
+        assert_eq!(
+            memory.enqueue_duplicate(1, "aci", 7, "[]").await.unwrap(),
+            m1
+        );
+
         let writer = SqliteDuplicateOutbox { pool: pool.clone() };
         let seq = writer.enqueue_duplicate(1, "aci", 7, "[]").await.unwrap();
         assert_eq!(
