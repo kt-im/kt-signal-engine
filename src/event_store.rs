@@ -88,4 +88,20 @@ mod tests {
         assert!(pull(&pool, 1, 0, 10).await.unwrap().is_empty());
         assert!(pull(&pool, 2, 0, 10).await.unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn outbox_survives_reopen() {
+        let path = std::env::temp_dir().join(format!("kt-events-{}.db", std::process::id()));
+        std::fs::File::create(&path).unwrap();
+        let url = format!("sqlite://{}", path.display());
+        let seq = {
+            let pool = open(&url).await.unwrap();
+            enqueue(&pool, 1, "persist", "{}").await.unwrap()
+        };
+        let pool = open(&url).await.unwrap();
+        assert_eq!(pull(&pool, 1, 0, 10).await.unwrap().len(), 1);
+        assert!(confirm(&pool, seq).await.unwrap());
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
 }
