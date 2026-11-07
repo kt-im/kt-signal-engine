@@ -21,6 +21,13 @@ use crate::{
     error::SqlxErrorExt,
 };
 
+fn log_slow_store_op(op: &'static str, phase: &'static str, started: std::time::Instant) {
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if elapsed_ms >= 1_000 {
+        tracing::warn!(stage = "slow_store_op", op, phase, elapsed_ms, "slow store operation");
+    }
+}
+
 impl ContentsStore for SqliteStore {
     type ContentsStoreError = SqliteStoreError;
 
@@ -111,9 +118,13 @@ impl ContentsStore for SqliteStore {
         thread: &Thread,
         content: Content,
     ) -> Result<(), Self::ContentsStoreError> {
+        let begin_started = std::time::Instant::now();
         let mut tx = self.db.begin().await?;
+        log_slow_store_op("save_message", "begin", begin_started);
         save_message_on_tx(&mut tx, thread, content).await?;
+        let commit_started = std::time::Instant::now();
         tx.commit().await?;
+        log_slow_store_op("save_message", "commit", commit_started);
         Ok(())
     }
 
@@ -123,12 +134,16 @@ impl ContentsStore for SqliteStore {
         &self,
         messages: Vec<(Thread, Content)>,
     ) -> Result<(), Self::ContentsStoreError> {
+        let begin_started = std::time::Instant::now();
         let mut tx = self.db.begin().await?;
+        log_slow_store_op("save_messages", "begin", begin_started);
         for (thread, content) in messages {
             save_outbox_on_tx(&mut tx, &thread, &content).await?;
             save_message_on_tx(&mut tx, &thread, content).await?;
         }
+        let commit_started = std::time::Instant::now();
         tx.commit().await?;
+        log_slow_store_op("save_messages", "commit", commit_started);
         Ok(())
     }
 
@@ -247,7 +262,9 @@ impl ContentsStore for SqliteStore {
         let avatar_bytes = contact.avatar.as_ref().map(|a| a.reader.to_vec());
         let phone_number = contact.phone_number.as_ref().map(|p| p.to_string());
 
+        let begin_started = std::time::Instant::now();
         let mut tx = self.db.begin().await?;
+        log_slow_store_op("save_contact", "begin", begin_started);
 
         query!(
             "INSERT OR REPLACE INTO contacts
