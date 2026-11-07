@@ -99,9 +99,22 @@ impl OutboxModel {
     }
 }
 
+pub(crate) fn duplicate_dedupe_key(sender: &str, timestamp: u64) -> String {
+    format!("dup:{sender}:{timestamp}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_key_is_stable_and_identity_scoped() {
+        assert_eq!(duplicate_dedupe_key("aci-a", 42), "dup:aci-a:42");
+        assert_ne!(
+            duplicate_dedupe_key("aci-a", 42),
+            duplicate_dedupe_key("aci-b", 42)
+        );
+    }
 
     #[test]
     fn outbox_sequences_dedupes_confirms_and_pulls() {
