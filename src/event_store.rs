@@ -75,6 +75,27 @@ pub(crate) async fn open_account(
     open(&url).await
 }
 
+#[derive(Default)]
+pub(crate) struct EventStoreRegistry {
+    pools: tokio::sync::Mutex<std::collections::HashMap<String, SqlitePool>>,
+}
+
+impl EventStoreRegistry {
+    pub(crate) async fn get(
+        &self,
+        data_dir: &std::path::Path,
+        account: &str,
+    ) -> Result<SqlitePool, sqlx::Error> {
+        let mut pools = self.pools.lock().await;
+        if let Some(pool) = pools.get(account) {
+            return Ok(pool.clone());
+        }
+        let pool = open_account(data_dir, account).await?;
+        pools.insert(account.to_string(), pool.clone());
+        Ok(pool)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +133,18 @@ mod tests {
         let pool = open_account(&dir, "acct-1").await.unwrap();
         assert_eq!(pull(&pool, 1, 0, 10).await.unwrap().len(), 1);
         drop(pool);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn registry_reuses_same_pool() {
+        let dir = std::env::temp_dir().join(format!("kt-events-reg-{}", std::process::id()));
+        let registry = EventStoreRegistry::default();
+        let a = registry.get(&dir, "a").await.unwrap();
+        let b = registry.get(&dir, "a").await.unwrap();
+        assert_eq!(a.size(), b.size());
+        drop(a);
+        drop(b);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
