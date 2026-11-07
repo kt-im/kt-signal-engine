@@ -61,6 +61,20 @@ pub(crate) async fn pull(
     .await
 }
 
+pub(crate) async fn open_account(
+    data_dir: &std::path::Path,
+    account: &str,
+) -> Result<SqlitePool, sqlx::Error> {
+    let dir = data_dir.join("kt-events");
+    std::fs::create_dir_all(&dir).map_err(sqlx::Error::Io)?;
+    let path = dir.join(format!("{account}.db"));
+    if !path.exists() {
+        std::fs::File::create(&path).map_err(sqlx::Error::Io)?;
+    }
+    let url = format!("sqlite://{}", path.display());
+    open(&url).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +101,18 @@ mod tests {
         assert!(!confirm(&pool, seq).await.unwrap());
         assert!(pull(&pool, 1, 0, 10).await.unwrap().is_empty());
         assert!(pull(&pool, 2, 0, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_db_path_is_isolated() {
+        let dir = std::env::temp_dir().join(format!("kt-events-dir-{}", std::process::id()));
+        let pool = open_account(&dir, "acct-1").await.unwrap();
+        enqueue(&pool, 1, "a", "{}").await.unwrap();
+        drop(pool);
+        let pool = open_account(&dir, "acct-1").await.unwrap();
+        assert_eq!(pull(&pool, 1, 0, 10).await.unwrap().len(), 1);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
