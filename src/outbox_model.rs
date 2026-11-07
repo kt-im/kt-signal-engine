@@ -56,6 +56,19 @@ impl OutboxModel {
             .map(|(_, row)| row.clone())
             .collect()
     }
+
+    pub(crate) fn pull_unconfirmed_for_epoch(
+        &self,
+        epoch: u64,
+        after: u64,
+        limit: usize,
+    ) -> Vec<OutboxRow> {
+        self.pull_unconfirmed(after, usize::MAX)
+            .into_iter()
+            .filter(|row| row.epoch == epoch)
+            .take(limit)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -81,5 +94,7 @@ mod tests {
             .pull_unconfirmed(0, 10)
             .iter()
             .all(|row| row.seq != 1));
+        assert_eq!(outbox.pull_unconfirmed_for_epoch(1, 0, 10).len(), 1);
+        assert!(outbox.pull_unconfirmed_for_epoch(2, 0, 10).is_empty());
     }
 }
