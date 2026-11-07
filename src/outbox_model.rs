@@ -74,5 +74,12 @@ mod tests {
         let rest = outbox.pull_unconfirmed(0, 10);
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].seq, 2);
+
+        // Duplicate after confirm: same seq, still confirmed, no new row.
+        assert_eq!(outbox.enqueue(1, "a", "{}"), 1);
+        assert!(outbox
+            .pull_unconfirmed(0, 10)
+            .iter()
+            .all(|row| row.seq != 1));
     }
 }
