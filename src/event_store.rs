@@ -113,6 +113,34 @@ pub(crate) async fn enqueue_duplicate(
     enqueue(pool, epoch, &key, payload).await
 }
 
+pub(crate) trait DuplicateOutbox: Send + Sync {
+    fn enqueue_duplicate<'a>(
+        &'a self,
+        epoch: i64,
+        sender: &'a str,
+        timestamp: u64,
+        payload: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<i64, sqlx::Error>>;
+}
+
+pub(crate) struct SqliteDuplicateOutbox {
+    pub(crate) pool: SqlitePool,
+}
+
+impl DuplicateOutbox for SqliteDuplicateOutbox {
+    fn enqueue_duplicate<'a>(
+        &'a self,
+        epoch: i64,
+        sender: &'a str,
+        timestamp: u64,
+        payload: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<i64, sqlx::Error>> {
+        Box::pin(
+            async move { enqueue_duplicate(&self.pool, epoch, sender, timestamp, payload).await },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +173,12 @@ mod tests {
             d
         );
         assert_eq!(pull(&pool, 1, 0, 10).await.unwrap().len(), 1);
+        let writer = SqliteDuplicateOutbox { pool: pool.clone() };
+        let seq = writer.enqueue_duplicate(1, "aci", 7, "[]").await.unwrap();
+        assert_eq!(
+            writer.enqueue_duplicate(1, "aci", 7, "[]").await.unwrap(),
+            seq
+        );
     }
 
     #[tokio::test]
