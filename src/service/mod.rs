@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use presage::libsignal_service::configuration::{Endpoint, ServiceCredentials, SignalServers};
-use presage::libsignal_service::content::ContentBody;
+use presage::libsignal_service::content::{Content, ContentBody, Metadata};
 use presage::libsignal_service::prelude::PushService;
-use presage::libsignal_service::protocol::{IdentityKeyPair, ServiceId};
+use presage::libsignal_service::protocol::{DeviceId, IdentityKeyPair, ServiceId};
 use presage::libsignal_service::provisioning::{
     link_device, NewDeviceRegistration, SecondaryDeviceProvisioning,
 };
@@ -2199,6 +2199,33 @@ impl Service {
     /// 账号许可耗尽时等待该账号帧被 writer 写出（单账号背压，不阻塞其他
     /// 账号）；writer 死亡返回 false（调用方按 fire-and-forget 纪律忽略，
     /// ack 安全性由 flush 栅栏兜底）。
+    /// E: reconstruct a duplicate from the presage receive outbox and project
+    /// it outside the receive manager lock.
+    pub(crate) async fn replay_duplicate(
+        self: &Arc<Self>,
+        account: &str,
+        dedupe_key: &str,
+    ) -> Option<Vec<Value>> {
+        let dir = {
+            let state = self.state.lock().await;
+            let rel = state.account_dir(account)?;
+            self.data_dir.join(rel)
+        };
+        let store = open_store(&dir).await.ok()?;
+        let (body, sender, metadata_json) = store.kt_outbox_get(dedupe_key).await.ok()??;
+        let content = reconstruct_outbox_content(&body, &sender, &metadata_json)?;
+        Some(
+            project_content(
+                account,
+                &store,
+                &content,
+                &self.terminated_groups,
+                Some(self),
+            )
+            .await,
+        )
+    }
+
     /// E: lazily open the per-account kt-events outbox pool.
     #[allow(dead_code)] // receive wiring lands next
     pub(crate) async fn event_pool(&self, account: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
@@ -8341,6 +8368,59 @@ async fn project_verified_sync(
 /// 逐条外发）。
 /// S2a 打点薄壳：投影阶段时长（RECEIVE_PROJECT；函数体在
 /// [`project_content_inner`] 原样未动——只测不改，控制流零变化）。
+fn reconstruct_outbox_content(body: &[u8], sender: &str, metadata_json: &str) -> Option<Content> {
+    use prost::Message as _;
+    let meta: Value = serde_json::from_str(metadata_json).ok()?;
+    let sender_id = ServiceId::parse_from_service_id_string(sender)?;
+    let destination = meta
+        .get("destination")
+        .and_then(Value::as_str)
+        .and_then(ServiceId::parse_from_service_id_string)
+        .unwrap_or(sender_id);
+    let sender_device = meta
+        .get("senderDevice")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .and_then(|value| DeviceId::new(value).ok())?;
+    let client_timestamp = meta
+        .get("clientTimestamp")
+        .and_then(Value::as_i64)
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .unwrap_or_else(chrono::Utc::now);
+    let server_timestamp = meta
+        .get("serverTimestamp")
+        .and_then(Value::as_i64)
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .unwrap_or(client_timestamp);
+    let metadata = Metadata {
+        sender: sender_id,
+        destination,
+        sender_device,
+        pni_verified: None,
+        client_timestamp,
+        server_timestamp,
+        needs_receipt: meta
+            .get("needsReceipt")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        unidentified_sender: meta
+            .get("unidentifiedSender")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        was_plaintext: meta
+            .get("wasPlaintext")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        server_guid: None,
+        story: None,
+        ephemeral: None,
+        urgent: None,
+        report_spam_token: None,
+    };
+    let proto = presage::proto::Content::decode(body).ok()?;
+    Content::from_proto(proto, metadata).ok()
+}
+
 async fn project_content(
     account: &str,
     store: &SqliteStore,
@@ -22913,6 +22993,44 @@ mod tests {
     /// B4 Unbound 停环：建流错误归型——Unauthorized 两层归型面（直接
     /// ServiceError 与 sender 再包层）判 Unbound；404 NotFound / 其他
     /// presage 错误不误报（维持退避重连，send_error_of 同纪律）。
+    #[test]
+    fn reconstruct_outbox_content_roundtrips_null_message() {
+        use chrono::TimeZone;
+        let sender = ServiceId::Aci(uuid::Uuid::from_u128(7).into());
+        let ts = chrono::Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        let content = Content::from_body(
+            ContentBody::NullMessage(presage::proto::NullMessage::default()),
+            Metadata {
+                sender,
+                destination: sender,
+                sender_device: DeviceId::new(1).unwrap(),
+                pni_verified: None,
+                client_timestamp: ts,
+                server_timestamp: ts,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+                story: None,
+                ephemeral: None,
+                urgent: None,
+                report_spam_token: None,
+            },
+        );
+        let body = prost::Message::encode_to_vec(&content.body.clone().into_proto());
+        let metadata = serde_json::json!({
+            "sender": content.metadata.sender.service_id_string(),
+            "destination": content.metadata.destination.service_id_string(),
+            "senderDevice": 1,
+            "clientTimestamp": 1_700_000_000_000i64,
+            "serverTimestamp": 1_700_000_000_000i64,
+        })
+        .to_string();
+        let restored = reconstruct_outbox_content(&body, &sender.service_id_string(), &metadata)
+            .expect("reconstructed");
+        assert!(matches!(restored.body, ContentBody::NullMessage(_)));
+    }
+
     #[test]
     fn connection_state_notification_reports_4401_without_unlink() {
         let value = connection_state_notification("acct", "invalidated", Some(4401));

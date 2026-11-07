@@ -3043,6 +3043,20 @@ async fn dispatch(
                 Err(error) => phone_lookup_error(id, &error),
             }
         }
+        // receive.replay（KT 扩展）：按 dedupe key 从 presage receive outbox
+        // 重建 Content 并投影；供 connector 消费 Duplicate recovery marker。
+        "receive.replay" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(key) = params.get("dedupeKey").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.replay_duplicate(account, key).await {
+                Some(rows) => jsonrpc::success_response(id, Value::Array(rows)),
+                None => internal_error(id),
+            }
+        }
         // profiles.refreshContacts（联系人 profile 名字材料刷新，KT 扩展
         // 方法，2026-10-16 profile 名字刷新批，wire additive，engine-compat，
         // §5 块）：params `{account}`（无逐联系人物品参数——目标集恒由
