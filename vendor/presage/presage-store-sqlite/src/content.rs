@@ -1055,6 +1055,12 @@ mod test {
             .fetch_one(&store.db)
             .await?;
         assert_eq!(outbox, 3, "each batch item gets one outbox marker");
+        let key = format!("{}:{}", sender.service_id_string(), 1_700_000_000_000i64);
+        let row = store.kt_outbox_get(&key).await?;
+        assert!(row.is_some(), "outbox row must be readable by dedupe key");
+        let (body, row_sender) = row.unwrap();
+        assert!(!body.is_empty());
+        assert_eq!(row_sender, sender.service_id_string());
 
         Ok(())
     }

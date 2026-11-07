@@ -37,6 +37,20 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// E: read a receive-outbox marker written by save_messages.
+    pub async fn kt_outbox_get(
+        &self,
+        dedupe_key: &str,
+    ) -> Result<Option<(Vec<u8>, String)>, SqliteStoreError> {
+        sqlx::query_as(
+            "SELECT content, sender FROM kt_outbox WHERE dedupe_key=?1",
+        )
+        .bind(dedupe_key)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn open(
         url: &str,
         trust_new_identities: OnNewIdentity,
