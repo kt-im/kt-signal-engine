@@ -2199,6 +2199,14 @@ impl Service {
     /// 账号许可耗尽时等待该账号帧被 writer 写出（单账号背压，不阻塞其他
     /// 账号）；writer 死亡返回 false（调用方按 fire-and-forget 纪律忽略，
     /// ack 安全性由 flush 栅栏兜底）。
+    /// E: lazily open the per-account kt-events outbox pool.
+    #[allow(dead_code)] // receive wiring lands next
+    pub(crate) async fn event_pool(&self, account: &str) -> Result<sqlx::SqlitePool, sqlx::Error> {
+        crate::event_store::global()
+            .get(&self.data_dir, account)
+            .await
+    }
+
     /// Mark a receive-terminal account. 401/403 is device-unlinked, not a
     /// recoverable transport failure; keep it until a fresh link clears it.
     pub(crate) fn mark_terminal_account(&self, account: &str) {

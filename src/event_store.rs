@@ -75,6 +75,12 @@ pub(crate) async fn open_account(
     open(&url).await
 }
 
+static REGISTRY: std::sync::OnceLock<EventStoreRegistry> = std::sync::OnceLock::new();
+
+pub(crate) fn global() -> &'static EventStoreRegistry {
+    REGISTRY.get_or_init(EventStoreRegistry::default)
+}
+
 #[derive(Default)]
 pub(crate) struct EventStoreRegistry {
     pools: tokio::sync::Mutex<std::collections::HashMap<String, SqlitePool>>,
