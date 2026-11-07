@@ -59,6 +59,10 @@ pub(crate) struct AccountEntry {
     pub number: String,
     /// presage store 目录（相对 --data-dir）；fake 账号为 None。
     pub dir: Option<String>,
+    /// Official postRegistrationSyncsComplete: the three link-time sync
+    /// requests are sent once per registration, not once per process start.
+    #[serde(default)]
+    pub post_registration_syncs_complete: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,7 +162,11 @@ impl EngineState {
 
     pub(crate) fn add_account(&mut self, number: String, dir: Option<String>) -> io::Result<()> {
         self.accounts.retain(|existing| existing.number != number);
-        self.accounts.push(AccountEntry { number, dir });
+        self.accounts.push(AccountEntry {
+            number,
+            dir,
+            post_registration_syncs_complete: false,
+        });
         self.persist()
     }
 
@@ -173,6 +181,30 @@ impl EngineState {
             self.persist()?;
         }
         Ok(removed)
+    }
+
+    pub(crate) fn post_registration_syncs_complete(&self, account: &str) -> bool {
+        self.accounts
+            .iter()
+            .find(|entry| entry.number == account)
+            .is_some_and(|entry| entry.post_registration_syncs_complete)
+    }
+
+    pub(crate) fn mark_post_registration_syncs_complete(
+        &mut self,
+        account: &str,
+    ) -> io::Result<()> {
+        if let Some(entry) = self
+            .accounts
+            .iter_mut()
+            .find(|entry| entry.number == account)
+        {
+            if !entry.post_registration_syncs_complete {
+                entry.post_registration_syncs_complete = true;
+                self.persist()?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn accounts(&self) -> &[AccountEntry] {
@@ -560,6 +592,44 @@ mod tests {
         assert!(
             !dir.join(ACCOUNTS_DIR).join(QUARANTINE_DIR).exists(),
             "加载阶段不得移动/隔离任何目录"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Official postRegistrationSyncsComplete: persisted across restarts and
+    /// reset when the account is linked again.
+    #[test]
+    fn post_registration_syncs_status_persists_and_resets_on_new_link() {
+        let dir = temp_dir("post-registration-syncs");
+        let mut state = EngineState::load(&dir).expect("first run");
+        state
+            .add_account("+15550001111".into(), Some("lk-sync".into()))
+            .expect("add");
+        assert!(!state.post_registration_syncs_complete("+15550001111"));
+        state
+            .mark_post_registration_syncs_complete("+15550001111")
+            .expect("mark");
+        assert!(state.post_registration_syncs_complete("+15550001111"));
+        drop(state);
+
+        let state = EngineState::load(&dir).expect("reload");
+        assert!(
+            state.post_registration_syncs_complete("+15550001111"),
+            "completion must survive restart"
+        );
+        drop(state);
+
+        let mut state = EngineState::load(&dir).expect("reload for relink");
+        state
+            .remove_account("+15550001111")
+            .expect("remove")
+            .expect("account existed");
+        state
+            .add_account("+15550001111".into(), Some("lk-sync".into()))
+            .expect("relink");
+        assert!(
+            !state.post_registration_syncs_complete("+15550001111"),
+            "new link must start incomplete"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

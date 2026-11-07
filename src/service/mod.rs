@@ -7621,12 +7621,17 @@ async fn serve_account_stream(
     // 库=官方链接设备同款）；群会话完整性由本批登录期 manifest 自动拉补
     // （同一时机带，见 sync 臂体）。
     let forced_initial_sync = take_forced_initial_sync(number);
+    let post_registration_syncs_complete = {
+        let state = service.state.lock().await;
+        state.post_registration_syncs_complete(number)
+    };
     // Official order: syncRequests are sent when the authenticated socket is
     // ready, before the receive queue starts. The deferred select arm below
     // still owns manifest/profile completion; the request itself must not
     // wait for a timer that a busy receive stream can starve.
     let early_sync_sent = if forced_initial_sync
-        || initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64))
+        || (!post_registration_syncs_complete
+            && initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64)))
     {
         // Never hold the receive loop on a slow sync-request send. Official
         // sends the three requests exactly once per auth socket; the deferred
@@ -7641,7 +7646,8 @@ async fn serve_account_stream(
         false
     };
     let mut sync_pending = if forced_initial_sync
-        || initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64))
+        || (!post_registration_syncs_complete
+            && initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64)))
     {
         Some(tokio::time::Instant::now() + Duration::from_secs(2))
     } else {
@@ -8018,6 +8024,17 @@ async fn serve_account_stream(
                     }
                     if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
+                    }
+                    if sync.complete {
+                        let mut state = service.state.lock().await;
+                        if let Err(error) = state.mark_post_registration_syncs_complete(number) {
+                            tracing::warn!(
+                                target: "engine.receive",
+                                stage = "post_registration_syncs_persist_failed",
+                                %error,
+                                "failed to persist post-registration sync completion"
+                            );
+                        }
                     }
                     record_receive_envelope(number, envelope_started);
                     ack.ack();
@@ -23754,6 +23771,19 @@ mod tests {
                     assert_eq!(context.revision, revision);
                 }
             }
+        }
+    }
+
+    fn build_sync_request(
+        request_type: presage::proto::sync_message::request::Type,
+    ) -> presage::proto::SyncMessage {
+        presage::proto::SyncMessage {
+            content: Some(presage::proto::sync_message::Content::Request(
+                presage::proto::sync_message::Request {
+                    r#type: Some(request_type.into()),
+                },
+            )),
+            ..Default::default()
         }
     }
 
