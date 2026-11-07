@@ -7652,8 +7652,12 @@ async fn serve_account_stream(
     if forced_initial_sync
         || initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64))
     {
+        // Never hold the receive loop on a slow sync-request send: a hung
+        // request would block ContactSync processing and the inbox gate for
+        // the whole RECEIVE_CONNECT_TIMEOUT window. The request is idempotent;
+        // the deferred arm below retries.
         let _ = tokio::time::timeout(
-            RECEIVE_CONNECT_TIMEOUT,
+            Duration::from_secs(5),
             send_initial_sync_requests(&mut manager),
         )
         .await;
@@ -7699,7 +7703,7 @@ async fn serve_account_stream(
                     // 纪律，下次链路建立再补）。
                     let sync_started = std::time::Instant::now();
                     if tokio::time::timeout(
-                        RECEIVE_CONNECT_TIMEOUT,
+                        Duration::from_secs(5),
                         send_initial_sync_requests(&mut manager),
                     )
                     .await
