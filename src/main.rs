@@ -31,6 +31,8 @@
 //! （presage future 持有非 Send 状态，进不了 tokio::spawn），finishLink
 //! 阻塞不饿死其他方法；启动即为每个已登记账号拉起接收管线。
 
+#[allow(dead_code)]
+mod event_store;
 mod history;
 mod jsonrpc;
 mod logfile;
