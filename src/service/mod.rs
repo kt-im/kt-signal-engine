@@ -7645,6 +7645,19 @@ async fn serve_account_stream(
     // 库=官方链接设备同款）；群会话完整性由本批登录期 manifest 自动拉补
     // （同一时机带，见 sync 臂体）。
     let forced_initial_sync = take_forced_initial_sync(number);
+    // Official order: syncRequests are sent when the authenticated socket is
+    // ready, before the receive queue starts. The deferred select arm below
+    // still owns manifest/profile completion; the request itself must not
+    // wait for a timer that a busy receive stream can starve.
+    if forced_initial_sync
+        || initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64))
+    {
+        let _ = tokio::time::timeout(
+            RECEIVE_CONNECT_TIMEOUT,
+            send_initial_sync_requests(&mut manager),
+        )
+        .await;
+    }
     let mut sync_pending = if forced_initial_sync
         || initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64))
     {
