@@ -3043,6 +3043,16 @@ async fn dispatch(
                 Err(error) => phone_lookup_error(id, &error),
             }
         }
+        "receive.confirm" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(key) = params.get("dedupeKey").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let confirmed = service.confirm_duplicate(account, key).await;
+            jsonrpc::success_response(id, Value::Bool(confirmed))
+        }
         // receive.replay（KT 扩展）：按 dedupe key 从 presage receive outbox
         // 重建 Content 并投影；供 connector 消费 Duplicate recovery marker。
         "receive.replay" => {

@@ -2199,6 +2199,21 @@ impl Service {
     /// 账号许可耗尽时等待该账号帧被 writer 写出（单账号背压，不阻塞其他
     /// 账号）；writer 死亡返回 false（调用方按 fire-and-forget 纪律忽略，
     /// ack 安全性由 flush 栅栏兜底）。
+    /// E: confirm a presage receive-outbox row after connector commit.
+    pub(crate) async fn confirm_duplicate(&self, account: &str, dedupe_key: &str) -> bool {
+        let dir = {
+            let state = self.state.lock().await;
+            let Some(rel) = state.account_dir(account) else {
+                return false;
+            };
+            self.data_dir.join(rel)
+        };
+        let Ok(store) = open_store(&dir).await else {
+            return false;
+        };
+        store.kt_outbox_confirm(dedupe_key).await.unwrap_or(false)
+    }
+
     /// E: reconstruct a duplicate from the presage receive outbox and project
     /// it outside the receive manager lock.
     pub(crate) async fn replay_duplicate(
@@ -7993,6 +8008,21 @@ async fn serve_account_stream(
                             .await
                         {
                             Ok(_) => {
+                                let replay_service = Arc::clone(service);
+                                let replay_account = number.to_owned();
+                                let replay_key = key.clone();
+                                tokio::task::spawn_local(async move {
+                                    if let Some(notifications) = replay_service
+                                        .replay_duplicate(&replay_account, &replay_key)
+                                        .await
+                                    {
+                                        for notification in notifications {
+                                            replay_service
+                                                .notify(&replay_account, notification)
+                                                .await;
+                                        }
+                                    }
+                                });
                                 quick_seen += 1;
                                 record_receive_envelope(number, envelope_started);
                                 ack.ack();

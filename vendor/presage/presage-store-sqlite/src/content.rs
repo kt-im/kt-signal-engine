@@ -730,13 +730,14 @@ async fn save_outbox_on_tx(
     })
     .to_string();
     sqlx::query(
-        "INSERT OR IGNORE INTO kt_outbox(dedupe_key, sender, client_timestamp, content, created_at)
-         VALUES(?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR IGNORE INTO kt_outbox(dedupe_key, sender, client_timestamp, content, metadata_json, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
     )
     .bind(dedupe_key)
     .bind(sender)
     .bind(timestamp)
     .bind(body)
+    .bind(metadata)
     .bind(chrono::Utc::now().timestamp_millis())
     .execute(&mut *conn)
     .await?;
@@ -1058,9 +1059,12 @@ mod test {
         let key = format!("{}:{}", sender.service_id_string(), 1_700_000_000_000i64);
         let row = store.kt_outbox_get(&key).await?;
         assert!(row.is_some(), "outbox row must be readable by dedupe key");
-        let (body, row_sender) = row.unwrap();
+        let (body, row_sender, _metadata) = row.unwrap();
         assert!(!body.is_empty());
         assert_eq!(row_sender, sender.service_id_string());
+        assert!(store.kt_outbox_confirm(&key).await?);
+        assert!(store.kt_outbox_get(&key).await?.is_none());
+        assert!(!store.kt_outbox_confirm(&key).await?);
 
         Ok(())
     }
