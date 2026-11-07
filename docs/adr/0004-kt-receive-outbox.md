@@ -1,6 +1,6 @@
 # ADR 0004: Presage receive outbox boundary
 
-Status: proposed
+Status: accepted
 Date: 2026-11-07
 
 ## Context
