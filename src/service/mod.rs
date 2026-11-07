@@ -2207,6 +2207,17 @@ impl Service {
             .await
     }
 
+    #[allow(dead_code)] // duplicate receive wiring lands next
+    pub(crate) async fn duplicate_outbox(
+        &self,
+        account: &str,
+    ) -> Result<std::sync::Arc<dyn crate::event_store::DuplicateOutbox>, sqlx::Error> {
+        let pool = self.event_pool(account).await?;
+        Ok(std::sync::Arc::new(
+            crate::event_store::SqliteDuplicateOutbox { pool },
+        ))
+    }
+
     /// Mark a receive-terminal account. 401/403 is device-unlinked, not a
     /// recoverable transport failure; keep it until a fresh link clears it.
     pub(crate) fn mark_terminal_account(&self, account: &str) {
