@@ -7939,7 +7939,8 @@ async fn serve_account_stream(
                     ack.ack();
                 }
                 // 重复投递（store 已有同源行）：已投影过，仅补 ack 不再通知。
-                Some(Received::Duplicate(ack)) => {
+                Some(Received::Duplicate(content, ack)) => {
+                    let _ = &content; // E: recovery wiring uses metadata next
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_DUPLICATE, 1);
                     quick_seen += 1;
                     record_receive_envelope(number, envelope_started);

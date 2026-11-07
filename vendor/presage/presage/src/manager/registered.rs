@@ -1375,7 +1375,10 @@ impl<S: Store> Manager<S, Registered> {
                                         .as_ref()
                                         .is_some_and(|key| batch_seen.contains(key))
                                 {
-                                    slots.push(BatchSlot::Ready(Received::Duplicate(ack)));
+                                    slots.push(BatchSlot::Ready(Received::Duplicate(
+                                        Box::new(content),
+                                        ack,
+                                    )));
                                     continue;
                                 }
                                 if let Some(key) = batch_key {

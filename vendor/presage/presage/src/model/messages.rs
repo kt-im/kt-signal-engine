@@ -72,7 +72,7 @@ pub enum Received {
     /// Redelivered envelope: a `(sender, client_timestamp)` row already exists
     /// in the store. The message was stored (and is expected to have been
     /// projected) once already; consumers ack and must not re-project.
-    Duplicate(EnvelopeAck),
+    Duplicate(Box<Content>, EnvelopeAck),
 
     /// Incoming decrypted message with metadata and content, stored before
     /// yielding. The consumer acks after projecting the message.
