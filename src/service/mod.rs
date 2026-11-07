@@ -7958,6 +7958,13 @@ async fn serve_account_stream(
                 // 事件供 connector upsert 自有库（官方 contactSync 消费同位）。
                 // G1：ack 前等 flush 栅栏（投影可达连接器才耗服务器队列）。
                 Some(Received::Contacts(sync, ack)) => {
+                    // Before retrieve_contacts (attachment download + decrypt).
+                    tracing::warn!(
+                        target: "engine.receive",
+                        stage = "contact_sync_envelope_received",
+                        complete = sync.complete,
+                        "contact sync envelope reached receive loop"
+                    );
                     tracing::warn!(
                         target: "engine.receive",
                         stage = "contact_sync_received",
