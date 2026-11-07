@@ -61,6 +61,30 @@ impl DispatchModel {
     }
 }
 
+static GLOBAL: std::sync::OnceLock<std::sync::Mutex<DispatchModel>> = std::sync::OnceLock::new();
+
+fn global() -> &'static std::sync::Mutex<DispatchModel> {
+    GLOBAL.get_or_init(|| std::sync::Mutex::new(DispatchModel::default()))
+}
+
+pub(crate) fn prepare_dispatch(id: &str) {
+    if let Ok(mut model) = global().lock() {
+        model.prepare(id);
+    }
+}
+
+pub(crate) fn mark_dispatch_sent(id: &str) {
+    if let Ok(mut model) = global().lock() {
+        model.mark_sent(id);
+    }
+}
+
+pub(crate) fn mark_dispatch_failed(id: &str) {
+    if let Ok(mut model) = global().lock() {
+        model.mark_failed(id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

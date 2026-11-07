@@ -625,6 +625,10 @@ async fn dispatch(
             {
                 return internal_error(id);
             }
+            let dispatch_id = params.get("dispatchId").and_then(Value::as_str);
+            if let Some(dispatch_id) = dispatch_id {
+                crate::dispatch_model::prepare_dispatch(dispatch_id);
+            }
             match (account, message, group, recipients_of(params)) {
                 (Some(account), message, Some(group), _)
                     if sticker.is_some() || message.is_some() || view_once =>
@@ -646,6 +650,9 @@ async fn dispatch(
                         .await
                     {
                         Ok((timestamp, results)) => {
+                            if let Some(dispatch_id) = dispatch_id {
+                                crate::dispatch_model::mark_dispatch_sent(dispatch_id);
+                            }
                             tracing::warn!(
                                 target: "send_latency_probe",
                                 stage = "engine.send-done",
@@ -662,6 +669,9 @@ async fn dispatch(
                             )
                         }
                         Err(error) => {
+                            if let Some(dispatch_id) = dispatch_id {
+                                crate::dispatch_model::mark_dispatch_failed(dispatch_id);
+                            }
                             let (face, _) = send_error_face(&error);
                             tracing::warn!(
                                 target: "send_latency_probe",
@@ -699,6 +709,9 @@ async fn dispatch(
                         .await
                     {
                         Ok((timestamp, results, failures)) => {
+                            if let Some(dispatch_id) = dispatch_id {
+                                crate::dispatch_model::mark_dispatch_sent(dispatch_id);
+                            }
                             perf_metrics::add(perf_metrics::keys::SEND_TEXT_OK, 1);
                             perf_metrics::record_us(
                                 perf_metrics::keys::SEND_TEXT_TOTAL,
@@ -723,6 +736,9 @@ async fn dispatch(
                             jsonrpc::success_response(id, payload)
                         }
                         Err(error) => {
+                            if let Some(dispatch_id) = dispatch_id {
+                                crate::dispatch_model::mark_dispatch_failed(dispatch_id);
+                            }
                             perf_metrics::add(perf_metrics::keys::SEND_TEXT_ERR, 1);
                             perf_metrics::record_us(
                                 perf_metrics::keys::SEND_TEXT_TOTAL,
