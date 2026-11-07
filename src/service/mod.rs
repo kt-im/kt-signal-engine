@@ -2079,6 +2079,10 @@ pub(crate) struct Service {
     /// `discard_incomplete_quarantine_stores` 全进程单飞——重复链接事件
     /// 幂等（后到者扫到已清空的区零通知），并发链接事件不双计。
     quarantine_discard: AsyncMutex<()>,
+    /// Account numbers whose receive stream was rejected with 401/403. This is
+    /// the engine-owned terminal gate: send-family methods check it before any
+    /// vendor sender path (including MRM) can run. Cleared by a fresh link.
+    terminal_accounts: StdMutex<HashSet<String>>,
 }
 
 /// 接收管线停机宽限（S5 关停宽限可配）：停旗发出后等待任务收口（drop
@@ -2187,6 +2191,7 @@ impl Service {
             whitelist_cache: StdMutex::new(HashMap::new()),
             own_capabilities_cache: own_capabilities::CapabilitiesCache::new(),
             quarantine_discard: AsyncMutex::new(()),
+            terminal_accounts: StdMutex::new(HashSet::new()),
         })
     }
 
@@ -2194,6 +2199,28 @@ impl Service {
     /// 账号许可耗尽时等待该账号帧被 writer 写出（单账号背压，不阻塞其他
     /// 账号）；writer 死亡返回 false（调用方按 fire-and-forget 纪律忽略，
     /// ack 安全性由 flush 栅栏兜底）。
+    /// Mark a receive-terminal account. 401/403 is device-unlinked, not a
+    /// recoverable transport failure; keep it until a fresh link clears it.
+    pub(crate) fn mark_terminal_account(&self, account: &str) {
+        if let Ok(mut accounts) = self.terminal_accounts.lock() {
+            accounts.insert(account.to_string());
+        }
+    }
+
+    /// A fresh link for this number revives the account gate.
+    pub(crate) fn clear_terminal_account(&self, account: &str) {
+        if let Ok(mut accounts) = self.terminal_accounts.lock() {
+            accounts.remove(account);
+        }
+    }
+
+    fn is_terminal_account(&self, account: &str) -> bool {
+        self.terminal_accounts
+            .lock()
+            .map(|accounts| accounts.contains(account))
+            .unwrap_or(false)
+    }
+
     pub(crate) async fn notify(&self, account: &str, value: Value) -> bool {
         // 出站队列/账号许可在连接器停止读取时会无限背压；收流任务不能
         // 卡在这里（卡住 = 不再 poll 信封）。30s 上限后按出口不可达返回
@@ -2497,6 +2524,7 @@ impl Service {
         let pending = inner.pending.take().expect("checked");
         // 会话槽已收走：后续 store/state/pipeline 收口均不持 inner 锁。
         drop(inner);
+        self.clear_terminal_account(&number);
         if !device_name.is_empty() {
             let mut store = open_store(&pending.store_dir)
                 .await
@@ -2757,6 +2785,9 @@ impl Service {
     ) -> Result<(u64, Vec<Value>, Vec<Value>), SendError> {
         if !self.real {
             return Ok((now_ms(), Vec::new(), Vec::new()));
+        }
+        if self.is_terminal_account(account) {
+            return Err(SendError::Unbound);
         }
         // KT (send latency probe): 纯日志零行为变化——lock 段含 db 打开与
         // 账号互斥等待（发送长尾嫌疑面），ts_id 供与 dispatch/vendor 行
@@ -4719,6 +4750,9 @@ impl Service {
         account: &str,
         group_id: &str,
     ) -> Result<(SharedSendManager, u64), SendError> {
+        if self.is_terminal_account(account) {
+            return Err(SendError::Unbound);
+        }
         let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
@@ -6617,6 +6651,18 @@ fn identity_changed_notification(account: &str, sender: &ServiceId, timestamp: u
 /// `ServiceError::Unauthorized`，401/403 同型）后接收循环停止，上抛一次
 /// 本通知（wire additive，connector 白名单不消费零影响）——官方链接设备
 /// 语义：凭据失效即停，等用户重链，不无限退避重连。
+fn connection_state_notification(account: &str, state: &str, close_code: Option<u16>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "connectionState",
+        "params": {
+            "account": account,
+            "state": state,
+            "closeCode": close_code,
+        },
+    })
+}
+
 fn account_unbound_notification(account: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -6683,6 +6729,29 @@ const WS_CLOSE_LOCAL_HANDOVER: u16 = 4000;
 /// 接收流结束时是否进入「不重连」终点：1000（normal closure）、4409
 /// （connected elsewhere，官方同位）与 4000（本地槽接管，引擎适配）。
 /// 其余（1001/1006/3001/无 close code）按传输失败走 Fibonacci 重连。
+/// C: one close-code classifier shared by receive, supervisor, and future
+/// connection events. 4401 is invalidated (reconnect, not account terminal);
+/// 4409 is terminated_external (no reconnect); 1000/4000 are local/terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectionClose {
+    Normal,
+    LocalHandover,
+    ConnectedElsewhere,
+    Invalidated,
+    Reconnect,
+}
+
+pub(crate) fn classify_connection_close(close_code: Option<u16>) -> ConnectionClose {
+    match close_code {
+        Some(WS_CLOSE_NORMAL) => ConnectionClose::Normal,
+        Some(WS_CLOSE_LOCAL_HANDOVER) => ConnectionClose::LocalHandover,
+        Some(WS_CLOSE_CONNECTED_ELSEWHERE) => ConnectionClose::ConnectedElsewhere,
+        Some(4401) => ConnectionClose::Invalidated,
+        _ => ConnectionClose::Reconnect,
+    }
+}
+
+#[allow(dead_code)]
 fn receive_close_is_terminal(close_code: Option<u16>) -> bool {
     matches!(
         close_code,
@@ -7068,6 +7137,7 @@ async fn receive_account_loop(
                     account = %crate::methods::probe_account8(Some(number)),
                     "receive credentials rejected (401/403); stopping until relink"
                 );
+                service.mark_terminal_account(number);
                 service
                     .notify(number, account_unbound_notification(number))
                     .await;
@@ -8075,17 +8145,53 @@ async fn serve_account_stream(
                         // 失败回到 Fibonacci 重连。旧实现把 4409 当
                         // Connected 立即重连，会与被夺走的客户端互踢振荡。
                         let close_code = manager.identified_websocket_close_code().await;
-                        if receive_close_is_terminal(close_code) {
-                            tracing::warn!(
-                                target: "engine.receive",
-                                stage = "receive_stream_closed_no_reconnect",
-                                account = %account_hash,
-                                close_code = ?close_code,
-                                "receive stream closed with a no-reconnect code (1000/4409/4000)"
-                            );
-                            return StreamOutcome::Terminated;
+                        match classify_connection_close(close_code) {
+                            ConnectionClose::Normal
+                            | ConnectionClose::ConnectedElsewhere
+                            | ConnectionClose::LocalHandover => {
+                                let state = match classify_connection_close(close_code) {
+                                    ConnectionClose::Normal => "normal",
+                                    ConnectionClose::ConnectedElsewhere => "connected_elsewhere",
+                                    ConnectionClose::LocalHandover => "local_handover",
+                                    _ => "unknown",
+                                };
+                                service
+                                    .notify(
+                                        number,
+                                        connection_state_notification(number, state, close_code),
+                                    )
+                                    .await;
+                                tracing::warn!(
+                                    target: "engine.receive",
+                                    stage = "receive_stream_closed_no_reconnect",
+                                    account = %account_hash,
+                                    close_code = ?close_code,
+                                    "receive stream closed with a no-reconnect code (1000/4409/4000)"
+                                );
+                                return StreamOutcome::Terminated;
+                            }
+                            ConnectionClose::Invalidated => {
+                                service
+                                    .notify(
+                                        number,
+                                        connection_state_notification(
+                                            number,
+                                            "invalidated",
+                                            close_code,
+                                        ),
+                                    )
+                                    .await;
+                                tracing::warn!(
+                                    target: "engine.receive",
+                                    stage = "receive_stream_invalidated",
+                                    account = %account_hash,
+                                    close_code = ?close_code,
+                                    "receive stream invalidated (4401); reconnecting, not unlinking"
+                                );
+                                return StreamOutcome::Connected;
+                            }
+                            ConnectionClose::Reconnect => return StreamOutcome::Connected,
                         }
-                        return StreamOutcome::Connected;
                     }
                 }
                 // prekey 快速巡检量臂（P12/R4）：窗内 ≥200 信封即快速巡检
@@ -22765,6 +22871,38 @@ mod tests {
     /// B4 Unbound 停环：建流错误归型——Unauthorized 两层归型面（直接
     /// ServiceError 与 sender 再包层）判 Unbound；404 NotFound / 其他
     /// presage 错误不误报（维持退避重连，send_error_of 同纪律）。
+    #[test]
+    fn connection_state_notification_reports_4401_without_unlink() {
+        let value = connection_state_notification("acct", "invalidated", Some(4401));
+        assert_eq!(value["method"], "connectionState");
+        assert_eq!(value["params"]["account"], "acct");
+        assert_eq!(value["params"]["state"], "invalidated");
+        assert_eq!(value["params"]["closeCode"], 4401);
+    }
+    #[test]
+    fn connection_close_classification_is_official() {
+        assert_eq!(
+            classify_connection_close(Some(1000)),
+            ConnectionClose::Normal
+        );
+        assert_eq!(
+            classify_connection_close(Some(4000)),
+            ConnectionClose::LocalHandover
+        );
+        assert_eq!(
+            classify_connection_close(Some(4409)),
+            ConnectionClose::ConnectedElsewhere
+        );
+        assert_eq!(
+            classify_connection_close(Some(4401)),
+            ConnectionClose::Invalidated
+        );
+        assert_eq!(
+            classify_connection_close(Some(1006)),
+            ConnectionClose::Reconnect
+        );
+        assert_eq!(classify_connection_close(None), ConnectionClose::Reconnect);
+    }
     #[test]
     fn receive_stream_unbound_classifies_unauthorized_only() {
         use presage::libsignal_service::prelude::ServiceError;

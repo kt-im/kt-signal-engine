@@ -367,7 +367,21 @@ fn main() -> ExitCode {
         eprintln!("kt-signal-engine: invalid {SOCKS_PROXY_ENV}: {message}");
         return ExitCode::from(2);
     }
-    amain()
+    // Debug builds carry much larger async-state frames than release. Group
+    // typing (send_typing_group -> send_message_to_group -> new_message_sender)
+    // overflowed the 8 MiB main-thread stack and aborted the whole engine with
+    // SIGABRT. Give the single-thread runtime a bounded 32 MiB stack so debug
+    // and release use the same runtime semantics; if the host refuses the
+    // thread, fall back to the process main stack rather than failing startup.
+    const ENGINE_STACK_BYTES: usize = 32 * 1024 * 1024;
+    match std::thread::Builder::new()
+        .name("kt-signal-engine-main".into())
+        .stack_size(ENGINE_STACK_BYTES)
+        .spawn(amain)
+    {
+        Ok(handle) => handle.join().unwrap_or(ExitCode::FAILURE),
+        Err(_) => amain(),
+    }
 }
 
 /// 单账号护栏开关（S5）：池化后每个引擎只应承载一个账号，防止误把多账号
@@ -511,6 +525,11 @@ async fn amain() -> ExitCode {
 
             // A4 干净退出：停全部接收管线并等待收口（在飞信封处理臂完成、
             // Manager drop 时 SQLite store 刷盘），再退出 LocalSet。
+            tracing::warn!(
+                target: "engine.lifecycle",
+                stage = "stdin_eof",
+                "engine stdin reached EOF; shutting down"
+            );
             service.shutdown_all().await;
         })
         .await;
