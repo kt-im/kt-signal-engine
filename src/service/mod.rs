@@ -7951,11 +7951,33 @@ async fn serve_account_stream(
                 }
                 // 重复投递（store 已有同源行）：已投影过，仅补 ack 不再通知。
                 Some(Received::Duplicate(content, ack)) => {
-                    let _ = &content; // E: recovery wiring uses metadata next
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_DUPLICATE, 1);
-                    quick_seen += 1;
-                    record_receive_envelope(number, envelope_started);
-                    ack.ack();
+                    let timestamp = content
+                        .metadata
+                        .client_timestamp
+                        .timestamp_millis()
+                        .max(0) as u64;
+                    let sender = content.metadata.sender.service_id_string();
+                    let key = crate::outbox_model::duplicate_dedupe_key(&sender, timestamp);
+                    let payload = serde_json::json!({ "ktRecover": key }).to_string();
+                    match service.duplicate_outbox(number).await {
+                        Ok(outbox) => match outbox
+                            .enqueue_duplicate(0, &sender, timestamp, &payload)
+                            .await
+                        {
+                            Ok(_) => {
+                                quick_seen += 1;
+                                record_receive_envelope(number, envelope_started);
+                                ack.ack();
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "duplicate recovery marker failed; withholding ack")
+                            }
+                        },
+                        Err(error) => {
+                            tracing::warn!(%error, "duplicate outbox open failed; withholding ack")
+                        }
+                    }
                 }
                 // 群取回失败（接收完整性批②，compat §3 additive）：同信封
                 // 触发的群 update fetch/decrypt 在 vendored 重试环耗尽。解码
