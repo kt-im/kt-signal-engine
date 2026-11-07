@@ -125,6 +125,7 @@ impl ContentsStore for SqliteStore {
     ) -> Result<(), Self::ContentsStoreError> {
         let mut tx = self.db.begin().await?;
         for (thread, content) in messages {
+            save_outbox_on_tx(&mut tx, &thread, &content).await?;
             save_message_on_tx(&mut tx, &thread, content).await?;
         }
         tx.commit().await?;
@@ -708,6 +709,40 @@ impl ContentsStore for SqliteStore {
     }
 }
 
+async fn save_outbox_on_tx(
+    conn: &mut sqlx::SqliteConnection,
+    _thread: &Thread,
+    content: &Content,
+) -> Result<(), SqliteStoreError> {
+    let sender = content.metadata.sender.service_id_string();
+    let timestamp = content.metadata.client_timestamp.timestamp_millis();
+    let dedupe_key = format!("{sender}:{timestamp}");
+    let body = prost::Message::encode_to_vec(&content.body.clone().into_proto());
+    let metadata = serde_json::json!({
+        "sender": sender,
+        "destination": content.metadata.destination.service_id_string(),
+        "senderDevice": u32::from(content.metadata.sender_device),
+        "clientTimestamp": timestamp,
+        "serverTimestamp": content.metadata.server_timestamp.timestamp_millis(),
+        "needsReceipt": content.metadata.needs_receipt,
+        "unidentifiedSender": content.metadata.unidentified_sender,
+        "wasPlaintext": content.metadata.was_plaintext,
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT OR IGNORE INTO kt_outbox(dedupe_key, sender, client_timestamp, content, created_at)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(dedupe_key)
+    .bind(sender)
+    .bind(timestamp)
+    .bind(body)
+    .bind(chrono::Utc::now().timestamp_millis())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// KT (receive batching): single-message insert within a caller-managed
 /// transaction, shared by [`save_message`] and the batched
 /// [`ContentsStore::save_messages`] override.
@@ -1016,6 +1051,10 @@ mod test {
             );
         }
         assert_eq!(store.messages(&thread, ..).await?.count(), 3);
+        let outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kt_outbox")
+            .fetch_one(&store.db)
+            .await?;
+        assert_eq!(outbox, 3, "each batch item gets one outbox marker");
 
         Ok(())
     }
