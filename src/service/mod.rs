@@ -1914,7 +1914,8 @@ fn initial_sync_complete_notification(
 /// 既有 60s 一次性纪律保留（重连风暴不重复轰主设备），请求族由 contacts
 /// 一腿补齐为官方三腿；每腿独立 best-effort（官方 Promise.all 一损俱损，
 /// 引擎零 stderr 纪律下逐腿尽力——sync 请求幂等，失败靠下次链路建立重补）。
-async fn send_initial_sync_requests(manager: &mut Manager<SqliteStore, Registered>) {
+async fn send_initial_sync_requests(manager: &mut Manager<SqliteStore, Registered>) -> bool {
+    let mut all_sent = true;
     for request_type in [
         presage::proto::sync_message::request::Type::Contacts,
         presage::proto::sync_message::request::Type::Configuration,
@@ -1927,15 +1928,19 @@ async fn send_initial_sync_requests(manager: &mut Manager<SqliteStore, Registere
                 request = ?request_type,
                 "sync request sent"
             ),
-            Err(error) => tracing::warn!(
-                target: "engine.receive",
-                stage = "initial_sync_request_failed",
-                request = ?request_type,
-                error = %error,
-                "sync request send failed"
-            ),
+            Err(error) => {
+                all_sent = false;
+                tracing::warn!(
+                    target: "engine.receive",
+                    stage = "initial_sync_request_failed",
+                    request = ?request_type,
+                    error = %error,
+                    "sync request send failed"
+                );
+            }
         }
     }
+    all_sent
 }
 
 /// E.164 形状闸（`+` 前缀 + 1..=15 位 ASCII 数字；deleteForMeConversation
@@ -7645,19 +7650,21 @@ async fn serve_account_stream(
     // ready, before the receive queue starts. The deferred select arm below
     // still owns manifest/profile completion; the request itself must not
     // wait for a timer that a busy receive stream can starve.
-    if forced_initial_sync
+    let early_sync_sent = if forced_initial_sync
         || initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64))
     {
-        // Never hold the receive loop on a slow sync-request send: a hung
-        // request would block ContactSync processing and the inbox gate for
-        // the whole RECEIVE_CONNECT_TIMEOUT window. The request is idempotent;
-        // the deferred arm below retries.
-        let _ = tokio::time::timeout(
+        // Never hold the receive loop on a slow sync-request send. Official
+        // sends the three requests exactly once per auth socket; the deferred
+        // arm only retries a failed early send.
+        tokio::time::timeout(
             Duration::from_secs(5),
             send_initial_sync_requests(&mut manager),
         )
-        .await;
-    }
+        .await
+        .unwrap_or(false)
+    } else {
+        false
+    };
     let mut sync_pending = if forced_initial_sync
         || initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64))
     {
@@ -7698,19 +7705,12 @@ async fn serve_account_stream(
                     // sendSyncRequests 同位——成功/失败都不重试（一次性
                     // 纪律，下次链路建立再补）。
                     let sync_started = std::time::Instant::now();
-                    if tokio::time::timeout(
-                        Duration::from_secs(5),
-                        send_initial_sync_requests(&mut manager),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        tracing::warn!(
-                            target: "engine.receive",
-                            stage = "initial_sync_requests_timeout",
-                            account = %account_hash,
-                            "initial sync requests timed out; returning to receive loop"
-                        );
+                    if !early_sync_sent {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            send_initial_sync_requests(&mut manager),
+                        )
+                        .await;
                     }
                     // S2a 打点：存量补同步三请求耗时（一次性面基线）。
                     perf_metrics::record_us(
