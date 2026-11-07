@@ -1733,6 +1733,26 @@ const INITIAL_SYNC_WINDOW_MS: u64 = 60_000;
 /// 登录期 sync 时机裁定（60s 一次性纪律单点；P15c 项4 既有语义抽纯函数，
 /// T-9 manifest 自动拉同门共闸）：上次记录缺席（首流/进程重启后）或超窗
 /// → true（本次建流安排 +2s 沉降）；窗内（重连风暴）→ false 恰跳过。
+static FORCE_INITIAL_SYNC: std::sync::OnceLock<StdMutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn force_initial_sync_on_next_stream(account: &str) {
+    if let Ok(mut set) = FORCE_INITIAL_SYNC
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+    {
+        set.insert(account.to_string());
+    }
+}
+
+fn take_forced_initial_sync(account: &str) -> bool {
+    FORCE_INITIAL_SYNC
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+        .map(|mut set| set.remove(account))
+        .unwrap_or(false)
+}
+
 fn initial_sync_due(last_elapsed_ms: Option<u64>) -> bool {
     match last_elapsed_ms {
         Some(elapsed) => elapsed >= INITIAL_SYNC_WINDOW_MS,
@@ -2659,6 +2679,7 @@ impl Service {
         // ACI additive 投影（connector 契约 1.142）：链接已成功，注册数据
         // 读取按 best-effort（account_aci）——宁缺勿炸，不连坐链接主结局。
         let aci = account_aci(&pending.store_dir).await;
+        force_initial_sync_on_next_stream(&number);
         self.spawn_pipeline(number.clone(), pending.store_dir).await;
         // 批 W2（§29.73）：成功链接事件 = 旧孤儿可弃的定局信号（§29.72 硬闸
         // 待办闭环）。隔离区未完成注册件此刻自动清扫；含注册数据件保留并随
@@ -7623,12 +7644,14 @@ async fn serve_account_stream(
     // 群组不在本面（presage 栈无 groups sync 消费路径，首条群消息渐进落
     // 库=官方链接设备同款）；群会话完整性由本批登录期 manifest 自动拉补
     // （同一时机带，见 sync 臂体）。
-    let mut sync_pending =
-        if initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64)) {
-            Some(tokio::time::Instant::now() + Duration::from_secs(2))
-        } else {
-            None
-        };
+    let forced_initial_sync = take_forced_initial_sync(number);
+    let mut sync_pending = if forced_initial_sync
+        || initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64))
+    {
+        Some(tokio::time::Instant::now() + Duration::from_secs(2))
+    } else {
+        None
+    };
     // T-9 fetchLatest 消费臂防抖簿（触发位在 Received::Content 臂；
     // 500ms trailing 窗沿毫秒簿记，窗沿 select 臂执行拉取）。
     let mut manifest_debounce = ManifestPullDebounce::default();
@@ -22078,6 +22101,14 @@ mod tests {
             "窗内（重连风暴）恰跳过"
         );
         assert!(initial_sync_due(Some(INITIAL_SYNC_WINDOW_MS)), "超窗重臂");
+    }
+
+    #[test]
+    fn forced_initial_sync_is_one_shot_per_link() {
+        let account = "+15559990001";
+        force_initial_sync_on_next_stream(account);
+        assert!(take_forced_initial_sync(account));
+        assert!(!take_forced_initial_sync(account));
     }
 
     /// T-9b 结果事件消费方测试替身：通道恰一帧且为 `engine.storagePull`
