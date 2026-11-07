@@ -1906,22 +1906,6 @@ fn initial_sync_complete_notification(
     })
 }
 
-/// syncRequests 单请求构帧（P15c 项4，官方 getRequestConfigurationSyncMessage
-/// / getRequestBlockSyncMessage 同位，SendMessage.preload.ts:1685/:1654）：
-/// SyncMessage.content.Request{type}，padded sync message。
-fn build_sync_request(
-    r#type: presage::proto::sync_message::request::Type,
-) -> presage::proto::SyncMessage {
-    presage::proto::SyncMessage {
-        content: Some(presage::proto::sync_message::Content::Request(
-            presage::proto::sync_message::Request {
-                r#type: Some(r#type as i32),
-            },
-        )),
-        ..presage::proto::SyncMessage::with_padding(&mut rng())
-    }
-}
-
 /// 链接完成 sync 上行三请求（P15c 项4，官方 sendSyncRequests 同位，
 /// syncRequests.preload.ts:11-34 / afterEveryLinkedStartupOnNewVersion
 /// 触发）：新设备/链接启动向主设备要 contacts/configuration/block 三族
@@ -1931,28 +1915,25 @@ fn build_sync_request(
 /// 一腿补齐为官方三腿；每腿独立 best-effort（官方 Promise.all 一损俱损，
 /// 引擎零 stderr 纪律下逐腿尽力——sync 请求幂等，失败靠下次链路建立重补）。
 async fn send_initial_sync_requests(manager: &mut Manager<SqliteStore, Registered>) {
-    if let Err(error) = manager.request_contacts().await {
-        tracing::warn!(
-            target: "engine.receive",
-            stage = "initial_sync_contacts_request_failed",
-            error = %error,
-            "contacts sync request failed"
-        );
-    }
-    let own_aci = ServiceId::Aci(manager.registration_data().service_ids.aci.into());
-    for r#type in [
+    for request_type in [
+        presage::proto::sync_message::request::Type::Contacts,
         presage::proto::sync_message::request::Type::Configuration,
         presage::proto::sync_message::request::Type::Blocked,
     ] {
-        let body = ContentBody::SynchronizeMessage(build_sync_request(r#type));
-        if let Err(error) = manager.send_message(own_aci, body, now_ms()).await {
-            tracing::warn!(
+        match manager.request_sync(request_type).await {
+            Ok(()) => tracing::warn!(
+                target: "engine.receive",
+                stage = "initial_sync_request_sent",
+                request = ?request_type,
+                "sync request sent"
+            ),
+            Err(error) => tracing::warn!(
                 target: "engine.receive",
                 stage = "initial_sync_request_failed",
-                request = ?r#type,
+                request = ?request_type,
                 error = %error,
                 "sync request send failed"
-            );
+            ),
         }
     }
 }
@@ -8003,6 +7984,13 @@ async fn serve_account_stream(
                 // 事件供 connector upsert 自有库（官方 contactSync 消费同位）。
                 // G1：ack 前等 flush 栅栏（投影可达连接器才耗服务器队列）。
                 Some(Received::Contacts(sync, ack)) => {
+                    tracing::warn!(
+                        target: "engine.receive",
+                        stage = "contact_sync_received",
+                        complete = sync.complete,
+                        records = sync.contacts.len(),
+                        "contact sync attachment received"
+                    );
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTACTS, 1);
                     quick_seen += 1;
                     for notification in project_contacts_sync(number, &sync) {

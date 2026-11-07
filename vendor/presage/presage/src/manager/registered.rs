@@ -311,22 +311,23 @@ impl<S: Store> Manager<S, Registered> {
     /// **Note**: If successful, the contacts are not yet received and stored, but will only be
     /// processed when they're received after polling on the
     pub async fn request_contacts(&mut self) -> Result<(), Error<S::Error>> {
-        trace!("requesting contacts sync");
-        let sync_message = SyncMessage {
-            content: Some(SyncContent::Request(sync_message::Request {
-                r#type: Some(sync_message::request::Type::Contacts.into()),
-            })),
-            ..SyncMessage::with_padding(&mut rand::rng())
-        };
+        self.request_sync(sync_message::request::Type::Contacts).await
+    }
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis() as u64;
-
-        self.send_message(self.state.data.service_ids.aci(), sync_message, timestamp)
+    /// KT fork: send one official SyncMessage.Request through libsignal's
+    /// sync-message sender. The normal send path to self also builds a sent
+    /// transcript; the official client uses sendSyncMessage for these
+    /// requests (Signal-Desktop WebAPI.preload.ts:3705-3711).
+    pub async fn request_sync(
+        &mut self,
+        request_type: sync_message::request::Type,
+    ) -> Result<(), Error<S::Error>> {
+        trace!(?request_type, "requesting sync");
+        let mut sender = self.new_message_sender().await?;
+        let own_aci = ServiceId::Aci(self.state.data.service_ids.aci().into());
+        sender
+            .send_sync_message_request(&own_aci, request_type)
             .await?;
-
         Ok(())
     }
 
