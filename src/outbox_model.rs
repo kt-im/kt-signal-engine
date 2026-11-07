@@ -2,8 +2,12 @@
 //! seq is assigned in-order; dedupe_key is unique; confirm only moves forward.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OutboxRow {
     pub seq: u64,
     pub epoch: u64,
@@ -12,7 +16,7 @@ pub(crate) struct OutboxRow {
     pub confirmed: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub(crate) struct OutboxModel {
     next_seq: u64,
     rows: BTreeMap<u64, OutboxRow>,
@@ -55,6 +59,18 @@ impl OutboxModel {
             .take(limit)
             .map(|(_, row)| row.clone())
             .collect()
+    }
+
+    pub(crate) fn save(&self, path: &Path) -> std::io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
+        fs::write(&tmp, bytes)?;
+        fs::rename(tmp, path)
+    }
+
+    pub(crate) fn load(path: &Path) -> std::io::Result<Self> {
+        let bytes = fs::read(path)?;
+        serde_json::from_slice(&bytes).map_err(std::io::Error::other)
     }
 
     pub(crate) fn snapshot(&self) -> Vec<OutboxRow> {
@@ -112,5 +128,12 @@ mod tests {
         let restored = OutboxModel::restore(outbox.snapshot());
         assert_eq!(restored.pull_unconfirmed(0, 10).len(), 1);
         assert_eq!(restored.next_seq, 2);
+
+        let path = std::env::temp_dir().join(format!("kt-outbox-{}.json", std::process::id()));
+        outbox.save(&path).unwrap();
+        let loaded = OutboxModel::load(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(loaded.pull_unconfirmed(0, 10).len(), 1);
+        assert_eq!(loaded.next_seq, 2);
     }
 }
