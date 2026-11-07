@@ -7428,44 +7428,17 @@ const PREKEYS_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// KT (pre-keys gate, §29.6): 闸结局 —— `Registered` = 注册完成放行；
 /// `Degraded` = 注册未确认（重试耗尽/超时）仍放行，原因串进降级日志。
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 enum PreKeysGateOutcome {
     Registered,
     Degraded(&'static str),
 }
 
-/// KT (pre-keys gate, §29.6): pre-keys 时序闸（生产包装）。接收流拨号前
-/// 串行等待 `refresh_pre_keys` 完成（内部自带 WsClosing 兜底重试与
-/// require_unused=false 的 slot 拨号——复用活连接，不杀消息管道）。任何
-/// 失败模式都放行接收流（显式落降级 warn），不把注册面故障变成接收面
-/// 停摆。证据行 warn 级 = 滚动日志（与 receive_stream_established 同位，
-/// 链接窗口的时序对账直接可查）。
-async fn prekeys_gate(
-    manager: &mut Manager<SqliteStore, Registered>,
-    account: &str,
-) -> PreKeysGateOutcome {
-    let outcome = run_prekeys_gate(|| manager.refresh_pre_keys(), PREKEYS_GATE_TIMEOUT).await;
-    match &outcome {
-        PreKeysGateOutcome::Registered => tracing::warn!(
-            target: "engine.receive",
-            stage = "prekeys_gate_registered",
-            account = %crate::methods::probe_account8(Some(account)),
-            "pre-keys registered before receive stream dial"
-        ),
-        PreKeysGateOutcome::Degraded(reason) => tracing::warn!(
-            target: "engine.receive",
-            stage = "prekeys_gate_degraded",
-            account = %crate::methods::probe_account8(Some(account)),
-            reason,
-            "pre-keys gate released the receive stream in degraded mode"
-        ),
-    }
-    outcome
-}
-
 /// KT (pre-keys gate, §29.6): 闸核心（预算注入，单测用假注册 future 钉
 /// 语义）。`register` 只调用一次；预算内完成且成功 = `Registered`，否则
 /// `Degraded`（失败 / 超时各有原因串）。
+#[allow(dead_code)]
 async fn run_prekeys_gate<E, F, Fut>(register: F, budget: Duration) -> PreKeysGateOutcome
 where
     E: std::error::Error,
@@ -7594,7 +7567,8 @@ async fn serve_account_stream(
     // 放行；重试耗尽/超时放行但记降级 warn——服务器可能仍有存量 pre-keys，
     // 接收面健康优先于注册面严格，缺口由 prekey 巡检与 §29.6 WsClosing
     // 重试兜底补齐。
-    prekeys_gate(&mut manager, &account_hash).await;
+    // Official does not block receive on a prekey refresh; the loop's
+    // maintenance tick (maint_at = now) converges keys after the stream is up.
     let mut stream =
         match tokio::time::timeout(RECEIVE_CONNECT_TIMEOUT, manager.receive_messages()).await {
             Ok(Ok(stream)) => stream,
