@@ -116,6 +116,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_outbox_is_isolated() {
+        let dir = std::env::temp_dir().join(format!("kt-events-iso-{}", std::process::id()));
+        let a = open_account(&dir, "acct-a").await.unwrap();
+        let b = open_account(&dir, "acct-b").await.unwrap();
+        enqueue(&a, 1, "a", "{}").await.unwrap();
+        assert_eq!(pull(&a, 1, 0, 10).await.unwrap().len(), 1);
+        assert!(pull(&b, 1, 0, 10).await.unwrap().is_empty());
+        drop(a);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn outbox_survives_reopen() {
         let path = std::env::temp_dir().join(format!("kt-events-{}.db", std::process::id()));
         std::fs::File::create(&path).unwrap();
