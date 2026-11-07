@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! E: kt-events.db (outbox/dispatch) storage foundation.
 
 use sqlx::SqlitePool;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 //! E: protocol outbox semantics before persistence.
 //! seq is assigned in-order; dedupe_key is unique; confirm only moves forward.
 
