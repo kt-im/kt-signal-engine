@@ -56,6 +56,9 @@ const IDENTITY_UNVERIFIED_MESSAGE: &str =
 /// WS 请求被服务器明确拒绝——确定未送达（508/499/send 面 413/404 未注册/
 /// 其余 4xx 应答拒绝）。
 const WS_REJECTED_MESSAGE: &str = "Failed to send message: Request rejected. (WsRejectedException)";
+/// 客户端版本过旧（HTTP 499）：不自动重试，需升级。
+const APP_EXPIRED_MESSAGE: &str =
+    "Failed to send message: Client version expired. (AppExpiredException)";
 /// WS 响应未达/等响应期断流——未知结局，绝不自动重试（重试可能重复投递）。
 const WS_TIMEOUT_MESSAGE: &str =
     "Failed to send message: Timed out waiting for the response. (WsTimeoutException)";
@@ -5342,6 +5345,7 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
         // cause 类全覆盖批（2026-10-16，§5）六族：均 -32603 + 固定原文
         //（锚词括注异常类名，connector 分类器按 message 命中）。
         SendError::WsRejected => (-32603, WS_REJECTED_MESSAGE),
+        SendError::AppExpired => (-32603, APP_EXPIRED_MESSAGE),
         SendError::WsTimeout => (-32603, WS_TIMEOUT_MESSAGE),
         SendError::WsTransport => (-32603, WS_TRANSPORT_MESSAGE),
         SendError::PreKey => (-32603, PRE_KEY_MESSAGE),

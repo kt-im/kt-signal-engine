@@ -875,6 +875,8 @@ pub(crate) enum SendError {
     /// -32603 + 固定原文（锚词 WsRejectedException；cause 类全覆盖批
     /// 2026-10-16，compat §3/§5）。
     WsRejected,
+    /// 客户端版本过旧（HTTP 499）：服务端拒绝服务，需升级客户端，不自动重试。
+    AppExpired,
     /// WS 请求响应未达/等响应期断流（`ServiceError::Timeout`、等响应相
     /// `WsClosing`、`WsError`、presage Elapsed 超时）：请求可能已写入
     /// 服务器，结局未知——connector 契约「An unknown send outcome must
@@ -981,6 +983,9 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
             ServiceError::ProofRequiredError(..) => SendError::ProofRequired,
             ServiceError::UnhandledResponseCode { status, .. } if status.as_u16() >= 500 => {
                 SendError::ServerUnavailable
+            }
+            ServiceError::UnhandledResponseCode { status, .. } if status.as_u16() == 499 => {
+                SendError::AppExpired
             }
             // —— cause 类全覆盖批（2026-10-16，§5）：服务器显式应答拒绝
             // 族（应答即未入队，确定未送达）——
@@ -1269,6 +1274,7 @@ pub(crate) fn send_error_variant_face(error: &SendError) -> &'static str {
         SendError::ServerUnavailable => "SendError::ServerUnavailable",
         SendError::IdentityUnverified => "SendError::IdentityUnverified",
         SendError::WsRejected => "SendError::WsRejected",
+        SendError::AppExpired => "SendError::AppExpired",
         SendError::WsTimeout => "SendError::WsTimeout",
         SendError::WsTransport => "SendError::WsTransport",
         SendError::PreKey => "SendError::PreKey",
@@ -14151,6 +14157,8 @@ mod tests {
         assert!(matches!(unhandled(503), SendError::ServerUnavailable));
         // <500（如 400）= 服务器明确拒绝（cause 全覆盖批 §5），非不可用。
         assert!(matches!(unhandled(400), SendError::WsRejected));
+        assert!(matches!(unhandled(499), SendError::AppExpired));
+        assert!(!unhandled(499).is_definite_failure());
     }
 
     /// send 链 cause 类全覆盖归型（2026-10-16 批，§5）：六族新变体的
