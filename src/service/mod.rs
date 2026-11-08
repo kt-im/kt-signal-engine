@@ -8037,7 +8037,9 @@ async fn serve_account_stream(
                         }
                     }
                     record_receive_envelope(number, envelope_started);
-                    ack.ack();
+                    if let Some(ack) = ack {
+                        ack.ack();
+                    }
                 }
                 // 解密失败：官方语义同样是 ack（Android IncomingMessageObserver
                 // 落库事务后逐条 ack，解密失败也 ack），否则服务器队列堆积；

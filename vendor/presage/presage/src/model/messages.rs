@@ -55,7 +55,7 @@ pub enum Received {
     /// They are stored before yielding; the consumer acks the source envelope.
     /// KT (P15a): carries the parsed records and source envelope for the
     /// engine projection.
-    Contacts(ContactSync, EnvelopeAck),
+    Contacts(ContactSync, Option<EnvelopeAck>),
 
     // Failed to receive a message from the specified service ID.
     // A session reset with the contact may fix this.

@@ -1123,6 +1123,9 @@ impl<S: Store> Manager<S, Registered> {
                                     // for the engine projection; save loop
                                     // keeps the upstream break-on-error face.
                                     let complete = contacts.complete.unwrap_or(false);
+                                    // Official decryptAndCacheBatch acks the whole
+                                    // batch before contact attachment download.
+                                    ack.ack();
                                     match state.message_receiver.retrieve_contacts(contacts).await {
                                         Ok(contacts) => {
                                             info!("saving contacts");
@@ -1143,7 +1146,7 @@ impl<S: Store> Manager<S, Registered> {
                                                     complete,
                                                     contacts: saved,
                                                 },
-                                                ack,
+                                                None,
                                             )));
                                             continue;
                                         }
@@ -1158,7 +1161,7 @@ impl<S: Store> Manager<S, Registered> {
                                             complete,
                                             contacts: Vec::new(),
                                         },
-                                        ack,
+                                        None,
                                     )));
                                     continue;
                                 }
