@@ -728,6 +728,42 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         )
     }
 
+    /// Builds a facade backed by the official chat connection.
+    #[cfg(feature = "cdsi")]
+    pub fn new_official(
+        socket: crate::websocket::chat_adapter::OfficialSocket,
+        unidentified_push_service: PushService,
+    ) -> (Self, impl Future<Output = ()>) {
+        let (incoming_sink, incoming_stream) = mpsc::unbounded();
+        let (outgoing_sink, outgoing_requests) = mpsc::channel(1);
+        let inner = Arc::new(Mutex::new(SignalWebSocketInner {
+            stream: Some(SignalRequestStream {
+                inner: incoming_stream,
+            }),
+            last_close_code: None,
+        }));
+        let kill = Arc::new(Notify::new());
+
+        let task = run_official(
+            socket,
+            outgoing_requests,
+            incoming_sink,
+            Arc::clone(&inner),
+            Arc::clone(&kill),
+        );
+
+        (
+            Self {
+                _type: PhantomData,
+                request_sink: outgoing_sink,
+                unidentified_push_service,
+                inner,
+                kill,
+            },
+            task,
+        )
+    }
+
     pub fn servers(&self) -> SignalServers {
         self.unidentified_push_service.servers
     }
@@ -1002,5 +1038,96 @@ mod keepalive_tests {
         }
         assert!(!KeepAliveStep::Send.is_close());
         assert!(!KeepAliveStep::Wait.is_close());
+    }
+}
+
+#[cfg(feature = "cdsi")]
+async fn run_official(
+    mut socket: crate::websocket::chat_adapter::OfficialSocket,
+    mut requests: mpsc::Receiver<(
+        WebSocketRequestMessage,
+        oneshot::Sender<Result<WebSocketResponseMessage, ServiceError>>,
+    )>,
+    request_sink: mpsc::UnboundedSender<RequestStreamItem>,
+    shared: Arc<Mutex<SignalWebSocketInner>>,
+    kill: Arc<Notify>,
+) {
+    use crate::websocket::chat_adapter::ChatEvent;
+
+    let chat = socket.chat();
+    let mut acks: FuturesUnordered<BoxFuture<'static, ()>> =
+        std::iter::once(Box::pin(futures::future::pending()) as BoxFuture<'static, ()>)
+            .collect();
+
+    loop {
+        futures::select! {
+            _ = kill.notified().fuse() => {
+                shared.lock().unwrap().last_close_code =
+                    Some(CLOSE_CODE_LOCAL_HANDOVER);
+                socket.disconnect().await;
+                break;
+            }
+            request = requests.next() => {
+                match request {
+                    Some((request, responder)) => {
+                        let chat = Arc::clone(&chat);
+                        acks.push(Box::pin(async move {
+                            let response = chat
+                                .send(
+                                    match request.try_into() {
+                                        Ok(request) => request,
+                                        Err(_) => {
+                                            let _ = responder.send(Err(ServiceError::Timeout {
+                                                reason: "official chat request conversion failed",
+                                            }));
+                                            return;
+                                        }
+                                    },
+                                    REQUEST_RESPONSE_TIMEOUT,
+                                )
+                                .await
+                                .map_err(|_| ServiceError::Timeout {
+                                    reason: "official chat request failed",
+                                })
+                                .and_then(|response| response.try_into().map_err(|_| {
+                                    ServiceError::Timeout {
+                                        reason: "official chat response conversion failed",
+                                    }
+                                }));
+                            let _ = responder.send(response);
+                        }));
+                    }
+                    None => break,
+                }
+            }
+            event = socket.next().fuse() => {
+                match event {
+                    Some(ChatEvent::Incoming(incoming)) => {
+                        let (ack_tx, ack_rx) = oneshot::channel();
+                        if request_sink.unbounded_send((incoming.message, ack_tx)).is_err() {
+                            continue;
+                        }
+                        let responder = incoming.responder;
+                        acks.push(Box::pin(async move {
+                            if let Ok(response) = ack_rx.await {
+                                let status = response
+                                    .status
+                                    .and_then(|status| u16::try_from(status).ok())
+                                    .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+                                    .unwrap_or(reqwest::StatusCode::OK);
+                                let _ = responder.send_response(status);
+                            }
+                        }));
+                    }
+                    Some(ChatEvent::Finished(code)) => {
+                        shared.lock().unwrap().last_close_code = code;
+                        break;
+                    }
+                    Some(ChatEvent::Other) => {}
+                    None => break,
+                }
+            }
+            _ = acks.next() => {}
+        }
     }
 }

@@ -172,7 +172,7 @@ pub fn listener(sender: UnboundedSender<ChatEvent>) -> EventListener {
 /// This is the boundary the main loop will consume; it deliberately does not
 /// know about SignalWebSocket yet.
 pub struct OfficialSocket {
-    chat: ChatConnection,
+    chat: std::sync::Arc<ChatConnection>,
     events: tokio::sync::mpsc::UnboundedReceiver<ChatEvent>,
 }
 
@@ -181,7 +181,11 @@ impl OfficialSocket {
         chat: ChatConnection,
         events: tokio::sync::mpsc::UnboundedReceiver<ChatEvent>,
     ) -> Self {
-        Self { chat, events }
+        Self { chat: std::sync::Arc::new(chat), events }
+    }
+
+    pub fn chat(&self) -> std::sync::Arc<ChatConnection> {
+        std::sync::Arc::clone(&self.chat)
     }
 
     pub async fn send(
