@@ -514,7 +514,9 @@ impl PushService {
                 EnableDomainFronting::No,
                 OverrideNagleAlgorithm::UseSystemDefault,
             ),
-            mode: DirectOrProxyMode::DirectOnly,
+            mode: DirectOrProxyMode::maybe_proxy(
+                crate::websocket::directory::proxy_from_environment(),
+            ),
         };
         let headers = ChatHeaders::Auth(AuthenticatedChatHeaders {
             aci: libsignal_core::Aci::from(aci),
