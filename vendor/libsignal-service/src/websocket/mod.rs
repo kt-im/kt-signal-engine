@@ -222,6 +222,9 @@ impl KeepAliveState {
 
 pub use request::WebSocketRequestMessageBuilder;
 
+#[cfg(feature = "cdsi")]
+pub mod chat_adapter;
+
 type RequestStreamItem = (
     WebSocketRequestMessage,
     oneshot::Sender<WebSocketResponseMessage>,

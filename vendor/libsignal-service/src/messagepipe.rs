@@ -36,11 +36,17 @@ pub enum Incoming {
 pub struct EnvelopeAck {
     response: WebSocketResponseMessage,
     responder: oneshot::Sender<WebSocketResponseMessage>,
+    #[cfg(feature = "cdsi")]
+    chat_responder: Option<libsignal_net::chat::ws::Responder>,
 }
 
 impl EnvelopeAck {
     /// Send the 200 ack. Returns false when the socket is already gone.
     pub fn ack(self) -> bool {
+        #[cfg(feature = "cdsi")]
+        if let Some(responder) = self.chat_responder {
+            return crate::websocket::chat_adapter::ack_ok(responder);
+        }
         self.responder.send(self.response).is_ok()
     }
 }
@@ -111,6 +117,8 @@ impl MessagePipe {
                 EnvelopeAck {
                     response,
                     responder,
+                    #[cfg(feature = "cdsi")]
+                    chat_responder: None,
                 },
             )));
         }
@@ -128,6 +136,18 @@ impl MessagePipe {
             })?;
 
         Ok(result)
+    }
+
+    /// Processes one request received from the official chat listener.
+    ///
+    /// This is the additive path; the legacy `run` loop is unchanged until
+    /// the transport switch lands.
+    #[cfg(feature = "cdsi")]
+    pub fn process_chat_incoming(
+        &mut self,
+        incoming: crate::websocket::chat_adapter::ChatIncoming,
+    ) -> Result<Option<Incoming>, ServiceError> {
+        decode_chat_incoming(incoming)
     }
 
     /// Returns the stream of `Envelope`s
@@ -148,6 +168,95 @@ impl MessagePipe {
     }
 }
 
+/// Decodes one official incoming request into the existing `Incoming` shape.
+#[cfg(feature = "cdsi")]
+pub fn decode_chat_incoming(
+    incoming: crate::websocket::chat_adapter::ChatIncoming,
+) -> Result<Option<Incoming>, ServiceError> {
+    let request = incoming.message;
+    let responder = incoming.responder;
+
+    if request.is_signal_service_envelope() {
+        let Some(body) = request.body.as_ref() else {
+            crate::websocket::chat_adapter::ack_ok(responder);
+            return Err(ServiceError::InvalidFrame {
+                reason: "request without body.",
+            });
+        };
+        let envelope = match Envelope::decode(body.as_slice()) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                crate::websocket::chat_adapter::ack_ok(responder);
+                return Err(error.into());
+            }
+        };
+        let (responder_tx, _responder_rx) = oneshot::channel();
+        return Ok(Some(Incoming::Envelope(
+            envelope,
+            EnvelopeAck {
+                response: WebSocketResponseMessage::from_request(&request),
+                responder: responder_tx,
+                chat_responder: Some(responder),
+            },
+        )));
+    }
+
+    if request.is_queue_empty() {
+        crate::websocket::chat_adapter::ack_ok(responder);
+        return Ok(Some(Incoming::QueueEmpty));
+    }
+
+    crate::websocket::chat_adapter::ack_status(
+        responder,
+        reqwest::StatusCode::BAD_REQUEST,
+    );
+    Ok(None)
+}
+
+/// Consumes listener events from the official chat connection.
+#[cfg(feature = "cdsi")]
+pub fn stream_from_chat(
+    mut events: tokio::sync::mpsc::UnboundedReceiver<
+        crate::websocket::chat_adapter::ChatEvent,
+    >,
+) -> impl Stream<Item = Result<Incoming, ServiceError>> {
+    use crate::websocket::chat_adapter::ChatEvent;
+
+    let (mut sink, stream) = mpsc::channel::<Result<Incoming, ServiceError>>(1);
+    let runner = async move {
+        while let Some(event) = events.recv().await {
+            match event {
+                ChatEvent::Incoming(incoming) => {
+                    match decode_chat_incoming(incoming) {
+                        Ok(Some(item)) => {
+                            if sink.send(Ok(item)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            if sink.send(Err(error)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                ChatEvent::Finished(_) => break,
+                ChatEvent::Other => {}
+            }
+        }
+    };
+
+    let stream = stream.map(Some);
+    let combined = futures::stream::select(
+        stream,
+        runner
+            .into_stream()
+            .map(|_| None::<Result<Incoming, ServiceError>>),
+    );
+    combined.filter_map(|x| async { x })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +267,8 @@ mod tests {
         let ack = EnvelopeAck {
             response: WebSocketResponseMessage::default(),
             responder,
+            #[cfg(feature = "cdsi")]
+            chat_responder: None,
         };
 
         assert!(ack.ack());
@@ -170,6 +281,8 @@ mod tests {
         let ack = EnvelopeAck {
             response: WebSocketResponseMessage::default(),
             responder,
+            #[cfg(feature = "cdsi")]
+            chat_responder: None,
         };
         drop(receiver);
 
