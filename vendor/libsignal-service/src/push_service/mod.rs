@@ -535,8 +535,13 @@ impl PushService {
             headers,
         )
         .await
-        .map_err(|_| ServiceError::WsClosing {
-            reason: "official chat connect failed",
+        .map_err(|error| match error {
+            libsignal_net::chat::ConnectError::DeviceDeregistered => {
+                ServiceError::Unauthorized
+            }
+            _ => ServiceError::WsClosing {
+                reason: "official chat connect failed",
+            },
         })?;
 
         let unidentified_push_service = PushService {
