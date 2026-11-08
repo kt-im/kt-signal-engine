@@ -12,9 +12,9 @@ use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use reqwest::Method;
-use reqwest_websocket::{CloseCode, Message as WsMessage, WebSocket};
+use reqwest_websocket::{CloseCode, WebSocket};
 use tokio::sync::Notify;
-use tokio::time::{timeout, Instant};
+use tokio::time::Instant;
 use tracing::debug;
 
 use crate::configuration::SignalServers;
@@ -150,7 +150,7 @@ enum KeepAliveSendOutcome {
 
 /// Why a frame write did not complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WsWriteError {
+pub(crate) enum WsWriteError {
     Failed,
     TimedOut,
 }
@@ -329,7 +329,7 @@ struct SignalWebSocketProcess {
         BoxFuture<'static, Result<WebSocketResponseMessage, Canceled>>,
     >,
 
-    ws: WebSocket,
+    link: crate::websocket::link::WsLink,
 
     // KT (single-connection): shared facade state (close-code bookkeeping)
     // and the termination signal for the kill-before-create handover.
@@ -462,20 +462,13 @@ impl SignalWebSocketProcess {
         message: WebSocketMessage,
         stage: &'static str,
     ) -> Result<(), WsWriteError> {
-        use prost::Message;
-        let buffer = message.encode_to_vec();
-        match timeout(
-            SEND_TIMEOUT,
-            self.ws.send(WsMessage::Binary(buffer.into())),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                tracing::warn!(stage, %error, "websocket frame write failed");
+        match self.link.send_frame(message, SEND_TIMEOUT).await {
+            Ok(()) => Ok(()),
+            Err(WsWriteError::Failed) => {
+                tracing::warn!(stage, "websocket frame write failed");
                 Err(WsWriteError::Failed)
             },
-            Err(_) => {
+            Err(WsWriteError::TimedOut) => {
                 tracing::warn!(stage, "websocket frame write timed out");
                 Err(WsWriteError::TimedOut)
             },
@@ -495,17 +488,13 @@ impl SignalWebSocketProcess {
         // `WebSocket::close` consumes the socket, so send the official 3001
         // close frame through the sink and then close it; both steps are
         // bounded so a dead transport cannot wedge this task.
-        let _ = timeout(CLOSE_TIMEOUT, async {
-            let _ = self
-                .ws
-                .send(WsMessage::Close {
-                    code: CloseCode::Library(CLOSE_CODE_TIMEOUT),
-                    reason: reason.to_owned(),
-                })
-                .await;
-            let _ = futures::SinkExt::close(&mut self.ws).await;
-        })
-        .await;
+        self.link
+            .close(
+                CloseCode::Library(CLOSE_CODE_TIMEOUT),
+                reason,
+                CLOSE_TIMEOUT,
+            )
+            .await;
         self.keepalive.in_flight = None;
         self.outgoing_requests.clear();
     }
@@ -618,47 +607,31 @@ impl SignalWebSocketProcess {
                     // not reconnect a link that a newer local dial replaced.
                     self.shared.lock().unwrap().last_close_code =
                         Some(CLOSE_CODE_LOCAL_HANDOVER);
-                    let _ = timeout(
-                        CLOSE_TIMEOUT,
-                        self.ws.send(WsMessage::Close {
-                            code: CloseCode::Away,
-                            reason: String::new(),
-                        }),
-                    )
-                    .await;
+                    self.link
+                        .close(CloseCode::Away, "", CLOSE_TIMEOUT)
+                        .await;
                     self.outgoing_requests.clear();
                     break;
                 }
                 // Incoming websocket message
-                web_socket_item = self.ws.next().fuse() => {
-                    use reqwest_websocket::Message;
-                    match web_socket_item {
-                        Some(Ok(Message::Close { code, reason })) => {
-                            let code = u16::from(code);
-                            tracing::warn!(%code, reason, "websocket closed");
-                            if code == CLOSE_CODE_CONNECTED_ELSEWHERE {
+                event = self.link.next_event().fuse() => {
+                    use crate::websocket::link::WsEvent;
+                    match event {
+                        WsEvent::Closed(code) => {
+                            tracing::warn!(?code, "websocket closed");
+                            if code == Some(CLOSE_CODE_CONNECTED_ELSEWHERE) {
                                 tracing::warn!("websocket closed with 4409 (connected elsewhere): another client took over this device connection"); // KT (single-connection)
                             }
-                            self.shared.lock().unwrap().last_close_code = Some(code);
+                            self.shared.lock().unwrap().last_close_code = code;
                             break;
                         },
-                        Some(Ok(Message::Binary(frame))) => {
+                        WsEvent::Frame(frame) => {
                             self.process_frame(frame).await?;
                         }
-                        Some(Ok(Message::Ping(_))) => {
-                            tracing::trace!("received ping");
+                        WsEvent::Chat(_) => {
+                            tracing::warn!("official chat event reached legacy process; ignoring");
                         }
-                        Some(Ok(Message::Pong(_))) => {
-                            tracing::trace!("received pong");
-                        }
-                        Some(Ok(Message::Text(_))) => {
-                            tracing::trace!("received text (unsupported, skipping)");
-                        }
-                        Some(Err(e)) => {
-                            tracing::warn!(%e, "websocket read failed; link is dead");
-                            return Err(e.into());
-                        }
-                        None => {
+                        WsEvent::End => {
                             tracing::warn!("websocket stream ended; link is dead");
                             return Err(ServiceError::WsClosing {
                                 reason: "end of web request stream; socket closing"
@@ -732,7 +705,7 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             ]
             .into_iter()
             .collect(),
-            ws,
+            link: crate::websocket::link::WsLink::Legacy(ws),
             shared: Arc::clone(&inner),
             kill: Arc::clone(&kill),
         };

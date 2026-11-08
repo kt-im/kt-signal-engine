@@ -192,6 +192,10 @@ impl OfficialSocket {
         send_request(&self.chat, message, timeout).await
     }
 
+    pub async fn disconnect(&self) {
+        self.chat.disconnect().await;
+    }
+
     pub async fn next(&mut self) -> Option<ChatEvent> {
         self.events.recv().await
     }
