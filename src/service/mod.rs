@@ -1704,6 +1704,24 @@ pub(crate) const MAX_DELETE_FOR_ME_MESSAGES: usize = 256;
 /// messageDeletes[0]{conversation, messages[]}——官方按会话聚合，
 /// `messages = items.map(toAddressableMessage)`；本方法一次 RPC 只服务
 /// 一个会话，故恰一条 MessageDeletes。padded sync message。
+/// Own outgoing rows are stored with the account E164; the delete sync
+/// protocol expects the author's ACI (official toAddressableMessage).
+fn normalize_delete_for_me_authors(
+    entries: Vec<DeleteForMeEntry>,
+    own_aci: &presage::libsignal_service::protocol::ServiceId,
+    own_e164: &str,
+) -> Vec<DeleteForMeEntry> {
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            if matches!(&entry.author, DeleteForMeAuthor::Phone(phone) if phone == own_e164) {
+                entry.author = DeleteForMeAuthor::ServiceId(own_aci.clone());
+            }
+            entry
+        })
+        .collect()
+}
+
 fn build_delete_for_me_messages_sync(
     conversation: &DeleteForMeConversation,
     entries: &[DeleteForMeEntry],
@@ -4169,6 +4187,8 @@ impl Service {
         let own_aci = presage::libsignal_service::protocol::ServiceId::Aci(
             manager.registration_data().service_ids.aci.into(),
         );
+        let own_e164 = manager.registration_data().phone_number.to_string();
+        let entries = normalize_delete_for_me_authors(entries, &own_aci, &own_e164);
         let body = ContentBody::SynchronizeMessage(build_delete_for_me_messages_sync(
             &conversation,
             &entries,
