@@ -213,7 +213,7 @@ impl PushService {
         credentials: Option<ServiceCredentials>,
     ) -> Result<SignalWebSocket<C>, ServiceError> {
         #[cfg(feature = "cdsi")]
-        if std::env::var("KT_WS_TRANSPORT").as_deref() == Ok("official") {
+        if std::env::var("KT_WS_TRANSPORT").as_deref() != Ok("legacy") {
             if let Some(credentials) = credentials.clone() {
                 return self.ws_official::<C>(credentials).await;
             }
