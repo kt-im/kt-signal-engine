@@ -203,6 +203,41 @@ impl OfficialSocket {
     }
 }
 
+
+
+/// Send-only half of the official connection, used by SignalWebSocket
+/// without changing the receive path yet.
+pub struct OfficialRequester {
+    chat: std::sync::Arc<ChatConnection>,
+    alive: std::sync::atomic::AtomicBool,
+}
+
+impl OfficialRequester {
+    pub fn new(chat: ChatConnection) -> Self {
+        Self {
+            chat: std::sync::Arc::new(chat),
+            alive: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub async fn request(
+        &self,
+        message: WebSocketRequestMessage,
+        timeout: Duration,
+    ) -> Result<crate::proto::WebSocketResponseMessage, ChatTransportError> {
+        send_request(&self.chat, message, timeout).await
+    }
+
+    pub fn close(&self) {
+        self.alive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
