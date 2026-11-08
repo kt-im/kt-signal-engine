@@ -212,6 +212,13 @@ impl PushService {
         additional_headers: &[(&'static str, &str)],
         credentials: Option<ServiceCredentials>,
     ) -> Result<SignalWebSocket<C>, ServiceError> {
+        #[cfg(feature = "cdsi")]
+        if std::env::var("KT_WS_TRANSPORT").as_deref() == Ok("official") {
+            if let Some(credentials) = credentials.clone() {
+                return self.ws_official::<C>(credentials).await;
+            }
+        }
+
         let span = debug_span!("websocket");
 
         let mut url = Endpoint::service(path).into_url(&self.cfg)?;
