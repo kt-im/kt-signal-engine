@@ -8221,6 +8221,21 @@ async fn serve_account_stream(
                     ack.ack();
                 }
                 Some(Received::Content(content, ack)) => {
+                    {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let server_ts = content.metadata.server_timestamp.timestamp_millis();
+                        tracing::warn!(
+                            target: "engine.latency",
+                            stage = "content_enter",
+                            server_ts,
+                            now_ms,
+                            delta_ms = now_ms - server_ts,
+                            "incoming content reached receive loop"
+                        );
+                    }
                     // S2a 打点：Content 臂信封计数。
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTENT, 1);
                     // 延迟探针（契约 §4.90 服务器时间戳的观测用法）：
