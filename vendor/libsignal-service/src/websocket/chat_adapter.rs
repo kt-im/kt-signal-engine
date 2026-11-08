@@ -123,14 +123,29 @@ pub async fn send_request(
 }
 
 
-use libsignal_net::chat::ws::{EventListener, FinishError, FinishReason, ListenerEvent};
+use libsignal_net::chat::ws::{
+    EventListener, FinishError, FinishReason, ListenerEvent, TaskExitError,
+};
+use libsignal_net::infra::ws::connection::NextEventError;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Events emitted by the official chat listener.
 pub enum ChatEvent {
     Incoming(ChatIncoming),
-    Finished(Result<FinishReason, FinishError>),
+    Finished(Option<u16>),
     Other,
+}
+
+/// Extracts the server close code from an official finish result.
+pub fn finish_close_code(
+    result: &Result<FinishReason, FinishError>,
+) -> Option<u16> {
+    match result {
+        Err(FinishError::Error(TaskExitError::WebsocketError(
+            NextEventError::AbnormalServerClose { code, .. },
+        ))) => Some(u16::from(*code)),
+        _ => None,
+    }
 }
 
 /// Builds the official listener closure. It only classifies and forwards;
@@ -141,7 +156,9 @@ pub fn listener(sender: UnboundedSender<ChatEvent>) -> EventListener {
             ListenerEvent::ReceivedMessage(request, responder) => {
                 ChatEvent::Incoming(map_incoming(request, responder))
             }
-            ListenerEvent::Finished(result) => ChatEvent::Finished(result),
+            ListenerEvent::Finished(result) => {
+                ChatEvent::Finished(finish_close_code(&result))
+            }
             _ => ChatEvent::Other,
         };
         let _ = sender.send(mapped);
@@ -198,6 +215,15 @@ mod tests {
             body: Some(vec![1, 2, 3].into()),
             headers: vec!["x-test:yes".to_owned()],
         }
+    }
+
+    #[test]
+    fn finish_without_close_code_stays_none() {
+        assert_eq!(
+            finish_close_code(&Ok(FinishReason::RemoteDisconnect)),
+            None
+        );
+        assert_eq!(finish_close_code(&Err(FinishError::Unknown)), None);
     }
 
     #[test]
