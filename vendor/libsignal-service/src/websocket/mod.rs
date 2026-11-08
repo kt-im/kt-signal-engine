@@ -225,6 +225,9 @@ pub use request::WebSocketRequestMessageBuilder;
 #[cfg(feature = "cdsi")]
 pub mod chat_adapter;
 
+#[cfg(feature = "cdsi")]
+pub mod link;
+
 type RequestStreamItem = (
     WebSocketRequestMessage,
     oneshot::Sender<WebSocketResponseMessage>,
