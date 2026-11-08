@@ -246,6 +246,42 @@ impl OfficialRequester {
     }
 }
 
+
+
+/// Connects and returns an official socket with a real listener.
+pub async fn connect_socket<TC, R>(
+    resources: ConnectionResources<'_, TC>,
+    service: ServiceName,
+    route: R,
+    user_agent: &UserAgent,
+    headers: ChatHeaders,
+) -> Result<OfficialSocket, ConnectError>
+where
+    TC: WebSocketTransportConnectorFactory<UsePreconnect<TransportRoute>>,
+    R: RouteProvider<Route = UnresolvedHttpsServiceRoute>,
+{
+    let (sender, events) = tokio::sync::mpsc::unbounded_channel();
+    let pending = ChatConnection::start_connect_with(
+        resources,
+        service,
+        route,
+        "/v1/websocket/",
+        user_agent,
+        RECOMMENDED_CHAT_WS_CONFIG,
+        Some(headers),
+        "kt-signal-chat",
+    )
+    .await?;
+
+    let chat = ChatConnection::finish_connect(
+        tokio::runtime::Handle::current(),
+        pending,
+        HashMap::new(),
+        listener(sender),
+    );
+    Ok(OfficialSocket::new(chat, events))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
