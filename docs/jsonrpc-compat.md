@@ -176,7 +176,8 @@ profile/群头像走 cdn_upload 自有字节帽，不在本闸。
 | 方法 | params（关键字段） | result | 错误 | 对齐状态 |
 |---|---|---|---|---|
 | `version` | `{}`（零参数，params 忽略——wire 宽容，generateInviteLinkPassword 同口径；账号无关，未绑定账号照常应答） | `{name, version, contractRevision}`（旧双键恒在：name = 引擎本名 `kt-signal-engine`、version = 引擎本仓版本——诚实自报不冒充上游名；libsignal 基线不在本面，`engine.protocolCapabilities.baseline` 所有，不自造字段。**2026-11-10 O1 握手引擎腿 additive【engine-compat】**：`contractRevision` = 引擎共享契约修订字符串，单源常量 `src/contract.rs::CONTRACT_REVISION`（当前 `1.285`），与 `engine.protocolCapabilities.contractRevision` 同值；connector `src/engine_contract.rs` O1 握手以闭区间 `1.200-1.285` 数字比较，本面是 capabilities 权威面的回退面） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-14 real（白名单补齐批，wire additive，engine-compat）**：上游 signal-cli JSON-RPC 元方法——connector `runtime.doctor`（§4.79）版本探针的引擎腿，doctor 以空参/只读车道/3s 诊断预算调用并把应答**原样透传**（verbatim，不 re-key 不归一，doctor-contract.md 钉定）；缺该方法的引擎被 doctor 按「上游错误类」降级（`present:false` + 固定理由文案「an engine that does not carry it surfaces the upstream class」冒上桌面——真机验收发现的根因面）；读面不落调度日志零 stderr；fake：同码路真实答。**2026-11-10 O1 握手引擎腿（wire additive【engine-compat】）**：新增 `contractRevision`（单源常量 1.285，与 `engine.protocolCapabilities` 同值），旧 `{name, version}` 双键零变化，见 §5 O1 块 |
-| `startLink` | `{}` | `{deviceLinkUri}`（real：官方 `sgnl://linkdevice?uuid=…&pub_key=…` + **单个** `capabilities=nopni,nopni2,backup5` 参数，`qr_link_url` 收敛面） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩。**2026-10-15 real（转移弹窗修复批，engine-compat）**：capabilities 收敛为单参数并保证 `backup5` 在位——此前 `link_uri`（nopni,nopni2）+ `append_pair`（backup5）产出两个同名参数，Android 扫码侧 `Uri.getQueryParameter`（单数）只取第一个，`backup5` 被吞 → 手机判 VALID_WITHOUT_SYNC：链接成功但不弹「转移聊天记录」、不上传迁移档案 |
+| `startLink` | `{}` | `{deviceLinkUri, linkAttemptId, slots}`（`deviceLinkUri` = 第 0 槽，旧端逐字兼容；`linkAttemptId`（attempt 键）与 `slots: [{deviceLinkUri, slot}]`（live 槽表，slot 号 = 下标）是 2026-11-11 双槽轮换 additive 键。real：官方 `sgnl://linkdevice?uuid=…&pub_key=…` + **单个** `capabilities=nopni,nopni2,backup5` 参数，`qr_link_url` 收敛面） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩。**2026-10-15 real（转移弹窗修复批，engine-compat）**：capabilities 收敛为单参数并保证 `backup5` 在位——此前 `link_uri`（nopni,nopni2）+ `append_pair`（backup5）产出两个同名参数，Android 扫码侧 `Uri.getQueryParameter`（单数）只取第一个，`backup5` 被吞 → 手机判 VALID_WITHOUT_SYNC：链接成功但不弹「转移聊天记录」、不上传迁移档案；**2026-11-11 real（双槽 QR 轮换引擎腿，wire additive【engine-compat】，§5 块）**：新增 `linkAttemptId`/`slots` 两键，第 0 槽仍由顶层 `deviceLinkUri` 表达——没有 rotate 的调用方行为零变化（单槽语义原样），新 startLink 仍作废上一个 attempt（旧 attempt 的全部槽按未注册回收、在飞 finish 回 LINK_LOST） |
+| `rotateLink` | `{linkAttemptId}`（attempt 键，来自本 attempt 的 startLink 应答；缺席/非字符串 fail-closed 到同一码位） | `{deviceLinkUri, slot, slots}`（新槽 uri + 槽号 + 该 attempt 当前 live 槽全表；槽号 = live 槽表下标，收回后重排，调用方按 `slots` 全量重渲染） | `-1` `LINK_ATTEMPT_NOT_FOUND`（attempt 不存在/已被新 startLink 顶掉/已随提交收口）；其余折叠 `-32603` | **2026-11-11 real（双槽 QR 轮换引擎腿，wire additive【engine-compat】，§5 块）**：为同一 attempt 铸新 provisioning 会话（复用 startLink 的单槽铸造路径 `mint_link_slot`）；live 槽上限 2，第 3 个槽进 = 最旧槽退（abort 其 flow、按未注册回收、落 LINK_LOST 墓碑）；要退的槽上有在飞 finish 时不 abort（只置退休旗，收口延后到它归零）——轮换绝不丢掉用户正在确认的那次提交 |
 | `finishLink` | `{deviceLinkUri, deviceName}` | `{number, aci?}`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批） | `-1` `Unknown device link uri.`；`-1` `LINK_LOST`（B1/issue #951：URL 交付后 provisioning WS 关闭/超时/流结束 = 会话已死，确定性失败，不是 -32603） | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩。**2026-11-11 real（B1 链接会话 lost 批，wire additive【engine-compat】，§5 块）**：link_flow 在 URL 交付后 provisioning 会话终局（WS 关闭/keepalive 超时/流结束）归类 LinkError::Lost，注册数据落库/重载失败仍 Internal；每个 link 用独立 `uri→PendingRecord{state,result,committed}`，finishLink 只等自己的记录，只有真正执行过 add_account 的记录才回 Ok，被新 start 顶掉的旧 finish 回 LINK_LOST/UnknownUri；新 start 以 supersede 代次复核后登记 pending，锁外 abort 旧 flow（JoinHandle + state 收口），旧未提交 store 回收 |
 | `listAccounts` | `{}` | `[{"number", "aci"?, "capabilities"?}]`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批；capabilities additive 2026-10-20，回填能力门数据面，§5 块——`{attachmentBackfill: bool}` 单键对象，取不到时整键缺席）；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录）；**2026-10-20 real/fake（回填能力门数据面批，wire additive，engine-compat，§5 块）**：条目 additive `capabilities` 键 = 本机 profile 的 `capabilities.attachmentBackfill`（官方 `isBackfillEnabled` 消费位，attachmentBackfill.preload.ts:57-72），有界缓存 + 整批 2s 预算，读面失败/超时/未注册 = 整键缺席（不投 false、不连坐列表）；fake 形状桩投引擎自声明位 |
 | `listContacts` | `{account}` | `[{number, name?, profile?: {givenName?, familyName?}}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；**2026-10-16 real（profile 名字刷新批，wire additive，engine-compat，§5 块）**：条目 additive `profile` 键——`{givenName, familyName}` 仅非空时出现（两件全空 = 整键不在；no-null 纪律，缺席与 null 折叠同一无键态），数据源 = profiles 表（`profiles.refreshContacts` 拉取落库面，键形状与 signal-cli 同形：givenName/familyName，connector supervisor 消费腿同形）；`name` 键语义不变（contacts 同步名，缺席键不在） |
@@ -7099,3 +7100,61 @@ announcements/terminated、收件人解析、profileSharing 白名单）仅 real
   退避中停机、删除等待在飞帧、MRM 池隔离与 fail-closed、并发 link/delete
   串行与 tmp 无残留、分位/环形缓冲/在飞守卫；契约测试钉定
   `engine.perfMetrics` 六键形状（基础四键 + additive 两键）。
+
+### 双槽 QR 轮换引擎腿批（2026-11-11，startLink/rotateLink 双槽，wire additive【engine-compat】）
+
+**背景**：单槽 QR 的扫码窗口只覆盖「手机扫到 → 确认」一次；连接器/桌面要在
+不打断用户确认的前提下轮换二维码，需要引擎侧承认「一次链接尝试（attempt）里
+可以有多个 provisioning 槽」。本批在引擎侧落地 attempt/槽模型，对旧端零破坏。
+
+**wire 面（additive）**
+
+- `startLink`：旧键 `deviceLinkUri` 保持 = 第 0 槽；新增 `linkAttemptId`
+  （attempt 键，rotateLink 的入参）与 `slots: [{deviceLinkUri, slot}]`
+  （该 attempt 的 live 槽表，slot 号 = 表下标）。没有 rotate 时 `slots` 恒为
+  单槽 —— 旧调用方读 `deviceLinkUri` 的行为逐字不变。
+- `rotateLink {linkAttemptId}` → `{deviceLinkUri, slot, slots}`：为同一
+  attempt 铸新 provisioning 会话；同一 attempt 最多 2 个 live 槽，超出时收回
+  最旧槽。attempt 不存在（已被新 `startLink` 顶掉 / 已随提交收口 / 参数缺失）
+  → `-1` + `LINK_ATTEMPT_NOT_FOUND`（确定性契约错误，不是 `-32603`）。
+- `finishLink` 仍按 `deviceLinkUri`：接受该 attempt 内任一 live 槽的 uri，
+  提交只发生一次（attempt 级提交门单飞），成功后收回其余槽；已提交 attempt 的
+  任一槽重复 finish 幂等回同一账号。
+
+**实现要点（engine 侧）**
+
+- `Inner` 增 `attempts: HashMap<attemptId, LinkAttempt{slots: Vec<uri>, committed}>`；
+  `links: uri → PendingRecord` 保留（每槽一条独立记录）。
+- 单槽铸造抽成 `Service::mint_link_slot`（开 store → spawn flow → 30s URL
+  有界等待），`startLink` 与 `rotateLink` 共用；登记（写 `links` 与槽表归属）
+  由调用方在 `inner` 锁内完成，过期铸造走 `MintedLinkSlot::discard` 当场收口。
+- attempt 级提交位被全部槽的 `PendingRecord::committed` 共享（同一把锁）：
+  跨槽提交单飞；兄弟槽完成链接后，等在本槽结果上的在飞 finish 读提交位拿回同一
+  账号，不丢成 LINK_LOST。
+- 退休（rotate 淘汰 / 提交后收回其余槽）`Service::retire_slot`：`inflight_finishes > 0`
+  时只置退休旗，物理收口（abort flow + 未注册 store 回收）由最后一个 finish 在
+  `FinishGuard` 里落地；无在飞 finish 则当场收口并落 LINK_LOST 墓碑（旧码后续
+  finish 稳定回 LINK_LOST）。
+- `startLink` 仍作废上一个 attempt：清 `attempts` + 取走全部 `links`，旧 flow
+  abort、在飞 finish 确定性回 LINK_LOST（B1 语义不变）。
+- 槽表不变量（审计必须项）：`attempt.slots` **恒等于 live 槽表**。任何让
+  uri 离开 `links` 的出口（finish 的 LINK_LOST 收口、提交后的兄弟槽收口）都
+  同步 `retain_live_attempt_slots`，`rotateLink` 在 push 新槽前再按 `links`
+  存在性修剪一次（双保险）；淘汰循环跳过已死目标、继续找真正最旧的活槽。应答
+  `slots` 只含 live 槽、`slot` 号 = 表下标（死槽不占位）。
+- 文件面：`accounts/lk-*` 每槽一个目录；退休未提交 = 埋掉（同 B1 的
+  `remove_link_store` 纪律，先 take 句柄再删目录）。
+
+**门禁**
+
+- 单测（`src/service/mod.rs`）：rotate 后两个槽都能 finish、第 3 次 rotate 淘汰
+  最旧且旧码 finish 回 LINK_LOST、两个槽并发 finish 只提交一次、rotate 不打断
+  在飞 finish、attempt 不存在错误码；槽表不变量三条——第 0 槽 LINK_LOST 后
+  rotate 应答不含死槽、残留死槽不抢淘汰名额（活槽不被误退休）、死槽不占 slot
+  下标。**跨槽幂等（提交第 1 槽后另一码 replay 回同一账号、只建 1 个账号）在
+  真面单测断言**（attempt 级提交位只在真面存在）。
+- 契约测试（`tests/contract.rs` fake 面）：只覆盖 wire 形状——`startLink` 三键
+  形状 + `rotateLink` 槽表 + 提交 rotate 出来的**第 1 槽** + `LINK_ATTEMPT_NOT_FOUND`
+  码位。fake 面 `finishLink` 首提交即清空 `fake_link`（无 store、无 attempt 级
+  提交位），**表达不了跨槽幂等**，因此不用 `accounts.len()==1` 自证单飞。
+- `cargo fmt` / `cargo clippy --all-targets -- -D warnings` / 全量单测与契约测试全绿。

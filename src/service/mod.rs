@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -915,6 +915,9 @@ pub(crate) enum LinkError {
     /// 关闭/超时/流结束即 QR 必死，finishLink 以 -1 + LINK_LOST 确定性应答
     /// （不是 -32603，避免 connector 把会话死亡当引擎内部错误重试）。
     Lost,
+    /// rotateLink 入参的 attemptId 不存在（已被新 startLink 顶掉 / 已提交
+    /// 收口）：wire -1 + LINK_ATTEMPT_NOT_FOUND 确定性应答，不是 -32603。
+    AttemptNotFound,
     /// 内部失败（-32603，细节不外泄）。
     Internal,
 }
@@ -926,6 +929,106 @@ pub(crate) enum LinkError {
 pub(crate) struct LinkedAccount {
     pub(crate) number: String,
     pub(crate) aci: Option<String>,
+}
+
+/// 同一 attempt 的 live 槽上限（双槽 QR 轮换：第 3 个槽进 = 最旧的槽退）。
+const LINK_MAX_LIVE_SLOTS: usize = 2;
+
+/// startLink 应答里的单个槽（additive）：slot 是 live 槽表下标（0 起），
+/// deviceLinkUri 是该槽的 provisioning QR。旧端只读顶层 deviceLinkUri
+///（= 第 0 槽）即可保持单槽行为。
+#[derive(Debug, Clone)]
+pub(crate) struct LinkSlotView {
+    pub slot: usize,
+    pub device_link_uri: String,
+}
+
+/// startLink 应答投影：deviceLinkUri 仍是第 0 槽（旧端逐字兼容），
+/// linkAttemptId + slots 是 additive 键（rotateLink 的入参与槽表）。
+#[derive(Debug, Clone)]
+pub(crate) struct LinkAttemptView {
+    pub attempt_id: String,
+    pub slots: Vec<LinkSlotView>,
+}
+
+impl LinkAttemptView {
+    /// 第 0 槽 uri（旧字段 deviceLinkUri 的唯一来源）。
+    pub(crate) fn device_link_uri(&self) -> &str {
+        self.slots
+            .first()
+            .map(|slot| slot.device_link_uri.as_str())
+            .unwrap_or_default()
+    }
+
+    /// wire 投影（compat §3 startLink 行）：三个键恒在。
+    pub(crate) fn to_json(&self) -> Value {
+        let mut row = serde_json::Map::with_capacity(3);
+        row.insert("deviceLinkUri".to_owned(), json!(self.device_link_uri()));
+        row.insert("linkAttemptId".to_owned(), json!(self.attempt_id));
+        row.insert("slots".to_owned(), link_slots_json(&self.slots));
+        Value::Object(row)
+    }
+}
+
+/// rotateLink 应答投影：新槽 uri + 槽号 + 该 attempt 当前 live 槽全表
+///（调用方按 slots 全量重渲染，槽号可能因收回重排）。
+#[derive(Debug, Clone)]
+pub(crate) struct LinkRotateView {
+    pub device_link_uri: String,
+    pub slot: usize,
+    pub slots: Vec<LinkSlotView>,
+}
+
+impl LinkRotateView {
+    /// wire 投影（compat §3 rotateLink 行）：三个键恒在。
+    pub(crate) fn to_json(&self) -> Value {
+        let mut row = serde_json::Map::with_capacity(3);
+        row.insert("deviceLinkUri".to_owned(), json!(self.device_link_uri));
+        row.insert("slot".to_owned(), json!(self.slot));
+        row.insert("slots".to_owned(), link_slots_json(&self.slots));
+        Value::Object(row)
+    }
+}
+
+/// 槽表 → wire 槽数组（[{deviceLinkUri, slot}]，下标即槽号）。
+fn link_slots_json(slots: &[LinkSlotView]) -> Value {
+    Value::Array(
+        slots
+            .iter()
+            .map(|slot| {
+                json!({
+                    "deviceLinkUri": slot.device_link_uri,
+                    "slot": slot.slot,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// 槽 uri 表 → 视图（slot 号 = 表下标；每次应答都带全表，收回后重排）。
+fn link_slot_views(slots: &[String]) -> Vec<LinkSlotView> {
+    slots
+        .iter()
+        .enumerate()
+        .map(|(slot, uri)| LinkSlotView {
+            slot,
+            device_link_uri: uri.clone(),
+        })
+        .collect()
+}
+
+/// 落 LINK_LOST 墓碑：记录摘除/回收后重复 finishLink 仍稳定回同一确定错误
+///（B1 幂等约定）。上限 64 条，先到先出。
+fn push_lost_link_tombstone(inner: &mut Inner, uri: &str, lost_at: u64) {
+    let mut tombstones = inner
+        .lost_link_tombstones
+        .lock()
+        .expect("lost tombstone lock");
+    tombstones.push((uri.to_owned(), lost_at));
+    let overflow = tombstones.len().saturating_sub(64);
+    if overflow > 0 {
+        tombstones.drain(0..overflow);
+    }
 }
 
 #[derive(Debug)]
@@ -2547,9 +2650,15 @@ fn link_lost_at(state: &StdMutex<LinkSessionState>) -> Option<u64> {
     state.lock().expect("link state lock").lost_at()
 }
 
-/// 单个 link 会话的独立记录（uri 键控）：finishLink 只等自己 uri 的记录，
+/// 单个 link 槽的独立记录（uri 键控）：finishLink 只等自己 uri 的记录，
 /// 新 startLink 取走旧记录后，旧 finish 不可能再拿到别人的结果冒充成功。
+///
+/// 双槽轮换（rotateLink）下同一 attempt 的全部槽共享 committed（attempt 级
+/// 提交位）：跨槽提交单飞，被 rotate 收回的槽上的在飞 finish 也能拿回同一
+/// 结果，绝不丢成 LINK_LOST。
 struct PendingRecord {
+    /// 本槽的 provisioning uri（finish 按它索引；retire 收口时摘除/墓碑用）。
+    uri: String,
     store_dir: PathBuf,
     /// 链接 store 的第二个句柄：flow 收口后由 finish 复用，避免刚 drop 连接
     /// 池就重开同一 SQLite 文件（sqlx 池关闭是异步的）。提交重试时为空才
@@ -2563,12 +2672,114 @@ struct PendingRecord {
     /// 会话状态共享槽：link_flow 任务落 lost/lostAt，finishLink 据此回
     /// LINK_LOST（与结果槽分离，结果只负责唤醒等待者）。
     state: Arc<StdMutex<LinkSessionState>>,
-    /// 提交门 + 已提交结果：只有真正执行过 `state.add_account` 的 finish
-    /// 才会落 Some。并发同 uri finish 用它做单飞，连接器超时重试用它做
-    /// 幂等应答；未提交记录永远不会借此返回成功。
-    committed: AsyncMutex<Option<LinkedAccount>>,
+    /// attempt 级提交门 + 已提交结果（同一 attempt 的全部槽共享同一把锁，
+    /// 见 LinkAttempt::committed）：只有真正执行过 state.add_account 的
+    /// finish 才会落 Some。跨槽并发 finish 用它做单飞，连接器超时重试用它
+    /// 做幂等应答；未提交记录永远不会借此返回成功。
+    committed: Arc<AsyncMutex<Option<LinkedAccount>>>,
+    /// 所属 attempt（提交后收回其余槽 / 诊断用）。
+    attempt_id: String,
     /// 被更新的 startLink 顶掉：置位后任何 finish 都不得再提交或返回成功。
     superseded: AtomicBool,
+    /// 已被 rotate/提交收回（不再是 live 槽）：置位后不再接受新的 finish；
+    /// 在飞的那次不受影响，物理收口延迟到它归零（见 Service::retire_slot）。
+    retired: AtomicBool,
+    /// 在飞 finish 计数：>0 时不得 abort 本槽 flow（会把用户正在确认的那次
+    /// 提交结果丢掉）。rotate 只置退休旗，收口由最后一个 finish 落地。
+    inflight_finishes: AtomicUsize,
+}
+
+/// 一次 startLink 的链接尝试（双槽 QR 轮换，additive 契约）：槽表 + attempt
+/// 级提交位。slots 按铸造序排列，slot 号 = 下标；rotateLink 追加新槽，超过
+/// LINK_MAX_LIVE_SLOTS 时从最旧开始退休（rotate 淘汰 / 提交后收回）。
+struct LinkAttempt {
+    /// live 槽 uri（铸造序）。
+    slots: Vec<String>,
+    /// attempt 级提交位：全部槽的 PendingRecord::committed 共享本锁。
+    committed: Arc<AsyncMutex<Option<LinkedAccount>>>,
+}
+
+/// fake 面的链接 attempt 形状桩（compat §6）：无网络桩同样带 attemptId 与
+/// live 槽表；没有 rotate 时只有一个槽（旧单槽语义原样保留）。
+struct FakeLinkAttempt {
+    attempt_id: String,
+    slots: Vec<String>,
+}
+
+/// 一个已铸好、尚未登记的 link 槽（startLink / rotateLink 共用的铸造产物）。
+/// 登记进 Inner::links 才成为可 finish 的会话；登记复核失败时
+/// MintedLinkSlot::discard 当场收口（abort flow + 回收未注册 store）。
+struct MintedLinkSlot {
+    uri: String,
+    store_dir: PathBuf,
+    store: StdMutex<Option<SqliteStore>>,
+    result: Arc<LinkResultSlot>,
+    task: tokio::task::JoinHandle<()>,
+    state: Arc<StdMutex<LinkSessionState>>,
+}
+
+impl MintedLinkSlot {
+    /// 铸好的槽 → 待登记记录（锚定 attempt 归属与 attempt 级提交位）。
+    fn into_record(
+        self,
+        attempt_id: String,
+        committed: Arc<AsyncMutex<Option<LinkedAccount>>>,
+    ) -> PendingRecord {
+        PendingRecord {
+            uri: self.uri,
+            store_dir: self.store_dir,
+            store: self.store,
+            result: self.result,
+            task: StdMutex::new(Some(self.task)),
+            state: self.state,
+            committed,
+            attempt_id,
+            superseded: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            inflight_finishes: AtomicUsize::new(0),
+        }
+    }
+
+    /// 丢弃一个未登记的槽（铸造后已过期）：abort flow → 放掉 store 句柄 →
+    /// 回收未注册目录（跨平台顺序同 retire_pending_record）。
+    async fn discard(self) {
+        self.task.abort();
+        let _ = self.task.await;
+        let _ = self.store.lock().expect("link store lock").take();
+        let _ = remove_link_store(&self.store_dir).await;
+    }
+}
+
+/// finishLink 的在飞守卫：进入时已在 Inner 锁内计数，离开（含早退）时归零；
+/// 归零且该槽已被退休时，在这里落地物理收口——retire 因为它在飞而推迟的那
+/// 次 abort/回收，绝不能提前打断用户正在确认的提交。
+struct FinishGuard {
+    service: Arc<Service>,
+    record: Arc<PendingRecord>,
+}
+
+impl FinishGuard {
+    fn new(service: &Arc<Service>, record: Arc<PendingRecord>) -> Self {
+        Self {
+            service: Arc::clone(service),
+            record,
+        }
+    }
+}
+
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        let remaining = self.record.inflight_finishes.fetch_sub(1, Ordering::AcqRel);
+        if remaining != 1 || !self.record.retired.load(Ordering::Acquire) {
+            return;
+        }
+        // Drop 不能 await：回到 LocalSet 里收口（finishLink 只在 LocalSet 内跑）。
+        let service = Arc::clone(&self.service);
+        let record = Arc::clone(&self.record);
+        tokio::task::spawn_local(async move {
+            service.finalize_retired_slot(record).await;
+        });
+    }
 }
 
 /// provisioning 会话终局失败来源（B1）：把「URL 是否已交付」和失败类型
@@ -2651,7 +2862,9 @@ async fn wait_link_task(record: &PendingRecord) {
 /// 收口一个待决链接记录：先立 superseded 旗（在途 finish 不得再提交），
 /// 再 abort 旧 flow，最后只回收从未提交为账号的 store。
 ///
-/// 返回 lostAt；若记录已经提交为真账号则返回 None（不抹掉成功）。
+/// 返回 lostAt；若记录已随 attempt 提交（兄弟槽完成了链接）则返回 None
+///（不抹掉成功），但仍唤醒等在本槽结果上的在飞 finish——它读 attempt 级
+/// 提交位拿回同一账号。
 async fn retire_pending_record(record: Arc<PendingRecord>) -> Option<u64> {
     // 先立旗再 abort：finish 拿到旧结果槽的 Ok 后也必须看见 superseded。
     record.superseded.store(true, Ordering::Release);
@@ -2665,8 +2878,13 @@ async fn retire_pending_record(record: Arc<PendingRecord>) -> Option<u64> {
     // 与在途 finish 的提交门串行：提交成功 = 记录已是真账号，store 必须
     // 保留；未提交 = 这条会话从未成为账号，连同注册数据一起回收，绝不
     // 留下引擎不认识的孤儿 store（用户重扫即可）。
-    let committed = record.committed.lock().await;
-    if committed.is_some() {
+    let committed = record.committed.lock().await.is_some();
+    if committed {
+        // attempt 里别的槽已经提交：唤醒等在本槽结果上的 finish，让它读
+        // attempt 级提交位拿回同一账号（退休槽的在飞提交不丢结果）。
+        if record.result.is_unresolved() {
+            record.result.complete(Err(()));
+        }
         return None;
     }
     // 先放掉 finish 复用的 store 句柄，再删目录（避免自己持有连接时删库）。
@@ -2920,6 +3138,9 @@ struct Inner {
     /// 找记录；新 startLink 取走并 retire 旧记录，不再用单个 pending 槽
     /// 让所有会话互相冒充。
     links: HashMap<String, Arc<PendingRecord>>,
+    /// 链接 attempt 表：attemptId → 槽表 + attempt 级提交位（双槽 QR 轮换，
+    /// additive）。没有 rotate 时每个 attempt 只有一个槽，旧行为不变。
+    attempts: HashMap<String, LinkAttempt>,
     /// supersede 代次：每个 startLink 递增。URL 拿到后只有代次仍是自己
     /// 才允许登记 pending；旧 start 的迟到结果直接丢弃并清理 store。
     link_epoch: u64,
@@ -2927,7 +3148,18 @@ struct Inner {
     /// finishLink 仍要稳定回 LINK_LOST（B1 幂等约定），不能被答成 UnknownUri。
     /// 只保留最近若干条，避免无界增长；新 startLink 不需要清它（uri 唯一）。
     lost_link_tombstones: StdMutex<Vec<(String, u64)>>,
-    fake_pending_uri: Option<String>,
+    /// fake 面：attemptId + live 槽（形状桩）。
+    fake_link: Option<FakeLinkAttempt>,
+}
+
+/// attempt 槽表恒等于 **live 槽表**（审计必须项 1）：任何让 uri 离开
+/// Inner::links 的出口都必须同步摘掉该 uri，否则槽表会退化成「铸造过的槽」，
+/// rotateLink 的应答就会带死槽、slot 下标也会与表位置错位（调用方按 slots
+/// 全量重渲染，错位等于把用户的 QR 指到死会话上）。
+fn retain_live_attempt_slots(inner: &mut Inner, attempt_id: &str, uri: &str) {
+    if let Some(attempt) = inner.attempts.get_mut(attempt_id) {
+        attempt.slots.retain(|candidate| candidate != uri);
+    }
 }
 
 impl Service {
@@ -2944,9 +3176,10 @@ impl Service {
             outbound,
             inner: AsyncMutex::new(Inner {
                 links: HashMap::new(),
+                attempts: HashMap::new(),
                 link_epoch: 0,
                 lost_link_tombstones: StdMutex::new(Vec::new()),
-                fake_pending_uri: None,
+                fake_link: None,
             }),
             pipelines: AsyncMutex::new(HashMap::new()),
             backup_tasks: Arc::new(StdMutex::new(HashMap::new())),
@@ -3368,12 +3601,23 @@ impl Service {
         snapshot
     }
 
-    pub(crate) async fn start_link(self: &Arc<Self>) -> Result<String, LinkError> {
+    pub(crate) async fn start_link(self: &Arc<Self>) -> Result<LinkAttemptView, LinkError> {
         if !self.real {
             let mut inner = self.inner.lock().await;
             let uri = fake_link_uri();
-            inner.fake_pending_uri = Some(uri.clone());
-            return Ok(uri);
+            let attempt_id = random_attempt_id();
+            // 形状桩同样带 attempt：单槽 = 只有一个槽的 attempt。
+            inner.fake_link = Some(FakeLinkAttempt {
+                attempt_id: attempt_id.clone(),
+                slots: vec![uri.clone()],
+            });
+            return Ok(LinkAttemptView {
+                attempt_id,
+                slots: vec![LinkSlotView {
+                    slot: 0,
+                    device_link_uri: uri,
+                }],
+            });
         }
         self.start_link_with_flow(link_flow).await
     }
@@ -3387,17 +3631,20 @@ impl Service {
     async fn start_link_with_flow<F, Fut>(
         self: &Arc<Self>,
         flow_factory: F,
-    ) -> Result<String, LinkError>
+    ) -> Result<LinkAttemptView, LinkError>
     where
         F: FnOnce(SqliteStore, futures::channel::oneshot::Sender<url::Url>) -> Fut + 'static,
         Fut: std::future::Future<Output = Result<LinkOutcome, LinkError>> + 'static,
     {
-        // 锁内只做两件事：登记本次 supersede 代次、取走旧记录。旧 flow
-        // 的 abort/await 与目录回收都放到锁外（retire_pending_record）。
+        // 锁内只做三件事：登记本次 supersede 代次、取走旧记录、清掉旧 attempt。
+        // 旧 flow 的 abort/await 与目录回收都放到锁外（retire_pending_record）。
         let (epoch, retired) = {
             let mut inner = self.inner.lock().await;
             inner.link_epoch = inner.link_epoch.wrapping_add(1);
             let epoch = inner.link_epoch;
+            // 新 startLink 作废上一个 attempt（契约 4：没有 rotate 时仍是单槽，
+            // attempt 归属照旧只保留最新一个）。
+            inner.attempts.clear();
             let retired = inner
                 .links
                 .drain()
@@ -3421,13 +3668,68 @@ impl Service {
             }
         }
 
+        // 铸第 0 槽（与 rotateLink 共用同一条单槽铸造路径）：开 store +
+        // spawn flow + 30s URL 有界等待全部在锁外。
+        let minted = self.mint_link_slot(flow_factory).await?;
+        let uri = minted.uri.clone();
+        let attempt_id = random_attempt_id();
+        let committed = Arc::new(AsyncMutex::new(None));
+
+        // 拿到 URL 后重新加锁做 supersede 复核：等待期间可能有更新的
+        // startLink 抢先把代次推高。只有代次仍是自己才允许登记 pending；
+        // 否则本次迟到结果直接丢弃（abort flow + 清理本次 store），绝不
+        // 覆盖新会话或留下未登记 store。
+        let mut inner = self.inner.lock().await;
+        if inner.link_epoch != epoch {
+            let superseded_epoch = inner.link_epoch;
+            drop(inner);
+            tracing::warn!(
+                target: "engine.link",
+                stage = "superseded_before_commit",
+                epoch,
+                superseded_epoch,
+                "startLink result discarded after URL handoff"
+            );
+            minted.discard().await;
+            return Err(LinkError::Internal);
+        }
+        inner.links.insert(
+            uri.clone(),
+            Arc::new(minted.into_record(attempt_id.clone(), Arc::clone(&committed))),
+        );
+        inner.attempts.insert(
+            attempt_id.clone(),
+            LinkAttempt {
+                slots: vec![uri.clone()],
+                committed,
+            },
+        );
+        Ok(LinkAttemptView {
+            attempt_id,
+            slots: vec![LinkSlotView {
+                slot: 0,
+                device_link_uri: uri,
+            }],
+        })
+    }
+
+    /// 铸一个 provisioning 槽（startLink / rotateLink 共用的单槽铸造路径）：
+    /// 开 store → spawn link flow → 有界等 URL（30s）。返回**未登记**的槽件；
+    /// 登记（写 Inner::links 与槽表归属）及过期复核由调用方在 inner 锁内完成，
+    /// MintedLinkSlot::discard 负责一次过期铸造的当场收口。
+    async fn mint_link_slot<F, Fut>(
+        self: &Arc<Self>,
+        flow_factory: F,
+    ) -> Result<MintedLinkSlot, LinkError>
+    where
+        F: FnOnce(SqliteStore, futures::channel::oneshot::Sender<url::Url>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<LinkOutcome, LinkError>> + 'static,
+    {
         let store_dir = self.data_dir.join("accounts").join(random_dir_name());
-        let store = open_store(&store_dir)
-            .await
-            .map_err(|error| {
-                tracing::warn!(target: "engine.link", stage = "open_store", ?error, "startLink store open failed");
-                LinkError::Internal
-            })?;
+        let store = open_store(&store_dir).await.map_err(|error| {
+            tracing::warn!(target: "engine.link", stage = "open_store", ?error, "link store open failed");
+            LinkError::Internal
+        })?;
         // 给 finish 留一个同池句柄：flow 任务收尾 drop 自己的句柄后，提交段
         // 直接复用本句柄，不重开同一 SQLite 文件。
         let finish_store = store.clone();
@@ -3437,7 +3739,7 @@ impl Service {
         let state = Arc::new(StdMutex::new(LinkSessionState::Pending));
 
         // 链接流程 future 同样非 Send：spawn_local 承载（见 spawn_pipeline）。
-        // start_link 只会从 LocalSet 内的 dispatch 被调用，上下文必然在。
+        // startLink / rotateLink 只会从 LocalSet 内的 dispatch 被调用，上下文必然在。
         let task_slot = Arc::clone(&slot);
         let task_state = Arc::clone(&state);
         let task_store_dir = store_dir.clone();
@@ -3474,7 +3776,7 @@ impl Service {
         let uri = match tokio::time::timeout(Duration::from_secs(30), url_rx).await {
             Ok(Ok(uri)) => uri.to_string(),
             Ok(Err(_)) => {
-                tracing::warn!(target: "engine.link", stage = "url_channel_closed", "startLink provisioning URL channel closed");
+                tracing::warn!(target: "engine.link", stage = "url_channel_closed", "link provisioning URL channel closed");
                 task.abort();
                 let _ = task.await;
                 drop(finish_store);
@@ -3482,7 +3784,7 @@ impl Service {
                 return Err(LinkError::Internal);
             }
             Err(_) => {
-                tracing::warn!(target: "engine.link", stage = "url_timeout", "startLink provisioning URL timed out");
+                tracing::warn!(target: "engine.link", stage = "url_timeout", "link provisioning URL timed out");
                 task.abort();
                 let _ = task.await;
                 drop(finish_store);
@@ -3490,41 +3792,14 @@ impl Service {
                 return Err(LinkError::Internal);
             }
         };
-
-        // 拿到 URL 后重新加锁做 supersede 复核：等待期间可能有更新的
-        // startLink 抢先把代次推高。只有代次仍是自己才允许登记 pending；
-        // 否则本次迟到结果直接丢弃（abort flow + 清理本次 store），绝不
-        // 覆盖新会话或留下未登记 store。
-        let mut inner = self.inner.lock().await;
-        if inner.link_epoch != epoch {
-            let superseded_epoch = inner.link_epoch;
-            drop(inner);
-            tracing::warn!(
-                target: "engine.link",
-                stage = "superseded_before_commit",
-                epoch,
-                superseded_epoch,
-                "startLink result discarded after URL handoff"
-            );
-            task.abort();
-            let _ = task.await;
-            drop(finish_store);
-            let _ = remove_link_store(&store_dir).await;
-            return Err(LinkError::Internal);
-        }
-        inner.links.insert(
-            uri.clone(),
-            Arc::new(PendingRecord {
-                store_dir,
-                store: StdMutex::new(Some(finish_store)),
-                result: slot,
-                task: StdMutex::new(Some(task)),
-                state,
-                committed: AsyncMutex::new(None),
-                superseded: AtomicBool::new(false),
-            }),
-        );
-        Ok(uri)
+        Ok(MintedLinkSlot {
+            uri,
+            store_dir,
+            store: StdMutex::new(Some(finish_store)),
+            result: slot,
+            task,
+            state,
+        })
     }
 
     pub(crate) async fn finish_link(
@@ -3535,13 +3810,13 @@ impl Service {
         if !self.real {
             let mut inner = self.inner.lock().await;
             let matches = inner
-                .fake_pending_uri
-                .as_deref()
-                .is_some_and(|pending| pending == uri);
+                .fake_link
+                .as_ref()
+                .is_some_and(|fake| fake.slots.iter().any(|pending| pending == uri));
             if !matches {
                 return Err(LinkError::UnknownUri);
             }
-            inner.fake_pending_uri = None;
+            inner.fake_link = None;
             let mut state = self.state.lock().await;
             let number = format!("+1555000{:04}", state.accounts().len() + 1);
             state
@@ -3574,8 +3849,10 @@ impl Service {
             }
         };
 
-        // 已提交记录的重试（connector 超时重试）：只有真正执行过
-        // state.add_account 的记录才会落 Some，直接返回同一账号。
+        // 已提交记录的重试（connector 超时重试 / 轮换槽的幂等应答）：同一
+        // attempt 的全部槽共享 attempt 级提交位，只有真正执行过
+        // state.add_account 的记录才会落 Some，直接返回同一账号（跨槽也只
+        // 提交一次）。
         {
             let committed = record.committed.lock().await;
             if let Some(account) = committed.as_ref() {
@@ -3583,11 +3860,32 @@ impl Service {
             }
         }
 
+        // 在飞 finish 登记：与 rotate 的退休判定同锁互斥——退休槽不再接受
+        // 新的 finish；已计数的那次不会被 abort（收口延迟到它归零）。
+        let _finish_guard = {
+            let inner = self.inner.lock().await;
+            if record.retired.load(Ordering::Acquire)
+                || !inner
+                    .links
+                    .get(uri)
+                    .is_some_and(|current| Arc::ptr_eq(current, &record))
+            {
+                return Err(LinkError::Lost);
+            }
+            record.inflight_finishes.fetch_add(1, Ordering::AcqRel);
+            FinishGuard::new(self, Arc::clone(&record))
+        };
+
         // 锁内只做记录查找；等待手机确认必须放锁（finishLink 可能阻塞数分钟，
         // 其他方法必须继续可用）。
         let (number, pending_transfer) = match record.result.wait().await {
             Ok(outcome) => outcome,
             Err(()) => {
+                // attempt 级提交位：兄弟槽已提交时，本槽（可能刚被 rotate
+                // 收回）的 finish 拿回同一结果，绝不丢成 LINK_LOST/内部错误。
+                if let Some(account) = record.committed.lock().await.clone() {
+                    return Ok(account);
+                }
                 // B1：URL 交付后 Provisioning WS 关闭/超时/流结束 = 会话
                 // 已死。记录的 state/lostAt 是判别器（-1 LINK_LOST）；
                 // 没有 lost 记录才是真正的内部失败（-32603）。
@@ -3610,17 +3908,12 @@ impl Service {
                             .is_some_and(|current| Arc::ptr_eq(current, &record))
                         {
                             inner.links.remove(uri);
-                        }
-                        // 墓碑让重复 finish 稳定答 LINK_LOST（幂等）；上限
-                        // 64 条，先到先出。
-                        let mut tombstones = inner
-                            .lost_link_tombstones
-                            .lock()
-                            .expect("lost tombstone lock");
-                        tombstones.push((uri.to_string(), lost_at));
-                        let overflow = tombstones.len().saturating_sub(64);
-                        if overflow > 0 {
-                            tombstones.drain(0..overflow);
+                            // 审计必须项：记录离开 links 的每个出口都要同步把该
+                            // uri 从 attempt 槽表摘掉，attempt.slots 恒等于 live
+                            // 槽表（否则 rotateLink 应答会带死槽、slot 下标错位）。
+                            retain_live_attempt_slots(&mut inner, &record.attempt_id, uri);
+                            // 墓碑让重复 finish 稳定答 LINK_LOST（幂等）。
+                            push_lost_link_tombstone(&mut inner, uri, lost_at);
                         }
                     }
                     let _ = retire_pending_record(record).await;
@@ -3719,6 +4012,10 @@ impl Service {
         };
         *committed = Some(account.clone());
         drop(committed);
+        // 提交成功 = 本 attempt 收口：其余 live 槽立即收回（abort flow +
+        // 未注册回收），attempt 从表里摘掉（rotateLink 此后答 NOT_FOUND）。
+        // 等在这些槽结果上的在飞 finish 由 attempt 级提交位拿回同一账号。
+        self.retire_attempt_siblings(&record).await;
         // 同号重链换新 store 目录：摘除旧常驻管理器（下次发送按新目录重建）。
         self.send_managers.lock().await.remove(&number);
         // 同号重链：摘除旧 MRM 连接槽（R4 槽按账号生命周期；新身份下次发送
@@ -3772,6 +4069,182 @@ impl Service {
             });
         }
         Ok(account)
+    }
+
+    /// rotateLink（双槽 QR 轮换，additive 契约）：为同一 attempt 铸一个新
+    /// provisioning 槽；live 槽超过 LINK_MAX_LIVE_SLOTS 时收回最旧槽（abort
+    /// 其 flow、按未注册回收）。attempt 不存在（已被新 startLink 顶掉或已
+    /// 提交收口）→ LinkError::AttemptNotFound。
+    pub(crate) async fn rotate_link(
+        self: &Arc<Self>,
+        attempt_id: &str,
+    ) -> Result<LinkRotateView, LinkError> {
+        if !self.real {
+            let mut inner = self.inner.lock().await;
+            let Some(fake) = inner.fake_link.as_mut() else {
+                return Err(LinkError::AttemptNotFound);
+            };
+            if fake.attempt_id != attempt_id {
+                return Err(LinkError::AttemptNotFound);
+            }
+            let uri = fake_link_uri();
+            fake.slots.push(uri.clone());
+            while fake.slots.len() > LINK_MAX_LIVE_SLOTS {
+                fake.slots.remove(0);
+            }
+            let slots = link_slot_views(&fake.slots);
+            let slot = slots.len() - 1;
+            return Ok(LinkRotateView {
+                device_link_uri: uri,
+                slot,
+                slots,
+            });
+        }
+        self.rotate_link_with_flow(attempt_id, link_flow).await
+    }
+
+    /// rotateLink 主体：flow 由调用方注入（单测用无网络 flow），与 startLink
+    /// 共用同一条单槽铸造路径（Service::mint_link_slot）。
+    ///
+    /// 锁纪律同 startLink：inner 内只做 attempt 校验与槽表登记，铸造（含 30s
+    /// URL 等待）与退休收口全部在锁外。
+    async fn rotate_link_with_flow<F, Fut>(
+        self: &Arc<Self>,
+        attempt_id: &str,
+        flow_factory: F,
+    ) -> Result<LinkRotateView, LinkError>
+    where
+        F: FnOnce(SqliteStore, futures::channel::oneshot::Sender<url::Url>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<LinkOutcome, LinkError>> + 'static,
+    {
+        {
+            let inner = self.inner.lock().await;
+            if !inner.attempts.contains_key(attempt_id) {
+                return Err(LinkError::AttemptNotFound);
+            }
+        }
+
+        let minted = self.mint_link_slot(flow_factory).await?;
+        let uri = minted.uri.clone();
+
+        let (slot, slots, victims) = {
+            let mut inner = self.inner.lock().await;
+            if !inner.attempts.contains_key(attempt_id) {
+                drop(inner);
+                // 铸造期间 attempt 被新 startLink 顶掉 / 被兄弟槽提交收口：
+                // 本槽当场收口，绝不留未登记 store。
+                tracing::warn!(
+                    target: "engine.link",
+                    stage = "rotate_discarded",
+                    "rotateLink result discarded: attempt gone"
+                );
+                minted.discard().await;
+                return Err(LinkError::AttemptNotFound);
+            }
+            let Inner {
+                attempts, links, ..
+            } = &mut *inner;
+            let attempt = attempts.get_mut(attempt_id).expect("attempt checked above");
+            // 双保险（审计必须项 1）：所有离开 links 的出口已同步 retain，
+            // 这里在 push 新槽前再按 links 存在性修剪一次——任何漏网的出口
+            // 都只会让表暂时多一格死槽，绝不会被当成 live 槽返回，也不占
+            // slot 下标（死槽不参与下标，调用方按 slots 全量重渲染）。
+            attempt
+                .slots
+                .retain(|candidate| links.contains_key(candidate));
+            links.insert(
+                uri.clone(),
+                Arc::new(minted.into_record(attempt_id.to_owned(), Arc::clone(&attempt.committed))),
+            );
+            attempt.slots.push(uri.clone());
+            // 双槽上限：超出即退休最旧的**活**槽。slot 号 = live 槽表下标，
+            // 退休后重排；调用方每次都用应答里的 slots 全表重渲染。
+            let mut victims = Vec::new();
+            while attempt.slots.len() > LINK_MAX_LIVE_SLOTS {
+                let victim = attempt.slots.remove(0);
+                let Some(record) = links.get(&victim).cloned() else {
+                    // 淘汰目标已死（不在 links）：跳过，继续找真正最旧的活槽，
+                    // 不能把它的死 uri 留在表里也不该把它算成一次退休。
+                    continue;
+                };
+                victims.push(record);
+            }
+            let slot = attempt.slots.len() - 1;
+            (slot, link_slot_views(&attempt.slots), victims)
+        };
+
+        for victim in victims {
+            tracing::warn!(
+                target: "engine.link",
+                stage = "rotate_retired",
+                "oldest link slot retired by rotateLink"
+            );
+            self.retire_slot(victim).await;
+        }
+        Ok(LinkRotateView {
+            device_link_uri: uri,
+            slot,
+            slots,
+        })
+    }
+
+    /// 收回一个槽（rotate 淘汰 / 提交后收回其余槽）：有在飞 finish 时不 abort
+    /// （会把用户正在确认的那次提交结果丢掉），只置退休旗，物理收口由最后
+    /// 一个 finish 在 FinishGuard 里落地。
+    async fn retire_slot(self: &Arc<Self>, record: Arc<PendingRecord>) {
+        record.retired.store(true, Ordering::Release);
+        if record.inflight_finishes.load(Ordering::Acquire) > 0 {
+            tracing::warn!(
+                target: "engine.link",
+                stage = "retire_deferred",
+                "link slot retirement deferred: finish in flight"
+            );
+            return;
+        }
+        self.finalize_retired_slot(record).await;
+    }
+
+    /// 物理收口一个已退休的槽：abort flow、未提交则回收 store 与目录，并从
+    /// links 摘除（落 LINK_LOST 墓碑，旧码后续 finish 稳定回 LINK_LOST）。
+    /// 已提交（attempt 里别的槽完成了链接）的槽保留可查，供幂等应答。
+    async fn finalize_retired_slot(self: &Arc<Self>, record: Arc<PendingRecord>) {
+        record.retired.store(true, Ordering::Release);
+        let Some(lost_at) = retire_pending_record(Arc::clone(&record)).await else {
+            return;
+        };
+        let mut inner = self.inner.lock().await;
+        if inner
+            .links
+            .get(&record.uri)
+            .is_some_and(|current| Arc::ptr_eq(current, &record))
+        {
+            inner.links.remove(&record.uri);
+            // 同一条纪律（审计必须项）：离开 links 就必须离开 attempt 槽表。
+            // 正常路径上退休方已先把 uri 移出表（rotate 淘汰 / attempt 收口），
+            // 这里覆盖 FinishGuard 延迟收口等旁路，顺带把不变量钉在单点。
+            retain_live_attempt_slots(&mut inner, &record.attempt_id, &record.uri);
+            push_lost_link_tombstone(&mut inner, &record.uri, lost_at);
+        }
+    }
+
+    /// 提交成功后收回同 attempt 的其余槽：全部物理收口（abort + 未注册回收），
+    /// 等在这些槽结果上的在飞 finish 由 attempt 级提交位拿回同一账号。
+    async fn retire_attempt_siblings(self: &Arc<Self>, record: &Arc<PendingRecord>) {
+        let siblings: Vec<Arc<PendingRecord>> = {
+            let mut inner = self.inner.lock().await;
+            let slots = inner
+                .attempts
+                .remove(&record.attempt_id)
+                .map(|attempt| attempt.slots)
+                .unwrap_or_default();
+            slots
+                .into_iter()
+                .filter_map(|uri| inner.links.get(&uri).cloned())
+                .collect()
+        };
+        for sibling in siblings {
+            self.finalize_retired_slot(sibling).await;
+        }
     }
 
     /// listAccounts 读投影（wire additive `aci` 键，connector 契约 1.142
@@ -14592,6 +15065,17 @@ fn random_dir_name() -> String {
     format!("lk-{:016x}", mix_seed_step(mix_seed()))
 }
 
+/// 链接 attempt id（rotateLink 的入参键）：`la-<hex16><hex16>`。时间 + pid
+/// 熵的 splitmix64（无 rand 依赖，同 lk-* 目录命名纪律）。
+fn random_attempt_id() -> String {
+    let seed = mix_seed();
+    format!(
+        "la-{:016x}{:016x}",
+        mix_seed_step(seed),
+        mix_seed_step(mix_seed_step(seed))
+    )
+}
+
 /// 启动清扫：未登记 `accounts/lk-*` 目录的处置（P0-B，2026-10-21）。
 ///
 /// 旧语义（ADR 0004）把未登记目录当垃圾直接 `remove_dir_all`；但
@@ -19157,6 +19641,7 @@ mod tests {
     async fn retire_all_links(service: &Arc<Service>) {
         let records: Vec<Arc<PendingRecord>> = {
             let mut inner = service.inner.lock().await;
+            inner.attempts.clear();
             inner.links.drain().map(|(_, record)| record).collect()
         };
         for record in records {
@@ -19223,7 +19708,7 @@ mod tests {
                         Err(LinkError::Lost)
                     })
                     .await
-                    .expect("start link");
+                    .expect("start link").device_link_uri().to_owned();
 
                 let store_dir = {
                     let inner = service.inner.lock().await;
@@ -19321,7 +19806,7 @@ mod tests {
                         Ok(("+15550000001".to_owned(), None))
                     })
                     .await
-                    .expect("first start");
+                    .expect("first start").device_link_uri().to_owned();
                 let first_dir = {
                     let inner = service.inner.lock().await;
                     inner
@@ -19343,7 +19828,7 @@ mod tests {
                         futures::future::pending::<Result<LinkOutcome, LinkError>>().await
                     })
                     .await
-                    .expect("second start");
+                    .expect("second start").device_link_uri().to_owned();
                 assert_ne!(first_uri, second_uri);
 
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -19402,7 +19887,7 @@ mod tests {
                         Ok(("+15550001111".to_owned(), None))
                     })
                     .await
-                    .expect("first start");
+                    .expect("first start").device_link_uri().to_owned();
                 wait_link_result_resolved(&service, &first_uri).await;
                 let first_dir = {
                     let inner = service.inner.lock().await;
@@ -19425,7 +19910,7 @@ mod tests {
                         futures::future::pending::<Result<LinkOutcome, LinkError>>().await
                     })
                     .await
-                    .expect("second start");
+                    .expect("second start").device_link_uri().to_owned();
                 assert_ne!(first_uri, second_uri);
 
                 match service.finish_link(&first_uri, "KT").await {
@@ -19482,7 +19967,7 @@ mod tests {
                         futures::future::pending::<Result<LinkOutcome, LinkError>>().await
                     })
                     .await
-                    .expect("start");
+                    .expect("start").device_link_uri().to_owned();
                 let record = {
                     let inner = service.inner.lock().await;
                     inner.links.get(&uri).expect("record").clone()
@@ -19552,7 +20037,7 @@ mod tests {
                         futures::future::pending::<Result<LinkOutcome, LinkError>>().await
                     })
                     .await
-                    .expect("first start");
+                    .expect("first start").device_link_uri().to_owned();
                 let first_dir = {
                     let inner = service.inner.lock().await;
                     inner
@@ -19583,7 +20068,7 @@ mod tests {
                         futures::future::pending::<Result<LinkOutcome, LinkError>>().await
                     })
                     .await
-                    .expect("second start");
+                    .expect("second start").device_link_uri().to_owned();
                 assert_ne!(first_uri, second_uri);
 
                 let err = match finish.await.expect("finish task") {
@@ -19654,7 +20139,7 @@ mod tests {
                 )
                 .await
                 .expect("second start must not block on the first URL wait")
-                .expect("second start");
+                .expect("second start").device_link_uri().to_owned();
 
                 let _ = gate_tx.send(());
                 let slow_result = slow.await.expect("slow start task");
@@ -19669,6 +20154,699 @@ mod tests {
                 }
 
                 retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 测试用 provisioning URL 夹具（与生产 QrLinkUrl 同形，不触网）。
+    fn test_link_url(uuid: &str) -> url::Url {
+        url::Url::parse(&format!(
+            "sgnl://link?uuid={uuid}-2222-4333-8444-555555555555&pub_key=AAAA"
+        ))
+        .expect("url")
+    }
+
+    /// 测试局部类型别名：link 状态机是 !Send（LocalSet 承载），不能用
+    /// futures 的 BoxFuture（它要求 Send）。
+    type LocalBox<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
+
+    /// 起一个 attempt（大 future 上堆）：Debug 构建下 link 状态机很大，
+    /// 内联等待会把 libtest 的 2 MiB 测试线程栈撑爆。
+    fn start_link_boxed<'a, F, Fut>(
+        service: &'a Arc<Service>,
+        flow: F,
+    ) -> LocalBox<'a, Result<LinkAttemptView, LinkError>>
+    where
+        F: FnOnce(SqliteStore, futures::channel::oneshot::Sender<url::Url>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<LinkOutcome, LinkError>> + 'static,
+    {
+        Box::pin(service.start_link_with_flow(flow))
+    }
+
+    /// rotateLink 的同款上堆封装（见 start_link_boxed）。
+    fn rotate_link_boxed<'a, F, Fut>(
+        service: &'a Arc<Service>,
+        attempt_id: &'a str,
+        flow: F,
+    ) -> LocalBox<'a, Result<LinkRotateView, LinkError>>
+    where
+        F: FnOnce(SqliteStore, futures::channel::oneshot::Sender<url::Url>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<LinkOutcome, LinkError>> + 'static,
+    {
+        Box::pin(service.rotate_link_with_flow(attempt_id, flow))
+    }
+
+    /// finishLink 的同款上堆封装（见 start_link_boxed）。
+    fn finish_link_boxed<'a>(
+        service: &'a Arc<Service>,
+        uri: &'a str,
+        name: &'a str,
+    ) -> LocalBox<'a, Result<LinkedAccount, LinkError>> {
+        Box::pin(service.finish_link(uri, name))
+    }
+
+    /// 双槽 QR 轮换（engine 侧 additive 契约）：startLink 回 attemptId + 第 0
+    /// 槽，rotateLink 铸第 1 槽；两个槽都能 finish（先 rotate 再提交新槽，或
+    /// 直接提交第 0 槽），跨槽共享 attempt 级提交位，只 add_account 一次。
+    ///
+    /// 审计必须项 2 的落点：契约测试（tests/contract.rs，假面）只覆盖 wire
+    /// 形状——fake 面首提交即清空 fake_link，表达不了跨槽幂等。本用例在**真面**
+    /// 做那两条断言：提交第 1 槽后只建 1 个账号，另一码（第 0 槽）replay 回
+    /// 同一账号（attempt 级提交位，不是假面形状）。
+    #[tokio::test]
+    async fn rotate_link_mints_second_slot_and_either_slot_can_finish() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                // attempt A：先 rotate，再用新槽（第 1 槽）finish。
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                })
+                .await
+                .expect("start");
+                assert_eq!(started.slots.len(), 1, "没有 rotate 就是单槽");
+                assert_eq!(started.slots[0].slot, 0);
+                let slot0_uri = started.device_link_uri().to_owned();
+
+                let rotated =
+                    rotate_link_boxed(&service, &started.attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                        Ok(("+15550004444".to_owned(), None))
+                    })
+                    .await
+                    .expect("rotate");
+                assert_eq!(rotated.slot, 1, "新槽落在 live 槽表末位");
+                assert_eq!(rotated.slots.len(), 2);
+                assert_eq!(rotated.slots[0].device_link_uri, slot0_uri);
+                assert_eq!(rotated.slots[0].slot, 0);
+                assert_eq!(rotated.slots[1].slot, 1);
+                assert_eq!(rotated.slots[1].device_link_uri, rotated.device_link_uri);
+
+                let linked = finish_link_boxed(&service, &rotated.device_link_uri, "KT")
+                    .await
+                    .expect("finish rotated slot");
+                assert_eq!(linked.number, "+15550004444");
+                // 第 0 槽随提交收口：幂等回同一账号，不会二次提交。
+                let replay = finish_link_boxed(&service, &slot0_uri, "KT")
+                    .await
+                    .expect("slot 0 idempotent replay");
+                assert_eq!(replay.number, linked.number);
+                assert_eq!(service.state.lock().await.accounts().len(), 1);
+                // 提交后 attempt 收口：rotate 不再接受。
+                let err =
+                    rotate_link_boxed(&service, &started.attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("eeeeeeee"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect_err("committed attempt must not rotate");
+                assert!(matches!(err, LinkError::AttemptNotFound), "{err:?}");
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 双槽轮换的另一半：rotate 之后**第 0 槽**仍然可提交（轮换不抢旧槽的
+    /// 手机确认），提交成功后轮换出去的新槽随 attempt 收口。
+    #[tokio::test]
+    async fn rotate_link_keeps_first_slot_committable() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-slot0-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("cccccccc"));
+                    Ok(("+15550005555".to_owned(), None))
+                })
+                .await
+                .expect("start");
+                let slot0_uri = started.device_link_uri().to_owned();
+                let rotated =
+                    rotate_link_boxed(&service, &started.attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("dddddddd"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate");
+
+                let linked = finish_link_boxed(&service, &slot0_uri, "KT")
+                    .await
+                    .expect("finish slot 0");
+                assert_eq!(linked.number, "+15550005555");
+                assert_eq!(service.state.lock().await.accounts().len(), 1);
+                // 轮换出去的新槽已随提交收口：幂等回同一账号。
+                let replay = finish_link_boxed(&service, &rotated.device_link_uri, "KT")
+                    .await
+                    .expect("rotated slot replay");
+                assert_eq!(replay.number, linked.number);
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 第 3 次 rotate 收回最旧槽：旧码 finish 确定性回 LINK_LOST（墓碑），
+    /// live 槽表恒 ≤2 且只剩最近铸的两个。
+    #[tokio::test]
+    async fn third_rotate_retires_oldest_slot_and_old_uri_is_link_lost() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-evict-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                })
+                .await
+                .expect("start link");
+                let attempt_id = started.attempt_id.clone();
+                let uri0 = started.device_link_uri().to_owned();
+
+                let first = rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                    futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                })
+                .await
+                .expect("rotate 1");
+                let uri1 = first.device_link_uri.clone();
+                let second =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("cccccccc"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate 2");
+                let third = rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("dddddddd"));
+                    futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                })
+                .await
+                .expect("rotate 3");
+
+                // live 槽表 = 最近铸的两个（第 3 次 rotate 收回最旧的 uri1）。
+                assert_eq!(third.slot, 1);
+                assert_eq!(third.slots.len(), 2, "live 槽上限 2");
+                assert_eq!(third.slots[0].device_link_uri, second.device_link_uri);
+                assert_eq!(third.slots[1].device_link_uri, third.device_link_uri);
+
+                for uri in [uri0.as_str(), uri1.as_str()] {
+                    match service.finish_link(uri, "KT").await {
+                        Err(error) => {
+                            assert!(matches!(error, LinkError::Lost), "retired slot: {error:?}");
+                        }
+                        Ok(account) => panic!("retired slot must fail: {}", account.number),
+                    }
+                }
+                {
+                    let inner = service.inner.lock().await;
+                    assert!(!inner.links.contains_key(&uri0));
+                    assert!(!inner.links.contains_key(&uri1));
+                    assert!(inner.links.contains_key(&second.device_link_uri));
+                    assert!(inner.links.contains_key(&third.device_link_uri));
+                }
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项 1（死槽出口）：startLink 的第 0 槽按 LINK_LOST 收口后，记录
+    /// 离开 links —— attempt 槽表必须同步摘掉它（attempt.slots ≡ live 槽表），
+    /// 随后 rotateLink 的应答只含新铸的活槽，且 slot 下标从 0 起（死槽不占位）。
+    #[tokio::test]
+    async fn lost_slot_leaves_live_table_so_rotate_response_has_no_dead_slot() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-lost-slot-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                // 第 0 槽：URL 交付后 provisioning 会话死亡（B1 的 LINK_LOST 面）。
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    Err(LinkError::Lost)
+                })
+                .await
+                .expect("start");
+                let attempt_id = started.attempt_id.clone();
+                let dead_uri = started.device_link_uri().to_owned();
+                wait_link_result_resolved(&service, &dead_uri).await;
+
+                // finish 走 lost 出口：摘记录 + 落墓碑。
+                let err = match finish_link_boxed(&service, &dead_uri, "KT").await {
+                    Err(error) => error,
+                    Ok(account) => panic!("lost slot must not commit: {}", account.number),
+                };
+                assert!(matches!(err, LinkError::Lost), "{err:?}");
+                {
+                    let inner = service.inner.lock().await;
+                    assert!(!inner.links.contains_key(&dead_uri), "记录必须离开 links");
+                    assert!(
+                        inner
+                            .attempts
+                            .get(&attempt_id)
+                            .is_some_and(|attempt| attempt.slots.is_empty()),
+                        "attempt 槽表必须同步摘掉死槽（≡ live 槽表），否则 rotate 应答会带死槽"
+                    );
+                }
+
+                let rotated =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate after lost slot");
+                assert_eq!(
+                    rotated.slots.len(),
+                    1,
+                    "死槽不占 live 槽表：只有新铸的那一格"
+                );
+                assert_eq!(rotated.slot, 0, "死槽不参与 slot 下标");
+                assert_eq!(rotated.slots[0].slot, 0);
+                assert_eq!(rotated.slots[0].device_link_uri, rotated.device_link_uri);
+                assert_ne!(rotated.device_link_uri, dead_uri);
+                assert!(
+                    rotated
+                        .slots
+                        .iter()
+                        .all(|slot| slot.device_link_uri != dead_uri),
+                    "应答槽表不得含死槽: {rotated:?}"
+                );
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项 1（淘汰面）：槽表里残留一格死槽（表头/相邻位置上的历史
+    /// 漏网——双保险的修剪面）时，rotateLink 必须修剪掉它，退休的只能是真正
+    /// 最旧的**活**槽：活槽不被误退休，死槽绝不出现在应答里，slot 下标紧排。
+    #[tokio::test]
+    async fn rotate_eviction_skips_dead_slot_and_keeps_live_slot() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-dead-skip-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                })
+                .await
+                .expect("start");
+                let attempt_id = started.attempt_id.clone();
+                let uri0 = started.device_link_uri().to_owned();
+
+                // 阶段 1：表里 1 个活槽 + 表尾一格死槽（漏 retain 的历史出口
+                // 留下的残留，它不在 links 里）。修剪掉死槽后只剩一个活槽，
+                // rotate 不该退休任何活槽，也不该把死槽回给调用方。
+                let stale_uri = test_link_url("ffffffff").to_string();
+                {
+                    let mut inner = service.inner.lock().await;
+                    let attempt = inner
+                        .attempts
+                        .get_mut(&attempt_id)
+                        .expect("attempt after start");
+                    attempt.slots.push(stale_uri.clone());
+                }
+
+                let first = rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                    Ok(("+15550008888".to_owned(), None))
+                })
+                .await
+                .expect("rotate 1");
+                let uri1 = first.device_link_uri.clone();
+                assert_eq!(first.slot, 1);
+                assert_eq!(first.slots.len(), 2, "死槽不占 live 槽表");
+                assert_eq!(first.slots[0].device_link_uri, uri0, "活槽不被误退休");
+                assert_eq!(first.slots[0].slot, 0);
+                assert_eq!(first.slots[1].device_link_uri, uri1);
+                assert_eq!(first.slots[1].slot, 1);
+                assert!(
+                    first
+                        .slots
+                        .iter()
+                        .all(|slot| slot.device_link_uri != stale_uri),
+                    "死槽不得出现在应答槽表: {first:?}"
+                );
+                {
+                    let inner = service.inner.lock().await;
+                    let attempt = inner.attempts.get(&attempt_id).expect("attempt alive");
+                    assert_eq!(attempt.slots, vec![uri0.clone(), uri1.clone()]);
+                }
+
+                // 阶段 2：另一种错位形态——死槽塞回表头。淘汰循环必须跳过它、
+                // 继续找真正最旧的**活**槽（uri0），而不是把死槽算成一次退休
+                // 就停下（那样表会涨到 3 格活槽）。
+                {
+                    let mut inner = service.inner.lock().await;
+                    let attempt = inner.attempts.get_mut(&attempt_id).expect("attempt alive");
+                    attempt.slots.insert(0, stale_uri.clone());
+                }
+
+                let second =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("cccccccc"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate 2");
+                let uri2 = second.device_link_uri.clone();
+
+                // 修剪死槽后 live 表 = [uri0, uri1] + 新槽 → 退休真正最旧的活槽
+                // uri0；若实现漏了修剪，死槽会被当成退休名额（表里留下三格活槽）
+                // 或直接退休错活槽。
+                assert_eq!(second.slot, 1);
+                assert_eq!(second.slots.len(), 2, "live 槽上限 2（死槽不计入）");
+                assert_eq!(second.slots[0].device_link_uri, uri1);
+                assert_eq!(second.slots[0].slot, 0);
+                assert_eq!(second.slots[1].device_link_uri, uri2);
+                assert_eq!(second.slots[1].slot, 1);
+                assert!(
+                    second
+                        .slots
+                        .iter()
+                        .all(|slot| slot.device_link_uri != stale_uri),
+                    "死槽不得出现在应答槽表: {second:?}"
+                );
+                {
+                    let inner = service.inner.lock().await;
+                    let attempt = inner.attempts.get(&attempt_id).expect("attempt alive");
+                    assert_eq!(attempt.slots, vec![uri1.clone(), uri2.clone()]);
+                }
+
+                // 被退休的是 uri0（Lost），活槽 uri1 仍然可提交。
+                let retired = match finish_link_boxed(&service, &uri0, "KT").await {
+                    Err(error) => error,
+                    Ok(account) => panic!("retired slot must not commit: {}", account.number),
+                };
+                assert!(matches!(retired, LinkError::Lost), "{retired:?}");
+                let linked = finish_link_boxed(&service, &uri1, "KT")
+                    .await
+                    .expect("live slot survives eviction");
+                assert_eq!(linked.number, "+15550008888");
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项 1（下标面）：两槽里第 0 槽死掉后，活槽仍然占 slot 0（死槽
+    /// 不参与下标），rotate 出来的新槽落在末位 —— 应答 slot 与槽表位置一一对应。
+    #[tokio::test]
+    async fn dead_slot_does_not_consume_slot_index() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-index-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    Err(LinkError::Lost)
+                })
+                .await
+                .expect("start");
+                let attempt_id = started.attempt_id.clone();
+                let uri0 = started.device_link_uri().to_owned();
+                wait_link_result_resolved(&service, &uri0).await;
+
+                let first = rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                    Ok(("+15550009999".to_owned(), None))
+                })
+                .await
+                .expect("rotate 1");
+                let uri1 = first.device_link_uri.clone();
+                assert_eq!(first.slots[0].device_link_uri, uri0, "死槽此刻还没收口");
+
+                // 第 0 槽按 LINK_LOST 收口：槽表里只剩 uri1，它必须落回 slot 0。
+                let err = match finish_link_boxed(&service, &uri0, "KT").await {
+                    Err(error) => error,
+                    Ok(account) => panic!("lost slot must not commit: {}", account.number),
+                };
+                assert!(matches!(err, LinkError::Lost), "{err:?}");
+                {
+                    let inner = service.inner.lock().await;
+                    let attempt = inner.attempts.get(&attempt_id).expect("attempt alive");
+                    assert_eq!(attempt.slots, vec![uri1.clone()], "死槽不留在槽表里");
+                }
+
+                let second =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("cccccccc"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate 2");
+                assert_eq!(second.slot, 1, "新槽永远落在 live 槽表末位");
+                assert_eq!(second.slots.len(), 2, "死槽不占下标");
+                assert_eq!(second.slots[0].device_link_uri, uri1);
+                assert_eq!(second.slots[0].slot, 0, "活槽回到 slot 0");
+                assert_eq!(second.slots[1].device_link_uri, second.device_link_uri);
+                assert_eq!(second.slots[1].slot, 1);
+                assert!(
+                    second.slots.iter().all(|slot| slot.device_link_uri != uri0),
+                    "死槽不得出现在应答槽表: {second:?}"
+                );
+
+                // 活槽仍可提交（下标重排不影响归属）。
+                let linked = finish_link_boxed(&service, &uri1, "KT")
+                    .await
+                    .expect("live slot committable");
+                assert_eq!(linked.number, "+15550009999");
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 两个槽的 finish 并发：attempt 级提交门单飞，只 add_account 一次，
+    /// 两个调用拿回同一账号。
+    #[tokio::test]
+    async fn concurrent_finishes_on_both_slots_commit_once() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-single-flight-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    Ok(("+15550006666".to_owned(), None))
+                })
+                .await
+                .expect("start");
+                let rotated =
+                    rotate_link_boxed(&service, &started.attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                        Ok(("+15550007777".to_owned(), None))
+                    })
+                    .await
+                    .expect("rotate");
+                let slot0 = started.device_link_uri().to_owned();
+                let slot1 = rotated.device_link_uri.clone();
+
+                // 两个槽的 finish 同时推进（同一任务里 join 轮询，不 spawn：commit
+                // 会拉起接收管线，LocalSet 轮询它需要比 libtest 2 MiB 更大的栈）。
+                let left_fut = finish_link_boxed(&service, &slot0, "KT");
+                let right_fut = finish_link_boxed(&service, &slot1, "KT");
+                let (left, right) = futures::future::join(left_fut, right_fut).await;
+                let left = left.expect("finish slot 0");
+                let right = right.expect("finish slot 1");
+                assert_eq!(left.number, right.number, "两个槽回同一账号");
+                assert!(
+                    left.number == "+15550006666" || left.number == "+15550007777",
+                    "committed number: {}",
+                    left.number
+                );
+                assert_eq!(
+                    service.state.lock().await.accounts().len(),
+                    1,
+                    "提交只发生一次"
+                );
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// rotate 不打断在飞 finish：要退休的槽上有 finish 在等手机确认时，只置
+    /// 退休旗不 abort；放手后那次提交照常成功（结果不丢）。
+    #[tokio::test]
+    async fn rotate_does_not_interrupt_inflight_finish() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-inflight-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+                let started = start_link_boxed(&service, move |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    let _ = release_rx.await;
+                    Ok(("+15550008888".to_owned(), None))
+                })
+                .await
+                .expect("start");
+                let attempt_id = started.attempt_id.clone();
+                let slot0 = started.device_link_uri().to_owned();
+                let _first =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate 1");
+
+                // finish 在飞：手动 poll 让它进入结果槽等待（不 spawn——commit 会
+                // 拉起接收管线，LocalSet 轮询它需要比 libtest 2 MiB 更大的栈）。
+                let mut finish = Box::pin(service.finish_link(&slot0, "KT"));
+                assert!(
+                    futures::poll!(finish.as_mut()).is_pending(),
+                    "finish waits for phone confirmation"
+                );
+
+                // 第 2 次 rotate 要收回第 0 槽（有在飞 finish）→ 只置退休旗，
+                // 绝不 abort 这次提交。
+                let _second =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("cccccccc"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate 2");
+                assert!(
+                    futures::poll!(finish.as_mut()).is_pending(),
+                    "rotate must not interrupt the in-flight finish"
+                );
+
+                // 放手：旧槽 flow 照常产出号码，这次提交不得被轮换丢掉。
+                let _ = release_tx.send(());
+                let linked = finish.await.expect("in-flight finish commits");
+                assert_eq!(linked.number, "+15550008888");
+                assert_eq!(service.state.lock().await.accounts().len(), 1);
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// rotateLink 的 attemptId 不存在 → AttemptNotFound（wire 面 -1
+    /// LINK_ATTEMPT_NOT_FOUND，methods 层单测钉码位）。
+    #[tokio::test]
+    async fn rotate_unknown_attempt_returns_not_found() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-unknown-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let err = rotate_link_boxed(
+                    &service,
+                    "la-0000000000000000",
+                    |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    },
+                )
+                .await
+                .expect_err("unknown attempt");
+                assert!(matches!(err, LinkError::AttemptNotFound), "{err:?}");
+                assert!(service.inner.lock().await.attempts.is_empty());
+                assert!(service.inner.lock().await.links.is_empty());
+
                 let _ = std::fs::remove_dir_all(&data_dir);
             })
             .await;
@@ -19702,7 +20880,7 @@ mod tests {
                         Ok(("+15550002222".to_owned(), None))
                     })
                     .await
-                    .expect("start");
+                    .expect("start").device_link_uri().to_owned();
                 wait_link_result_resolved(&service, &uri).await;
 
                 let linked = service.finish_link(&uri, "KT").await.expect("finish link");

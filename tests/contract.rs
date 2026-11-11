@@ -421,6 +421,86 @@ fn start_and_finish_link_lifecycle() {
     );
 }
 
+/// 双槽 QR 轮换（engine 侧 additive 契约，2026-11-11 批）：startLink 除旧
+/// deviceLinkUri（= 第 0 槽）外新增 linkAttemptId + slots；rotateLink 铸新槽
+/// 并回该 attempt 的 live 槽全表；提交 **rotate 出来的第 1 槽**（用户真正会扫
+/// 的那张码）成功后 attempt 收口 → rotateLink / 缺参都答 -1
+/// LINK_ATTEMPT_NOT_FOUND。
+///
+/// 假面边界（审计必须项 2，显式声明）：KT_ENGINE_FAKE_SERVICE 的 finishLink
+/// 首提交即清空 fake_link（无 store、无 attempt 级提交位），**表达不了跨槽
+/// 幂等**——另一码 replay 在假面会答 -1 UNKNOWN_LINK_URI，那不是真面行为。
+/// 所以本用例只覆盖 wire 形状（三个键、槽表、错误码），"只提交一次 + 另一码
+/// 幂等回同一账号"的证明搬到了真面单测
+/// service::tests::rotate_link_mints_second_slot_and_either_slot_can_finish
+/// （那里真跑 attempt 级提交位）。这里也不用 accounts.len()==1 自证：假面每
+/// 次成功提交必然只建一个账号，长度断言证明不了单飞。
+#[test]
+fn rotate_link_rotation_lifecycle() {
+    let dir = temp_dir("link-rotate");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    let started = engine.request("startLink", json!({}));
+    let slot0 = started["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("deviceLinkUri string")
+        .to_owned();
+    let attempt_id = started["result"]["linkAttemptId"]
+        .as_str()
+        .expect("linkAttemptId string")
+        .to_owned();
+    assert!(!attempt_id.is_empty(), "linkAttemptId must be non-empty");
+    assert_eq!(
+        started["result"]["slots"],
+        json!([{ "deviceLinkUri": slot0.clone(), "slot": 0 }]),
+        "没有 rotate 时只有一个槽（旧行为不变）"
+    );
+
+    let rotated = engine.request("rotateLink", json!({ "linkAttemptId": attempt_id.clone() }));
+    let slot1 = rotated["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("rotated uri string")
+        .to_owned();
+    assert_ne!(slot0, slot1, "rotate 必须铸新槽");
+    assert_eq!(rotated["result"]["slot"], json!(1));
+    assert_eq!(
+        rotated["result"]["slots"],
+        json!([
+            { "deviceLinkUri": slot0.clone(), "slot": 0 },
+            { "deviceLinkUri": slot1.clone(), "slot": 1 },
+        ])
+    );
+
+    // 真的 finish 轮换出来的第 1 槽（不是第 0 槽）：用户扫的就是最新那张码。
+    let finished = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": slot1, "deviceName": "KT" }),
+    );
+    let number = finished["result"]["number"]
+        .as_str()
+        .expect("number string")
+        .to_owned();
+    assert_e164_number(&number);
+    // 号码必须真的落进账号表（按号码核，而不是拿长度自证单飞）。
+    let accounts = engine.request("listAccounts", json!({}))["result"]
+        .as_array()
+        .expect("accounts array")
+        .clone();
+    assert!(
+        accounts.iter().any(|row| row["number"] == json!(number)),
+        "提交后的号码必须在 listAccounts 里: {accounts:?}"
+    );
+    // 跨槽幂等（另一码 replay 同账号）在假面表达不了（见上方边界说明）；
+    // 真面断言在服务单测 rotate_link_mints_second_slot_and_either_slot_can_finish。
+
+    // attempt 已收口：轮换不再接受（确定性错误码，不是 -32603）。
+    let (code, message) = engine.error_of("rotateLink", json!({ "linkAttemptId": attempt_id }));
+    assert_eq!((code, message.as_str()), (-1, "LINK_ATTEMPT_NOT_FOUND"));
+    // 参数缺失同样 fail-closed 到同一码位。
+    let (code, message) = engine.error_of("rotateLink", json!({}));
+    assert_eq!((code, message.as_str()), (-1, "LINK_ATTEMPT_NOT_FOUND"));
+}
+
 /// listAccounts 回填能力门数据面（2026-10-20 批，wire additive
 /// `capabilities` 键，compat §3 行 + §5 块）：fake 形状桩逐账号投
 /// `{attachmentBackfill: true}`——官方 `isBackfillEnabled` 对

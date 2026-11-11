@@ -32,6 +32,11 @@ const UNKNOWN_LINK_URI: &str = "Unknown device link uri.";
 /// 不折叠成 -32603——connector 需要把「会话已死」与引擎内部故障分开。
 const LINK_LOST: &str = "LINK_LOST";
 
+/// rotateLink 的 attemptId 不存在（已被新 startLink 顶掉 / 已随提交收口）：
+/// 确定性契约错误（-1 + 本码位），不折叠成 -32603——轮换失败要能被连接器
+/// 直接判定为「这次 attempt 作废，重新 startLink」，而不是引擎故障重试。
+const LINK_ATTEMPT_NOT_FOUND: &str = "LINK_ATTEMPT_NOT_FOUND";
+
 /// 解绑态错误原文（上游把 AuthorizationFailedException 包进
 /// UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 const USER_UNBOUND_MESSAGE: &str =
@@ -358,10 +363,26 @@ async fn dispatch(
     let Request { id, method, params } = request;
     // S2a 打点在 respond 单点包裹（本函数臂内多 `return`，不在此计时）。
     match method.as_str() {
+        // startLink：旧端只读 deviceLinkUri（= 第 0 槽），linkAttemptId +
+        // slots 是双槽 QR 轮换的 additive 键（compat §3）。
         "startLink" => match service.start_link().await {
-            Ok(uri) => jsonrpc::success_response(id, json!({ "deviceLinkUri": uri })),
+            Ok(started) => jsonrpc::success_response(id, started.to_json()),
             Err(_) => internal_error(id),
         },
+        // rotateLink：同一 attempt 铸新槽（live 槽上限 2，超出收回最旧）。
+        // attempt 缺失 = 确定性错误码，不是内部错误。
+        "rotateLink" => {
+            let attempt_id = params.get("linkAttemptId").and_then(Value::as_str);
+            match attempt_id {
+                Some(attempt_id) => match service.rotate_link(attempt_id).await {
+                    Ok(rotated) => jsonrpc::success_response(id, rotated.to_json()),
+                    Err(error) => rotate_link_error(id, error),
+                },
+                // 参数缺失按「attempt 不存在」fail-closed（同 finishLink 的参数
+                // 纪律：坏会话形状不触网）。
+                None => jsonrpc::error_response(id, &RpcError::new(-1, LINK_ATTEMPT_NOT_FOUND)),
+            }
+        }
         "finishLink" => {
             let uri = params.get("deviceLinkUri").and_then(Value::as_str);
             let name = params.get("deviceName").and_then(Value::as_str);
@@ -5296,7 +5317,19 @@ fn finish_link_error(id: &Value, error: LinkError) -> Value {
     match error {
         LinkError::UnknownUri => jsonrpc::error_response(id, &RpcError::new(-1, UNKNOWN_LINK_URI)),
         LinkError::Lost => jsonrpc::error_response(id, &RpcError::new(-1, LINK_LOST)),
-        LinkError::Internal => internal_error(id),
+        // finishLink 不走 attempt 键查找；归型保持内部错误（防御臂，不可达）。
+        LinkError::AttemptNotFound | LinkError::Internal => internal_error(id),
+    }
+}
+
+/// rotateLink 错误面归型：attempt 不存在是确定性契约错误（-1 +
+/// LINK_ATTEMPT_NOT_FOUND），其余一律折叠 -32603（细节不外泄）。
+fn rotate_link_error(id: &Value, error: LinkError) -> Value {
+    match error {
+        LinkError::AttemptNotFound => {
+            jsonrpc::error_response(id, &RpcError::new(-1, LINK_ATTEMPT_NOT_FOUND))
+        }
+        LinkError::UnknownUri | LinkError::Lost | LinkError::Internal => internal_error(id),
     }
 }
 
@@ -5557,6 +5590,26 @@ mod tests {
         let internal = finish_link_error(&Value::from(9), LinkError::Internal);
         assert_eq!(internal["error"]["code"], json!(-32603));
         assert_eq!(internal["error"]["message"], json!("Internal error"));
+    }
+
+    /// 双槽 QR 轮换（engine 侧 additive，2026-11-11 批）：rotateLink 的
+    /// attemptId 不存在必须是 -1 + LINK_ATTEMPT_NOT_FOUND（确定性契约错误，
+    /// 连接器据此重新 startLink），其余错误仍折叠 -32603。
+    #[test]
+    fn rotate_link_error_faces_pin_attempt_not_found() {
+        let not_found = rotate_link_error(&Value::from(11), LinkError::AttemptNotFound);
+        assert_eq!(not_found["id"], json!(11));
+        assert_eq!(not_found["error"]["code"], json!(-1));
+        assert_eq!(
+            not_found["error"]["message"],
+            json!("LINK_ATTEMPT_NOT_FOUND")
+        );
+
+        for folded in [LinkError::UnknownUri, LinkError::Lost, LinkError::Internal] {
+            let response = rotate_link_error(&Value::from(12), folded);
+            assert_eq!(response["error"]["code"], json!(-32603));
+            assert_eq!(response["error"]["message"], json!("Internal error"));
+        }
     }
 
     /// 2026-10-20 隐私修复：账号前缀日志必须不可逆。原实现取 E.164 前 8
