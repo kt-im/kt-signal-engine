@@ -118,53 +118,9 @@ impl Inbound {
     }
 }
 
-/// 调度日志大媒体载荷摘要化（帧帽对齐批 companion）：`send` 的
-/// `attachments[]`、`sendStory` 的 `attachment` 以及两族的 `previewImage`
-/// 都是内联 data URI。帧帽 1 MiB→160 MiB 后这些键可以承载多 MB 明文媒体，
-/// 原样落盘会把引擎变成媒体明文落库点（违反「消息内容只经内存转发」边界），
-/// 并把未轮转的 `engine-send-log.jsonl` 撑爆。
-///
-/// 闸位刻意取旧帧帽 1 MiB：**旧帧帽下可达的请求逐字节保持原日志面**
-/// （既有契约「参数形状逐字保留」对小型附件不变，connector 侧断言零冲击），
-/// 只有帧帽对齐后才新可达的大载荷换成字节数摘要（形状与 updateGroup 的
-/// avatar 键同款 `[<key> data uri: N bytes]`）。大值按长度直接造摘要、
-/// 不先 clone 再覆盖——避免在峰值路径上多复制一整份 base64 字符串。
-const DISPATCH_MEDIA_DIGEST_BYTES: usize = 1024 * 1024;
-
-fn redacted_dispatch_params(method: &str, params: &Map<String, Value>) -> Map<String, Value> {
-    let digest = |key: &str, uri: &str| {
-        if uri.len() > DISPATCH_MEDIA_DIGEST_BYTES {
-            Some(json!(format!("[{key} data uri: {} bytes]", uri.len())))
-        } else {
-            None
-        }
-    };
-    let mut logged = Map::with_capacity(params.len());
-    for (key, value) in params {
-        let redacted = match (method, key.as_str()) {
-            ("send", "attachments") => match value {
-                Value::Array(entries) => Some(Value::Array(
-                    entries
-                        .iter()
-                        .map(|entry| {
-                            match entry.as_str().and_then(|uri| digest("attachment", uri)) {
-                                Some(digest) => digest,
-                                None => entry.clone(),
-                            }
-                        })
-                        .collect(),
-                )),
-                _ => None,
-            },
-            ("send" | "sendStory", "attachment" | "previewImage") => {
-                value.as_str().and_then(|uri| digest(key, uri))
-            }
-            _ => None,
-        };
-        logged.insert(key.clone(), redacted.unwrap_or_else(|| value.clone()));
-    }
-    logged
-}
+// 调度日志的脱敏与按账号分文件收口在 `state::append_dispatch`（M5 多账号
+// 批）：正文/号码/大媒体一律在写入前处理，dispatch 层只传原始 params；每个
+// 方法只在参数校验通过后调用（被拒请求不写日志）。
 
 /// 入站帧的解析结果（M4 稳定性批）：分帧只做一次——超时预算分类、busy
 /// 应答 id 提取与 dispatch 共用同一份解析结果，避免 160MiB 帧被重复解析
@@ -321,7 +277,11 @@ pub(crate) async fn respond_prepared(
             // S2a 打点：JSON-RPC 请求分派整体耗时（单点包裹，控制流
             // 零变化；dispatch 臂内多 `return` 故不在其内部计时）。
             let dispatch_started = std::time::Instant::now();
-            let response = dispatch(&request, state, service).await;
+            // dispatch 的 async 状态机覆盖全部方法分支（M5 每条校验后
+            // append 又扩了一圈），debug 构建下内联进 input loop 会顶爆
+            // 测试线程 2MiB 栈；Box::pin 把状态机放到堆上（每请求一次
+            // 分配，远小于帧/附件分配）。
+            let response = Box::pin(dispatch(&request, state, service)).await;
             crate::service::perf_metrics::record_us(
                 crate::service::perf_metrics::keys::RPC_DISPATCH,
                 dispatch_started.elapsed().as_micros() as u64,
@@ -486,10 +446,6 @@ async fn dispatch(
             }
         }
         "send" => {
-            state
-                .lock()
-                .await
-                .append_dispatch(method, &redacted_dispatch_params(method, params));
             let account = params.get("account").and_then(Value::as_str);
             let message = params.get("message").and_then(Value::as_str);
             let group = params.get("groupId").and_then(Value::as_str);
@@ -809,6 +765,7 @@ async fn dispatch(
                 (Some(account), message, Some(group), _)
                     if sticker.is_some() || message.is_some() || view_once =>
                 {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_text_group(
                             account,
@@ -866,6 +823,7 @@ async fn dispatch(
                 (Some(account), message, None, Ok(recipients))
                     if sticker.is_some() || message.is_some() || view_once =>
                 {
+                    state.lock().await.append_dispatch(method, params);
                     // S2a 打点：直聊族发送整体耗时（成败两臂各自落计数）。
                     let send_started = std::time::Instant::now();
                     match service
@@ -946,7 +904,6 @@ async fn dispatch(
         // base64）同置/都缺/任一腿形状非法全拒。24h 窗口/次数闸是官方 UI 层
         // 闸，wire 面不设（§5 登记）。
         "editMessage" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let message = params
                 .get("message")
@@ -981,6 +938,7 @@ async fn dispatch(
             };
             match (account, message, target, recipient, group) {
                 (Some(account), Some(message), Some(target), None, Some(Some(group))) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_edit_message_group(account, group, target, message)
                         .await
@@ -993,6 +951,7 @@ async fn dispatch(
                     }
                 }
                 (Some(account), Some(message), Some(target), Some(Some(recipients)), None) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_edit_message(account, &recipients, target, message)
                         .await
@@ -1013,7 +972,6 @@ async fn dispatch(
         // fail-closed——sendCallMessage 群腿同源口径），eraId 必填非空（官方
         // eraId 字符串即 era 标识）。
         "sendGroupCallUpdate" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let group = params
                 .get("groupId")
@@ -1025,6 +983,7 @@ async fn dispatch(
                 .filter(|era| !era.is_empty());
             match (account, group, era_id) {
                 (Some(account), Some(group), Some(era_id)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service.send_group_call_update(account, group, era_id).await {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
                         Err(error) => send_error(id, error),
@@ -1034,12 +993,12 @@ async fn dispatch(
             }
         }
         "remoteDelete" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
             let group = params.get("groupId").and_then(Value::as_str);
             match (account, target, group, recipients_of(params)) {
                 (Some(account), Some(target), Some(group), _) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_remote_delete_group(account, group, target)
                         .await
@@ -1049,6 +1008,7 @@ async fn dispatch(
                     }
                 }
                 (Some(account), Some(target), None, Ok(recipients)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_remote_delete(account, &recipients, target)
                         .await
@@ -1061,7 +1021,6 @@ async fn dispatch(
             }
         }
         "sendReaction" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target_author = params.get("targetAuthor").and_then(Value::as_str);
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
@@ -1083,6 +1042,7 @@ async fn dispatch(
                     Some(remove),
                     _,
                 ) if params.get("groupId").is_some() => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_reaction_group(
                             account,
@@ -1109,6 +1069,7 @@ async fn dispatch(
                     Some(remove),
                     Ok(recipients),
                 ) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_reaction(account, &recipients, target_author, target, emoji, remove)
                         .await
@@ -1132,7 +1093,6 @@ async fn dispatch(
         // 「story 通道 groupV2 形态」措辞失真随本批订正），应答加性
         // group:{groupId, timestamp}。
         "sendStoryReaction" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params
                 .get("account")
                 .and_then(Value::as_str)
@@ -1165,6 +1125,7 @@ async fn dispatch(
                     //（open_group_sender + dispatch_group）；错误走结构化
                     // 面同群发送（send_error 单点，-1 词族）。
                     Some(group_id) => {
+                        state.lock().await.append_dispatch(method, params);
                         match service
                             .send_story_reaction_group(account, group_id, author, target, emoji)
                             .await
@@ -1175,6 +1136,7 @@ async fn dispatch(
                     }
                     // 1:1 作者直发腿（S4 现状，逐字节零变化）。
                     None => {
+                        state.lock().await.append_dispatch(method, params);
                         match service
                             .send_story_reaction(account, author, target, emoji)
                             .await
@@ -1196,7 +1158,6 @@ async fn dispatch(
         // storyMessageRecipients 扇出名单展开形态。应答 {timestamp}（DOE
         // 信封 ts）。
         "deleteStoryForEveryone" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params
                 .get("account")
                 .and_then(Value::as_str)
@@ -1262,6 +1223,7 @@ async fn dispatch(
                 });
             match (account, target, recipients, updated) {
                 (Some(account), Some(target), Some(recipients), Some(updated)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_story_delete_for_everyone(account, target, &recipients, &updated)
                         .await
@@ -1276,7 +1238,6 @@ async fn dispatch(
             }
         }
         "sendPinMessage" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target_author = params.get("targetAuthor").and_then(Value::as_str);
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
@@ -1299,6 +1260,7 @@ async fn dispatch(
                 recipients_of(params),
             ) {
                 (Some(account), Some(author), Some(target), Some(duration), Some(group), _) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_pin_message_group(account, group, author, target, duration)
                         .await
@@ -1315,6 +1277,7 @@ async fn dispatch(
                     None,
                     Ok(recipients),
                 ) if !recipients.is_empty() => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_pin_message(account, &recipients, author, target, duration)
                         .await
@@ -1327,13 +1290,13 @@ async fn dispatch(
             }
         }
         "sendUnpinMessage" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target_author = params.get("targetAuthor").and_then(Value::as_str);
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
             let group = params.get("groupId").and_then(Value::as_str);
             match (account, target_author, target, group, recipients_of(params)) {
                 (Some(account), Some(author), Some(target), Some(group), _) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_unpin_message_group(account, group, author, target)
                         .await
@@ -1345,6 +1308,7 @@ async fn dispatch(
                 (Some(account), Some(author), Some(target), None, Ok(recipients))
                     if !recipients.is_empty() =>
                 {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_unpin_message(account, &recipients, author, target)
                         .await
@@ -1357,7 +1321,6 @@ async fn dispatch(
             }
         }
         "sendAdminDelete" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target_author = params.get("targetAuthor").and_then(Value::as_str);
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
@@ -1366,6 +1329,7 @@ async fn dispatch(
             // fail-closed。
             match (account, target_author, target, group) {
                 (Some(account), Some(author), Some(target), Some(group)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_admin_delete_group(account, group, author, target)
                         .await
@@ -1391,7 +1355,6 @@ async fn dispatch(
         // 长度计数 chars 而非 graphemes（无分割依赖，合成序列计数更大、
         // 超限更保守——偏差记档 §5）。
         "sendPollCreate" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let group = params
                 .get("groupId")
@@ -1405,6 +1368,7 @@ async fn dispatch(
             };
             match (account, group, question, options, allow_multiple) {
                 (Some(account), Some(group), Some(question), Some(options), Some(allow)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_poll_create_group(account, group, &question, &options, allow)
                         .await
@@ -1417,7 +1381,6 @@ async fn dispatch(
             }
         }
         "sendPollVote" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let group = params
                 .get("groupId")
@@ -1448,6 +1411,7 @@ async fn dispatch(
                     Some(indexes),
                     Some(count),
                 ) if target > 0 => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_poll_vote_group(account, group, author, target, &indexes, count)
                         .await
@@ -1460,7 +1424,6 @@ async fn dispatch(
             }
         }
         "sendPollTerminate" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let group = params
                 .get("groupId")
@@ -1469,6 +1432,7 @@ async fn dispatch(
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
             match (account, group, target) {
                 (Some(account), Some(group), Some(target)) if target > 0 => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_poll_terminate_group(account, group, target)
                         .await
@@ -1481,12 +1445,12 @@ async fn dispatch(
             }
         }
         "updateContact" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let recipient = params.get("recipient").and_then(Value::as_str);
             let name = params.get("name").and_then(Value::as_str);
             match (account, recipient, name) {
                 (Some(account), Some(recipient), Some(name)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service.update_contact(account, recipient, name).await {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
                         Err(error) => send_error(id, error),
@@ -1496,7 +1460,6 @@ async fn dispatch(
             }
         }
         "sendTyping" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let stop = params.get("stop").and_then(Value::as_bool);
             let group = params.get("groupId").and_then(Value::as_str);
@@ -1512,6 +1475,7 @@ async fn dispatch(
             );
             match (account, stop, group, recipients_of(params)) {
                 (Some(account), Some(stop), Some(group), _) => {
+                    state.lock().await.append_dispatch(method, params);
                     // 失败显形批（2026-10-16，wire additive，compat §3/§5）：
                     // 三态 1:1 投影——全败 = 失败面（词条计数）；零收件人
                     // 已在服务层转 NoRecipients 错误；部分失败/全成功 =
@@ -1527,6 +1491,7 @@ async fn dispatch(
                     }
                 }
                 (Some(account), Some(stop), None, Ok(recipients)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service.send_typing(account, &recipients, stop).await {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
                         Err(error) => send_error(id, error),
@@ -1539,7 +1504,6 @@ async fn dispatch(
         // recipient 为单字符串（原消息作者；官方按作者分组直发，不整组
         // 广播）；timestamps 非空数字数组，元素非数字 fail-closed。
         "sendDeliveryReceipt" | "sendReadReceipt" | "sendViewedReceipt" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let recipient = params.get("recipient").and_then(Value::as_str);
             let timestamps = params
@@ -1558,6 +1522,7 @@ async fn dispatch(
             };
             match (account, recipient, timestamps) {
                 (Some(account), Some(recipient), Some(Some(timestamps))) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_receipt(account, recipient, &timestamps, kind)
                         .await
@@ -1575,12 +1540,12 @@ async fn dispatch(
         // 与 sendViewedReceipt（作者面 VIEWED 回执）双通道独立。senderAci
         // 号码/UUID 双形态（reaction targetAuthor 同解析口径）。
         "sendViewOnceOpen" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let sender = params.get("senderAci").and_then(Value::as_str);
             let timestamp = params.get("timestamp").and_then(Value::as_u64);
             match (account, sender, timestamp) {
                 (Some(account), Some(sender), Some(timestamp)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_view_once_open(account, sender, timestamp)
                         .await
@@ -1604,7 +1569,6 @@ async fn dispatch(
         // 100 条/chunk 分信封（官方 syncHelpers CHUNK_SIZE=100 同构）；
         // 成功答空结果对象（写面惯例）；协议上行面落调度日志（send 系同纪律）。
         "markRead" | "markViewed" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let list_key = if method == "markRead" {
                 "reads"
@@ -1624,6 +1588,7 @@ async fn dispatch(
             });
             match (account, entries) {
                 (Some(account), Some(Some(entries))) if !entries.is_empty() => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .mark_read_state(account, method == "markViewed", entries)
                         .await
@@ -1654,7 +1619,6 @@ async fn dispatch(
                 Recipient(&'a str),
                 Group(&'a str),
             }
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let legacy = parse_legacy_call_face(params.get("legacy"));
             let data = params
@@ -1737,23 +1701,27 @@ async fn dispatch(
                     Some(CallTarget::Recipient(recipient)),
                     Some(face),
                     Some(destination),
-                ) => match service
-                    .send_call_message(
-                        account,
-                        recipient,
-                        crate::service::SendCallMessage {
-                            face,
-                            destination_device_id: destination,
-                        },
-                    )
-                    .await
-                {
-                    Ok(timestamp) => {
-                        jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                ) => {
+                    state.lock().await.append_dispatch(method, params);
+                    match service
+                        .send_call_message(
+                            account,
+                            recipient,
+                            crate::service::SendCallMessage {
+                                face,
+                                destination_device_id: destination,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(timestamp) => {
+                            jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                        }
+                        Err(error) => send_error(id, error),
                     }
-                    Err(error) => send_error(id, error),
-                },
+                }
                 (Some(account), Some(CallTarget::Group(group_id)), Some(face), _) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_call_message_group(
                             account,
@@ -1785,11 +1753,11 @@ async fn dispatch(
         // 正整数 u64。成功 `{timestamp}`（信封时间戳，sendCallMessage 同
         // 款）；事件源接线（connector 每事件即调）归 connector 批。
         "sendCallEvent" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let event = crate::service::parse_call_event(params);
             match (account, event) {
                 (Some(account), Some(event)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service.send_call_event(account, event).await {
                         Ok(timestamp) => {
                             jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
@@ -1818,19 +1786,6 @@ async fn dispatch(
                 Recipient(String),
                 Group(String),
             }
-            // 调度日志先落（send 系同款：被拒调用同样记录派发）；
-            // contact.avatar 键落盘前形状摘要化（头像 data URI 载荷零字
-            // 节进日志——setProfile/updateGroup「调度零头像字节」同纪律，
-            // 摘要以 URI 字符串长度记量级），contact 其余键逐字保留（名
-            // 片文本面是调用方自有数据，非 bulk 载荷）。
-            let mut logged_params = params.clone();
-            if let Some(Value::Object(contact)) = logged_params.get_mut("contact") {
-                if let Some(Value::String(uri)) = contact.get_mut("avatar") {
-                    let digest = format!("[avatar data uri: {} bytes]", uri.len());
-                    contact.insert("avatar".into(), json!(digest));
-                }
-            }
-            state.lock().await.append_dispatch(method, &logged_params);
             let account = params.get("account").and_then(Value::as_str);
             let contact = parse_send_contact(params.get("contact"));
             let recipient = match params.get("recipient") {
@@ -1864,6 +1819,7 @@ async fn dispatch(
             };
             match (account, target, contact) {
                 (Some(account), Some(ContactTarget::Recipient(recipient)), Some(payload)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service.send_contact(account, &recipient, &payload).await {
                         Ok(timestamp) => {
                             jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
@@ -1872,6 +1828,7 @@ async fn dispatch(
                     }
                 }
                 (Some(account), Some(ContactTarget::Group(group_id)), Some(payload)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_contact_group(account, &group_id, &payload)
                         .await
@@ -1928,10 +1885,6 @@ async fn dispatch(
         // 1059-1061）。attachment 缺席 = text story 现状零变化；group 与
         // 内容两腿正交（官方群 story text/media 双臂同源 getStoryMessage）。
         "sendStory" => {
-            state
-                .lock()
-                .await
-                .append_dispatch(method, &redacted_dispatch_params(method, params));
             let account = params
                 .get("account")
                 .and_then(Value::as_str)
@@ -2127,6 +2080,7 @@ async fn dispatch(
             }
             match (account, message, attachment) {
                 (Some(account), Some(message), None) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_story(
                             account,
@@ -2176,6 +2130,7 @@ async fn dispatch(
                 // 指针互异分键）；text 腿/发送失败键缺席（组装单点
                 // send_story_success_body，缺席绝不序列化）。
                 (Some(account), None, Some(attachment)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_story(
                             account,
@@ -2222,7 +2177,6 @@ async fn dispatch(
         //（send 系同纪律）；成功答空结果对象（上游同款）；未知结局不重试
         // 纪律由写调用结果即返回值承载（connector §4.56 对齐）。
         "sendMessageRequestResponse" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let request_type = params
                 .get("type")
@@ -2260,6 +2214,7 @@ async fn dispatch(
             };
             match (account, target, request_type) {
                 (Some(account), Some(target), Some(request_type)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_message_request_response(account, target, request_type)
                         .await
@@ -2285,7 +2240,6 @@ async fn dispatch(
         // （-32603）；协议上行面落调度日志（send 系同纪律）；成功答空结果
         // 对象；未知结局不重试。
         "requestAttachmentBackfill" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let author = params
                 .get("author")
@@ -2326,6 +2280,7 @@ async fn dispatch(
             };
             match (account, target, author, sent_timestamp) {
                 (Some(account), Some(target), Some(author), Some(sent_timestamp)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .request_attachment_backfill(account, target, author, sent_timestamp)
                         .await
@@ -2434,7 +2389,6 @@ async fn dispatch(
         // timestamp 正整数；任一条目形状错整拒 -32603 不发半批。协议上行
         // 面落调度日志（send 系同纪律）。
         "deleteForMeConversation" => {
-            state.lock().await.append_dispatch(method, params);
             let Some(account) = params.get("account").and_then(Value::as_str) else {
                 return internal_error(id);
             };
@@ -2462,6 +2416,7 @@ async fn dispatch(
             {
                 return internal_error(id);
             }
+            state.lock().await.append_dispatch(method, params);
             match service
                 .send_delete_for_me_conversation(
                     account,
@@ -2488,7 +2443,6 @@ async fn dispatch(
         // 拒 -32603 不发半批。协议上行面落调度日志（send 系同纪律；无消息
         // 正文/媒体内容）。fake：成功 {status:"sent"} 形状桩。
         "deleteForMeMessages" => {
-            state.lock().await.append_dispatch(method, params);
             let Some(account) = params.get("account").and_then(Value::as_str) else {
                 return internal_error(id);
             };
@@ -2501,6 +2455,7 @@ async fn dispatch(
             if entries.is_empty() || entries.len() > MAX_DELETE_FOR_ME_MESSAGES {
                 return internal_error(id);
             }
+            state.lock().await.append_dispatch(method, params);
             match service
                 .send_delete_for_me_messages(account, conversation, entries)
                 .await
@@ -2532,7 +2487,6 @@ async fn dispatch(
         // recipient/expirationInSeconds 缺失或形状错（负数/小数/超 u32），
         // 未注册联系人与发送失败同码 -32603 折叠。
         "setExpirationTimer" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let recipient = params.get("recipient").and_then(Value::as_str);
             let timer = params
@@ -2541,6 +2495,7 @@ async fn dispatch(
                 .and_then(|seconds| u32::try_from(seconds).ok());
             match (account, recipient, timer) {
                 (Some(account), Some(recipient), Some(timer)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .set_expiration_timer(account, recipient, timer)
                         .await
@@ -3428,7 +3383,6 @@ async fn dispatch(
         // set 臂三 flag 全缺（或全 null）= 无写意图整拒；写后返回目标三
         // flag 读投影（getConversationState 同形状）。
         "getConversationState" => {
-            state.lock().await.append_dispatch(method, params);
             let Some(account) = params.get("account").and_then(Value::as_str) else {
                 return internal_error(id);
             };
@@ -3438,6 +3392,7 @@ async fn dispatch(
             ) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service.conversation_state(account, conversation).await {
                 Ok(state) => jsonrpc::success_response(id, conversation_state_payload(&state)),
                 Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
@@ -3445,7 +3400,6 @@ async fn dispatch(
             }
         }
         "setConversationState" => {
-            state.lock().await.append_dispatch(method, params);
             let Some(account) = params.get("account").and_then(Value::as_str) else {
                 return internal_error(id);
             };
@@ -3486,6 +3440,7 @@ async fn dispatch(
                 // 三 flag 全缺 = 无写意图（updateGroup 全缺整拒同纪律）。
                 return internal_error(id);
             }
+            state.lock().await.append_dispatch(method, params);
             match service
                 .set_conversation_state(account, conversation, intent)
                 .await
@@ -3502,7 +3457,6 @@ async fn dispatch(
         //（setAccountConfiguration 零可写字段先例）。token 只能是
         // string|null|缺省；部分失败诚实投影（failures 逐条带状态码）。
         "reportSpam" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target_aci = params.get("targetAci").and_then(Value::as_str).and_then(
                 presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string,
@@ -3535,6 +3489,7 @@ async fn dispatch(
             }
             match (account, target_aci) {
                 (Some(account), Some(target_aci)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .report_spam(account, target_aci, server_guids, token.map(str::to_owned))
                         .await
@@ -3854,12 +3809,6 @@ async fn dispatch(
         // key 标准 base64), revision: 0}（avatar data URI 臂失败同
         // updateGroup 两臂纪律）。
         "createGroup" => {
-            let mut logged_params = params.clone();
-            if let Some(Value::String(uri)) = logged_params.get_mut("avatar") {
-                let digest = format!("[avatar data uri: {} bytes]", uri.len());
-                *logged_params.get_mut("avatar").expect("avatar slot") = json!(digest);
-            }
-            state.lock().await.append_dispatch(method, &logged_params);
             let account = params.get("account").and_then(Value::as_str);
             let title = match params.get("title") {
                 Some(Value::String(title)) if !title.is_empty() => title.to_owned(),
@@ -3906,6 +3855,7 @@ async fn dispatch(
             let Some(account) = account else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service
                 .create_group(account, &title, expiration, avatar, &members)
                 .await
@@ -3966,12 +3916,6 @@ async fn dispatch(
         // fake 模式形状桩 {groupId(随机 master key 标准 base64),
         // revision: 0}（avatar data URI 臂失败同 createGroup 两臂纪律）。
         "migrateGroup" => {
-            let mut logged_params = params.clone();
-            if let Some(Value::String(uri)) = logged_params.get_mut("avatar") {
-                let digest = format!("[avatar data uri: {} bytes]", uri.len());
-                *logged_params.get_mut("avatar").expect("avatar slot") = json!(digest);
-            }
-            state.lock().await.append_dispatch(method, &logged_params);
             let account = params.get("account").and_then(Value::as_str);
             let legacy_id = match params.get("groupId") {
                 Some(Value::String(text)) if !text.is_empty() => {
@@ -4024,6 +3968,7 @@ async fn dispatch(
             let Some(account) = account else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service
                 .migrate_group(
                     account,
@@ -4080,7 +4025,6 @@ async fn dispatch(
         // 网络面 → -1 STORAGE_UNAVAILABLE（STORAGE 族 retryable 语义）；
         // fake 模式成功 {status:"terminated"}。
         "terminateGroup" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let master_key = params
                 .get("groupId")
@@ -4089,6 +4033,7 @@ async fn dispatch(
             let (Some(account), Some(master_key)) = (account, master_key) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service.terminate_group(account, master_key).await {
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "terminated" })),
                 Err(crate::service::groups::TerminateError::UnknownAccount)
@@ -4152,16 +4097,6 @@ async fn dispatch(
         // STORAGE_UNAVAILABLE；fake 两臂：缺省/null 臂成功 {status:"sent"}、
         // data URI 臂失败 GROUP_AVATAR_UPLOAD_FAILED（§5 fake 两臂纪律）。
         "updateGroup" => {
-            // 调度日志先落（mutating 面同款：被拒调用同样记录派发）；
-            // avatar 键落盘前形状摘要化（头像 data URI/base64 载荷零字节
-            // 进日志，setProfile「调度零头像字节」同纪律；摘要以 URI 字符
-            // 串长度记量级）。groupId/account/expiration 键照旧逐字保留。
-            let mut logged_params = params.clone();
-            if let Some(Value::String(uri)) = logged_params.get_mut("avatar") {
-                let digest = format!("[avatar data uri: {} bytes]", uri.len());
-                *logged_params.get_mut("avatar").expect("avatar slot") = json!(digest);
-            }
-            state.lock().await.append_dispatch(method, &logged_params);
             let account = params.get("account").and_then(Value::as_str);
             let master_key = params
                 .get("groupId")
@@ -4283,6 +4218,7 @@ async fn dispatch(
             let (Some(account), Some(master_key)) = (account, master_key) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             let write = crate::service::groups::GroupUpdateWrite {
                 expiration_secs: expiration,
                 title: title.map(str::to_owned),
@@ -4344,7 +4280,6 @@ async fn dispatch(
         // STORAGE_UNAVAILABLE；fake 成功 {status:"left"} 形状桩（§5 fake 两
         // 臂纪律）。
         "leaveGroup" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let master_key = params
                 .get("groupId")
@@ -4353,6 +4288,7 @@ async fn dispatch(
             let (Some(account), Some(master_key)) = (account, master_key) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service.leave_group(account, master_key).await {
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "left" })),
                 Err(crate::service::groups::TerminateError::UnknownAccount)
@@ -4528,8 +4464,6 @@ async fn dispatch(
             }
         }
         "joinGroupViaLink" => {
-            // 写面落调度日志（mutating 面先落后被拒同样记录派发）。
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let parsed = params
                 .get("inviteLink")
@@ -4538,6 +4472,7 @@ async fn dispatch(
             let (Some(account), Some(parsed)) = (account, parsed) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service
                 .join_group_via_link(account, parsed.master_key, parsed.password)
                 .await
@@ -4578,7 +4513,6 @@ async fn dispatch(
         //（管理员有群态读面）。服务器拒绝 → GROUP_UPDATE_FAILED +
         // data.status；网络面 STORAGE_UNAVAILABLE；参数/本地闸面 -32603。
         "cancelJoinRequest" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let parsed = params
                 .get("inviteLink")
@@ -4587,6 +4521,7 @@ async fn dispatch(
             let (Some(account), Some(parsed)) = (account, parsed) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service
                 .cancel_join_request_via_link(account, parsed.master_key, parsed.password)
                 .await
@@ -4618,7 +4553,6 @@ async fn dispatch(
             }
         }
         "approveJoinRequest" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let master_key = params
                 .get("groupId")
@@ -4633,6 +4567,7 @@ async fn dispatch(
             if recipient.trim().is_empty() {
                 return internal_error(id);
             }
+            state.lock().await.append_dispatch(method, params);
             match service
                 .approve_join_request(account, master_key, recipient)
                 .await
@@ -5964,76 +5899,5 @@ mod tests {
         // 无键态）。
         let text = serde_json::to_string(&bare).expect("serialize");
         assert!(!text.contains("null"), "no-null：{text}");
-    }
-
-    /// 调度日志大媒体摘要面（帧帽对齐批 companion）：>1MiB（旧帧帽闸位）的
-    /// data URI 落盘前换成字节数摘要（形状同 updateGroup avatar），小载荷与
-    /// 其余键逐字保留（connector 侧既有断言零冲击）；非 send 系方法零变化。
-    #[test]
-    fn dispatch_log_large_media_payloads_are_digested_small_ones_verbatim() {
-        // 小载荷（旧帧帽下可达）：逐字保留。
-        let small_video = "data:video/mp4;base64,AAAA";
-        let small_image = "data:image/png;base64,BBBB";
-        let send = json!({
-            "account": "+15550000000",
-            "message": "hi",
-            "attachments": [small_video, 42],
-            "previewImage": small_image,
-        });
-        let logged = redacted_dispatch_params("send", send.as_object().expect("object"));
-        assert_eq!(logged["attachments"], json!([small_video, 42]));
-        assert_eq!(logged["previewImage"], json!(small_image));
-        assert_eq!(logged["message"], json!("hi"));
-        assert_eq!(logged["account"], json!("+15550000000"));
-
-        // 大载荷（>1MiB，帧帽对齐后才可达）：摘要化（非字符串条目原样）。
-        let big_video = format!("data:video/mp4;base64,{}", "A".repeat(1024 * 1024));
-        let big_image = format!("data:image/png;base64,{}", "B".repeat(1024 * 1024));
-        let send = json!({
-            "account": "+15550000000",
-            "message": "hi",
-            "attachments": [big_video, 42],
-            "previewImage": big_image,
-        });
-        let logged = redacted_dispatch_params("send", send.as_object().expect("object"));
-        assert_eq!(
-            logged["attachments"],
-            json!([
-                format!("[attachment data uri: {} bytes]", big_video.len()),
-                42
-            ])
-        );
-        assert_eq!(
-            logged["previewImage"],
-            json!(format!(
-                "[previewImage data uri: {} bytes]",
-                big_image.len()
-            ))
-        );
-
-        let story = json!({
-            "account": "+15550000000",
-            "attachment": big_video,
-            "previewImage": big_image,
-        });
-        let logged = redacted_dispatch_params("sendStory", story.as_object().expect("object"));
-        assert_eq!(
-            logged["attachment"],
-            json!(format!("[attachment data uri: {} bytes]", big_video.len()))
-        );
-        assert_eq!(
-            logged["previewImage"],
-            json!(format!(
-                "[previewImage data uri: {} bytes]",
-                big_image.len()
-            ))
-        );
-
-        let other = json!({
-            "account": "+15550000000",
-            "attachment": big_video,
-        });
-        let logged = redacted_dispatch_params("sendReaction", other.as_object().expect("object"));
-        assert_eq!(json!(logged), other, "非 send 系方法零变化");
     }
 }

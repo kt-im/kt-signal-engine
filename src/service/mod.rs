@@ -4344,6 +4344,13 @@ impl Service {
         self.mrm_pool.remove(account);
         // 池关闭/连接归还是异步 spawn，让出一次再删。
         tokio::task::yield_now().await;
+        // M5：先 drain（stop_pipeline + 发送管理器/池收口）再删账号日志文件，
+        // 避免在飞发送在删除后又追加一行把文件重建出来。fail-soft：日志清理
+        // 失败不改删除主结局，只落结构化 warn。
+        {
+            let state = self.state.lock().await;
+            state.remove_dispatch_log(account);
+        }
         if let Some(dir) = removed_dir {
             if let Err(error) = std::fs::remove_dir_all(&dir) {
                 if error.kind() != std::io::ErrorKind::NotFound {

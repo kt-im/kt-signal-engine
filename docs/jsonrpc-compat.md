@@ -7158,3 +7158,22 @@ announcements/terminated、收件人解析、profileSharing 白名单）仅 real
   码位。fake 面 `finishLink` 首提交即清空 `fake_link`（无 store、无 attempt 级
   提交位），**表达不了跨槽幂等**，因此不用 `accounts.len()==1` 自证单飞。
 - `cargo fmt` / `cargo clippy --all-targets -- -D warnings` / 全量单测与契约测试全绿。
+
+## 调度日志按账号分文件与脱敏（多账号 M5，2026-11-12）
+
+- 路径：`<data_dir>/engine-send-log/<accountTag>.jsonl`；`accountTag` =
+  `sha256(salt || lower(accountId))` 前 16 hex，`salt` 为同目录 `.salt`
+  （首建 32 随机字节，0600；安装级），**文件名不含号码/账号明文**；大小写归一，
+  `ABC`/`abc` 在 APFS/NTFS 上落到同一个文件。
+- 脱敏：正文类键（message/text/caption/quoteText/question/options/previewTitle/
+  previewDescription）只留 `{length, sha256Prefix, redacted}`；收件人类键只留
+  `count`；群名/联系人姓名/邀请链接/邀请密码/举报 token/sticker 图片一律摘要化；
+  任意 E.164 形状串一律 `{redacted:"phone"}`；超过 1 MiB 的媒体 data URI
+  只留字节数，`sticker.image` 一律摘要。保留 `method`、`ts` 与结构键。
+- 上限与轮转：每账号活动日志上限 5 MiB，超限轮转一次为 `.jsonl.1`
+  （只保留最近一段），不无限增长。
+- 生命周期：先 drain 再删日志；被参数校验拒绝的请求不写日志（不在删除后重建文件）。
+- 旧全局 `engine-send-log.jsonl` 一次性处理：先把旧文件原子改名为 `.migrated`
+  （保证幂等，崩溃残留不重放、不重复追加），再按 `params.account` 归属追加到
+  分文件；不可归属的行丢弃并 warn。
+- 权限：Unix 下文件 0600、目录 0700（每次写入校正；盐文件 0600）。
