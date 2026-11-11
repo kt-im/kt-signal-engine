@@ -103,6 +103,22 @@ pub(crate) mod keys {
     /// 群取回失败信封计（接收完整性批②：groupSyncFailed/groupTerminated
     /// 事件腿，decode+gone 合并计数）。
     pub const RECEIVE_KIND_GROUP_SYNC_FAILED: &str = "receive_kind_group_sync_failed";
+    /// Duplicate 恢复臂 replay 任务的**启动**失败（spawn_local 不在 LocalSet
+    /// 上下文即 panic，被 catch 后计此键）。投影未发生，ack 扣留。
+    pub const DUPLICATE_REPLAY_SPAWN_FAILED: &str = "duplicate_replay_spawn_failed";
+    /// Duplicate 恢复臂 replay 任务 panic（JoinError::is_panic）——投影未完成，
+    /// ack 扣留，信封留服务器队列待下次重放。payload 不落日志。
+    pub const DUPLICATE_REPLAY_PANIC: &str = "duplicate_replay_panic";
+    /// Duplicate 恢复臂 replay 任务被取消（管线收尾 abort；投影未完成）。
+    pub const DUPLICATE_REPLAY_ABORTED: &str = "duplicate_replay_aborted";
+    /// Duplicate 恢复臂 replay **确认无行**（store 查询成功且空集）——
+    /// 按「确认无可投影 = 已投影」flush 后照常 ack（止血 b），计此键仅供
+    /// 观测。store 打不开/查询/解码失败不是本键。
+    pub const DUPLICATE_REPLAY_UNAVAILABLE: &str = "duplicate_replay_unavailable";
+    /// Duplicate 恢复臂 replay 的读面失败（store open/查询/解码，或账号/
+    /// key 不可定位）——行状态未知，不能当「无行」：Failed 扣留 ack，等
+    /// 服务器下次重投重试。
+    pub const DUPLICATE_REPLAY_FAILED: &str = "duplicate_replay_failed";
     pub const FLUSH_BARRIER_OK: &str = "flush_barrier_ok";
     pub const FLUSH_BARRIER_DEAD: &str = "flush_barrier_dead";
     pub const SEND_TEXT_OK: &str = "send_text_ok";
@@ -159,6 +175,11 @@ const KNOWN_KEYS: &[&str] = &[
     keys::RECEIVE_KIND_CONTACTS,
     keys::RECEIVE_KIND_QUEUE_EMPTY,
     keys::RECEIVE_KIND_GROUP_SYNC_FAILED,
+    keys::DUPLICATE_REPLAY_SPAWN_FAILED,
+    keys::DUPLICATE_REPLAY_PANIC,
+    keys::DUPLICATE_REPLAY_ABORTED,
+    keys::DUPLICATE_REPLAY_UNAVAILABLE,
+    keys::DUPLICATE_REPLAY_FAILED,
     keys::FLUSH_BARRIER_OK,
     keys::FLUSH_BARRIER_DEAD,
     keys::SEND_TEXT_OK,
@@ -265,6 +286,19 @@ pub(crate) fn snapshot_json() -> serde_json::Value {
     })
 }
 
+/// 测试串行锁：全局指标注册表是进程共享的，
+/// `reset_for_tests` 会把其他测试在 add/record 与 snapshot 之间
+/// 清空（CI 并行下证实 flaky：日志键在 add 后被其他
+/// 用例 reset 掉，快照欠键）。所有会 reset 的测试持这把
+/// 锁做整段隔离；镜像不排除以外模块只读 snapshot。
+#[cfg(test)]
+fn test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 fn reset_for_tests() {
     let mut registry = registry().lock().expect("perf registry poisoned");
@@ -276,10 +310,11 @@ fn reset_for_tests() {
 
 #[cfg(test)]
 mod tests {
-    use super::{add, keys, record_us, reset_for_tests, snapshot_json};
+    use super::{add, keys, record_us, reset_for_tests, snapshot_json, test_serial};
 
     #[test]
     fn record_then_snapshot_has_series_and_counter_absent_until_used() {
+        let _serial = test_serial();
         reset_for_tests();
         record_us(keys::FLUSH_BARRIER, 1_500);
         add(keys::FLUSH_BARRIER_OK, 2);
@@ -300,6 +335,7 @@ mod tests {
 
     #[test]
     fn series_aggregates_count_total_max_last() {
+        let _serial = test_serial();
         reset_for_tests();
         record_us(keys::RECEIVE_ENVELOPE, 100);
         record_us(keys::RECEIVE_ENVELOPE, 900);
@@ -314,6 +350,7 @@ mod tests {
 
     #[test]
     fn unknown_key_is_dropped_and_counted_not_stored() {
+        let _serial = test_serial();
         reset_for_tests();
         record_us("rogue_metric", 1);
         add("rogue_metric", 1);
@@ -327,6 +364,7 @@ mod tests {
 
     #[test]
     fn snapshot_keys_are_deterministic_and_word_list_is_respected() {
+        let _serial = test_serial();
         reset_for_tests();
         add(keys::STREAM_CONNECTED, 1);
         add(keys::STREAM_RECOVERABLE, 3);
@@ -344,6 +382,7 @@ mod tests {
     /// vendor 字面量漂移即此测试红）。
     #[test]
     fn send_segment_keys_are_registered_and_pinned_to_vendor_literals() {
+        let _serial = test_serial();
         reset_for_tests();
         for key in [
             keys::SEND_RESOLVE,
@@ -375,6 +414,7 @@ mod tests {
     /// 可见——观测面唯一出口，失败静默纪律的计数承载）。
     #[test]
     fn send_warmup_counter_keys_are_registered_not_dropped() {
+        let _serial = test_serial();
         reset_for_tests();
         add(keys::SEND_WARMUP_RUN, 1);
         add(keys::SEND_WARMUP_OK, 4);

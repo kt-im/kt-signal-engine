@@ -106,12 +106,19 @@ fn pinned_client_builder(
     ca_pem: &str,
     user_agent: &str,
 ) -> reqwest::ClientBuilder {
-    reqwest::ClientBuilder::new()
+    let builder = reqwest::ClientBuilder::new()
         .tls_certs_only([
             reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap()
         ])
         .user_agent(user_agent)
-        .http1_only()
+        .http1_only();
+    // Local debugging only: TLS-terminating proxies present a private CA that
+    // the pinned Signal root cannot verify. Opt in explicitly, never default.
+    if std::env::var("KT_SIGNAL_INSECURE_TLS").ok().as_deref() == Some("1") {
+        builder.danger_accept_invalid_certs(true)
+    } else {
+        builder
+    }
 }
 
 impl PushService {

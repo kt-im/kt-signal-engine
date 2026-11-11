@@ -90,9 +90,15 @@ const _: () = {
 /// `engine.protocolCapabilities` 应答体：只读、零网络、账号无关，未绑定
 /// 账号照常应答。能力位 JSON 形状 = vendor serde 属性输出（camelCase；
 /// `profiles_v2` 按上游字面保持 snake——线上声明即此拼写，消费方不得
-/// "纠正"），键值即引擎向服务器声明的位。
+/// "纠正"），键值即引擎向服务器声明的位；O1 握手引擎腿批（2026-11-10）
+/// additive `contractRevision`——它是引擎自证元数据（单源常量），不是
+/// 协议能力位，不向服务器声明。
 pub(crate) fn protocol_capabilities_payload() -> Value {
     json!({
+        // O1 握手引擎腿（2026-11-10，wire additive【engine-compat】）：
+        // 自证面 additive 出契约修订，值取 crate::contract 单源常量，
+        // 与 version 面同值（connector 以本面为权威、version 面为回退）。
+        "contractRevision": crate::contract::CONTRACT_REVISION,
         "deviceCapabilities": vendor_json(&DEVICE_CAPABILITIES),
         "deviceCapabilitiesUpload": vendor_json(&DEVICE_CAPABILITIES_UPLOAD),
         "linkCapabilities": vendor_json(&LinkCapabilities::default()),
@@ -227,11 +233,19 @@ mod tests {
             obj.keys().collect::<Vec<_>>().as_slice(),
             [
                 "baseline",
+                "contractRevision",
                 "deviceCapabilities",
                 "deviceCapabilitiesUpload",
                 "linkCapabilities"
             ]
         );
+        // O1 握手引擎腿：自证面报单源契约修订（旧四键不回归由上方键集
+        // 钉定，本行只钉新键值）。
+        assert_eq!(
+            obj["contractRevision"],
+            json!(crate::contract::CONTRACT_REVISION)
+        );
+        assert_eq!(obj["contractRevision"], json!("1.285"));
 
         let device = obj["deviceCapabilities"].as_object().expect("object");
         assert_eq!(

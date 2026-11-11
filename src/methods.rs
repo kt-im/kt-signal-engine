@@ -8,6 +8,7 @@
 //! 落调度日志。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
@@ -74,6 +75,14 @@ const SESSION_BUILD_MESSAGE: &str =
 /// 附件/贴纸图/预览图上行失败——上传先于发送，消息未离站。
 const ATTACHMENT_UPLOAD_MESSAGE: &str =
     "Failed to send message: Attachment upload failed. (AttachmentUploadException)";
+/// 附件上行全局并发槽等待超时（M5）：上行尚未开始，确定
+/// 未投递，可重试；wire 字面量与 connector 分类器配套。
+const ATTACHMENT_BUSY_MESSAGE: &str =
+    "Failed to send message: Attachment upload slot busy. (AttachmentBusyException)";
+/// 附件上行全局字节预算不足（M5）：base64 decode 前拒绝，
+/// 整批未上行；单请求可能永远超预算，不自动重试。
+const ATTACHMENT_BUDGET_MESSAGE: &str =
+    "Failed to send message: Attachment byte budget exhausted. (AttachmentBudgetException)";
 /// 群腿零收件人（群成员过滤自身后目标集为空）——请求从未构造收件人面，
 /// 确定未送达（2026-10-16 群腿零收件人防御批，wire 字面量与锚词
 /// `(NoRecipientsException)`；群发送系与群 typing 共用，compat §3/§5）。
@@ -87,6 +96,16 @@ pub(crate) enum Inbound {
     /// 入站帧超过 `crate::MAX_LINE_BYTES`（已吞到行尾，内容不保留）；
     /// `bytes` 是该帧实际字节数，只进结构化拒绝日志。
     Overlong { bytes: u64 },
+}
+
+impl Inbound {
+    /// 该帧占用的入站队列字节预算（Overlong 帧不保留内容，计 0）。
+    pub(crate) fn queued_bytes(&self) -> usize {
+        match self {
+            Inbound::Line(line) => line.len(),
+            Inbound::Overlong { .. } => 0,
+        }
+    }
 }
 
 /// 调度日志大媒体载荷摘要化（帧帽对齐批 companion）：`send` 的
@@ -137,38 +156,169 @@ fn redacted_dispatch_params(method: &str, params: &Map<String, Value>) -> Map<St
     logged
 }
 
-pub(crate) async fn respond(
-    inbound: &Inbound,
+/// 入站帧的解析结果（M4 稳定性批）：分帧只做一次——超时预算分类、busy
+/// 应答 id 提取与 dispatch 共用同一份解析结果，避免 160MiB 帧被重复解析
+/// 或为了判类型再复制一份 params。
+pub(crate) enum Prepared {
+    Overlong { bytes: u64 },
+    Malformed(Value),
+    Request(Request),
+}
+
+/// 普通请求预算（M5）：无附件上行面的请求 60s 内必须收敛，超时即取消。
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// 附件请求预算（M5）：含附件/预览图/贴纸/头像上行面的请求给 120s。
+pub(crate) const ATTACHMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// finishLink 预算：等待手机确认是协议内长任务，connector 侧
+/// `LINK_FINISH_TIMEOUT` = 5 min（kt-signal-connector supervisor.rs:77）。
+/// 引擎内建上限必须晚于 connector 的取消点，否则会在手机仍可确认时先
+/// 砍掉链接会话（connector 重试会变成第二次设备授权）。只作最后兜底。
+pub(crate) const LINK_FINISH_TIMEOUT: Duration = Duration::from_secs(360);
+
+/// 引擎级错误码（JSON-RPC 保留区外的实现错误）：busy/超时共用 -32000，
+/// 结构化原因放 error.data.reason（connector 可按 reason 区分背压与超时）。
+const ENGINE_UNAVAILABLE: i64 = -32000;
+
+pub(crate) const ENGINE_BUSY_MESSAGE: &str =
+    "Engine busy: in-flight request limit reached. (EngineBusyException)";
+
+pub(crate) const ENGINE_TIMEOUT_MESSAGE: &str =
+    "Request timed out and was cancelled by the engine. (EngineTimeoutException)";
+
+/// 帧 → 解析结果（一次性）。`Inbound::Overlong` 不解析内容，只保留字节数。
+pub(crate) fn prepare(inbound: &Inbound) -> Prepared {
+    match inbound {
+        Inbound::Overlong { bytes } => Prepared::Overlong { bytes: *bytes },
+        Inbound::Line(line) => match jsonrpc::parse_line(line) {
+            ParseOutcome::Malformed(id) => Prepared::Malformed(id),
+            ParseOutcome::Request(request) => Prepared::Request(request),
+        },
+    }
+}
+
+/// 应答 id（busy/超时错误面用；id 只会是字符串/数字/null，clone 成本可忽
+/// 略——params 不入这条路径）。
+pub(crate) fn prepared_id(prepared: &Prepared) -> Value {
+    match prepared {
+        Prepared::Overlong { .. } => Value::Null,
+        Prepared::Malformed(id) => id.clone(),
+        Prepared::Request(request) => request.id.clone(),
+    }
+}
+
+/// 方法名（超时日志用；Malformed/Overlong 无方法名）。
+pub(crate) fn prepared_method(prepared: &Prepared) -> Option<&str> {
+    match prepared {
+        Prepared::Request(request) => Some(request.method.as_str()),
+        _ => None,
+    }
+}
+
+/// 请求超时预算分类（M5）：附件上行面 120s、finishLink 360s、其余 60s。
+pub(crate) fn request_timeout_budget(prepared: &Prepared) -> Duration {
+    let Prepared::Request(request) = prepared else {
+        return REQUEST_TIMEOUT;
+    };
+    if request.method == "finishLink" {
+        return LINK_FINISH_TIMEOUT;
+    }
+    if carries_attachment_upload(request) {
+        ATTACHMENT_REQUEST_TIMEOUT
+    } else {
+        REQUEST_TIMEOUT
+    }
+}
+
+/// 请求是否含附件上行面：只按公开参数键判定，宽松命中（多给 120s 无害，
+/// 少给会让大附件请求在 CDN 上行中途被取消）。
+fn carries_attachment_upload(request: &Request) -> bool {
+    let params = &request.params;
+    let non_empty_uri = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    match request.method.as_str() {
+        "send" => {
+            matches!(params.get("attachments"), Some(Value::Array(entries)) if !entries.is_empty())
+                || non_empty_uri("previewImage")
+                || params.get("sticker").is_some_and(|value| !value.is_null())
+        }
+        "sendStory" => non_empty_uri("attachment") || non_empty_uri("previewImage"),
+        "sendContact" | "setProfile" => non_empty_uri("avatar"),
+        "createGroup" | "updateGroup" | "migrateGroup" => non_empty_uri("avatar"),
+        _ => false,
+    }
+}
+
+/// 在飞上限拒绝面（M4）：立即结构化回错，不排队膨胀、不静默丢。
+pub(crate) fn busy_response(prepared: &Prepared) -> Value {
+    jsonrpc::error_response(
+        &prepared_id(prepared),
+        &RpcError::with_data(
+            ENGINE_UNAVAILABLE,
+            ENGINE_BUSY_MESSAGE,
+            json!({
+                "reason": "ENGINE_BUSY",
+                "retryable": true,
+                "inFlightLimit": crate::INFLIGHT_REQUEST_LIMIT,
+            }),
+        ),
+    )
+}
+
+/// 超时取消面（M5）：dispatch future 已被 drop（取消），回结构化超时错误。
+pub(crate) fn timeout_response(id: &Value, budget: Duration) -> Value {
+    jsonrpc::error_response(
+        id,
+        &RpcError::with_data(
+            ENGINE_UNAVAILABLE,
+            ENGINE_TIMEOUT_MESSAGE,
+            json!({
+                "reason": "REQUEST_TIMEOUT",
+                // 超时崩带的 dispatch future 可能已写出请求（send 类
+                // mutating 面），结局未知：不声称可重试。
+                "retryable": false,
+                "timeoutMs": budget.as_millis() as u64,
+            }),
+        ),
+    )
+}
+
+/// 已解析帧的 dispatch（respond 的解析后半段；main 只在 timeout 包裹内
+/// 调用它）。`prepared` 按值消费：Request 的 params 直接进入 dispatch，
+/// 原始 160MiB 帧缓冲可在调用前释放。
+pub(crate) async fn respond_prepared(
+    prepared: Prepared,
     state: Arc<AsyncMutex<EngineState>>,
     service: Arc<Service>,
 ) -> Value {
-    match inbound {
-        Inbound::Overlong { bytes } => {
+    match prepared {
+        Prepared::Overlong { bytes } => {
             // 超帽帧以前完全静默（只有 id 为 null 的 parse error），connector
             // 侧把无 id 应答判为协议故障并杀掉引擎时，engine-stderr 没有任何
             // 线索。这里落一条 warn：帧字节数 + 上限，零内容字节。
             tracing::warn!(
-                frame_bytes = *bytes,
+                frame_bytes = bytes,
                 frame_limit = crate::MAX_LINE_BYTES,
                 "inbound frame exceeds the line limit; answered with a parse error"
             );
             jsonrpc::parse_error_response(Value::Null)
         }
-        Inbound::Line(line) => match jsonrpc::parse_line(line) {
-            ParseOutcome::Malformed(id) => jsonrpc::parse_error_response(id),
-            ParseOutcome::Request(request) => {
-                // S2a 打点：JSON-RPC 请求分派整体耗时（单点包裹，控制流
-                // 零变化；dispatch 臂内多 `return` 故不在其内部计时）。
-                let dispatch_started = std::time::Instant::now();
-                let response = dispatch(&request, state, service).await;
-                crate::service::perf_metrics::record_us(
-                    crate::service::perf_metrics::keys::RPC_DISPATCH,
-                    dispatch_started.elapsed().as_micros() as u64,
-                );
-                log_rpc_error_face(&request, &response);
-                response
-            }
-        },
+        Prepared::Malformed(id) => jsonrpc::parse_error_response(id),
+        Prepared::Request(request) => {
+            // S2a 打点：JSON-RPC 请求分派整体耗时（单点包裹，控制流
+            // 零变化；dispatch 臂内多 `return` 故不在其内部计时）。
+            let dispatch_started = std::time::Instant::now();
+            let response = dispatch(&request, state, service).await;
+            crate::service::perf_metrics::record_us(
+                crate::service::perf_metrics::keys::RPC_DISPATCH,
+                dispatch_started.elapsed().as_micros() as u64,
+            );
+            log_rpc_error_face(&request, &response);
+            response
+        }
     }
 }
 
@@ -3062,6 +3212,9 @@ async fn dispatch(
                 Err(error) => phone_lookup_error(id, &error),
             }
         }
+        // receive.confirm（KT 扩展，phase2 兼容面）：kt_outbox 已随迁移
+        // DROP，confirm 是幂等 no-op；账号已知返回 true，wire 形状不变。
+        // connector 零调用，保留一版供回滚窗口。
         "receive.confirm" => {
             let Some(account) = params.get("account").and_then(Value::as_str) else {
                 return internal_error(id);
@@ -3072,8 +3225,9 @@ async fn dispatch(
             let confirmed = service.confirm_duplicate(account, key).await;
             jsonrpc::success_response(id, Value::Bool(confirmed))
         }
-        // receive.replay（KT 扩展）：按 dedupe key 从 presage receive outbox
-        // 重建 Content 并投影；供 connector 消费 Duplicate recovery marker。
+        // receive.replay（KT 扩展，phase2 兼容面）：dedupe key 只解析成
+        // sender+client_timestamp，按 thread_messages 重建 Content 并投影；
+        // kt_outbox 已 DROP，没有第二份拷贝可读。
         "receive.replay" => {
             let Some(account) = params.get("account").and_then(Value::as_str) else {
                 return internal_error(id);
@@ -3082,8 +3236,10 @@ async fn dispatch(
                 return internal_error(id);
             };
             match service.replay_duplicate(account, key).await {
-                Some(rows) => jsonrpc::success_response(id, Value::Array(rows)),
-                None => internal_error(id),
+                Ok(Some(rows)) => jsonrpc::success_response(id, Value::Array(rows)),
+                // 唯二可达的 miss/失败面（确认无行 / 读面无法确认）wire 形状
+                // 不变：同折叠 -32603，不向 connector 发明新错误码。
+                Ok(None) | Err(_) => internal_error(id),
             }
         }
         // profiles.refreshContacts（联系人 profile 名字材料刷新，KT 扩展
@@ -4709,12 +4865,19 @@ async fn dispatch(
 }
 
 /// version 元方法应答体：上游 signal-cli JSON-RPC 的 `{name, version}`
-/// 双字符串键形状（connector 原样透传，键集即契约，不自造字段——libsignal
+/// 双字符串键形状（connector 原样透传，旧键集即契约、只增不改——libsignal
 /// 基线是 `engine.protocolCapabilities.baseline` 的面，不混装）。身份诚实
 /// 自报引擎本名与本仓版本，不冒充上游名——doctor 面向桌面呈现的就是这份
 /// 原文，冒名将制造「signal-cli 版本 0.1.0」式误读。
+///
+/// O1 握手引擎腿（2026-11-10，wire additive【engine-compat】）：additive
+/// `contractRevision` 键，值取 [`crate::contract::CONTRACT_REVISION`] 单源
+/// （connector `src/engine_contract.rs` 接受 version 面作能力面的回退面）。
+/// 旧双键 `{name, version}` 零变化——新增键只增不改，doctor 原样透传面
+/// 对旧消费方仍是同形前缀。
 fn version_payload() -> Value {
     json!({
+        "contractRevision": crate::contract::CONTRACT_REVISION,
         "name": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
     })
@@ -5351,6 +5514,8 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
         SendError::PreKey => (-32603, PRE_KEY_MESSAGE),
         SendError::SessionBuild => (-32603, SESSION_BUILD_MESSAGE),
         SendError::AttachmentUpload => (-32603, ATTACHMENT_UPLOAD_MESSAGE),
+        SendError::AttachmentBusy => (-32603, ATTACHMENT_BUSY_MESSAGE),
+        SendError::AttachmentBudgetExceeded => (-32603, ATTACHMENT_BUDGET_MESSAGE),
         SendError::NoRecipients => (-32603, NO_RECIPIENTS_MESSAGE),
         // 群取回分型降级（接收完整性批②，compat §3）：-1 同目标终止族
         // （目标群态不可用即不应再发），data.count 由 send_error 单点附加。
@@ -5425,6 +5590,8 @@ mod tests {
             SendError::PreKey,
             SendError::SessionBuild,
             SendError::AttachmentUpload,
+            SendError::AttachmentBusy,
+            SendError::AttachmentBudgetExceeded,
             SendError::NoRecipients,
             SendError::GroupSyncFailed { count: 2 },
             SendError::Internal,
@@ -5503,17 +5670,17 @@ mod tests {
         assert_eq!(counts["NetworkFailure"], json!(1));
     }
 
-    /// version 元方法应答体形状面：恰 `{name, version}` 双字符串键（上游
-    /// signal-cli JSON-RPC 形状，connector runtime.doctor 原样透传——键集
-    /// 即契约，改动即断）；name = 引擎本名（诚实自报，不冒充上游），
-    /// version = 本仓版本非空。
+    /// version 元方法应答体形状面：旧 `{name, version}` 双字符串键不回归
+    /// （上游 signal-cli JSON-RPC 形状，connector runtime.doctor 原样透传
+    /// ——键集即契约，改动即断；name = 引擎本名诚实自报，version = 本仓
+    /// 版本非空），additive `contractRevision` = 单源常量（O1 握手引擎腿）。
     #[test]
     fn version_payload_shape() {
         let payload = version_payload();
         let obj = payload.as_object().expect("payload object");
         assert_eq!(
             obj.keys().collect::<Vec<_>>().as_slice(),
-            ["name", "version"]
+            ["contractRevision", "name", "version"]
         );
         assert_eq!(obj["name"], json!(env!("CARGO_PKG_NAME")));
         assert_eq!(obj["name"], json!("kt-signal-engine"));
@@ -5522,6 +5689,11 @@ mod tests {
             !obj["version"].as_str().expect("version string").is_empty(),
             "version 非空"
         );
+        assert_eq!(
+            obj["contractRevision"],
+            json!(crate::contract::CONTRACT_REVISION)
+        );
+        assert_eq!(obj["contractRevision"], json!("1.285"));
     }
 
     /// 发送链结构化三面（限流/人机验证/服务端不可用）wire 形状：均

@@ -469,6 +469,53 @@ fn list_accounts_fake_capabilities_shape() {
     );
 }
 
+/// receive.confirm / receive.replay 兼容面（phase2）：kt_outbox 已 DROP，
+/// 两个方法保留一版回滚窗口。confirm = 幂等 no-op（已知账号 true / 未知
+/// false / key 形状不参与判定）；replay = 仍按 dedupe key 解析 sender+ts 查
+/// thread_messages（无行 → -32603）。wire 形状不变。
+#[test]
+fn receive_compat_surface_stays_a_noop() {
+    let dir = temp_dir("receive-compat");
+    // v2 注册表：一条带 store 目录的账号（fake 管线不启动，只测方法面）。
+    let account = "+15550000001";
+    let state = json!({
+        "version": 2,
+        "accounts": [{ "number": account, "dir": "accounts/known" }],
+    });
+    std::fs::write(
+        dir.join("engine-state.json"),
+        serde_json::to_vec(&state).expect("state json"),
+    )
+    .expect("engine-state.json");
+    std::fs::create_dir_all(dir.join("accounts/known")).expect("account dir");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let key = "dup:11111111-2222-4333-8444-555555555555:1700000000000";
+
+    // 已知账号：幂等 true（kt_outbox 已 DROP，没有行也需要 confirm 收口）；
+    // 未知账号：如实 false。
+    for _ in 0..2 {
+        let confirmed = engine.request(
+            "receive.confirm",
+            json!({ "account": account, "dedupeKey": key }),
+        );
+        assert_eq!(confirmed["result"], json!(true));
+    }
+    let unknown = engine.request(
+        "receive.confirm",
+        json!({ "account": "+15559990000", "dedupeKey": key }),
+    );
+    assert_eq!(unknown["result"], json!(false));
+
+    // 参数面照旧 fail-closed（-32603）。
+    let (code, _) = engine.error_of("receive.confirm", json!({ "account": account }));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "receive.replay",
+        json!({ "account": account, "dedupeKey": key }),
+    );
+    assert_eq!(code, -32603, "无 store 行 → replay 折叠内部错误");
+}
+
 #[test]
 fn real_mode_no_network_error_paths() {
     let dir = temp_dir("real-no-net");
@@ -6992,11 +7039,15 @@ fn engine_protocol_capabilities_self_report_shape() {
             obj.keys().collect::<Vec<_>>().as_slice(),
             [
                 "baseline",
+                "contractRevision",
                 "deviceCapabilities",
                 "deviceCapabilitiesUpload",
                 "linkCapabilities"
             ]
         );
+        // O1 握手引擎腿（2026-11-10，wire additive）：契约修订在自证面
+        // 原样自报，值 = 单源常量（connector 支持区间 1.200-1.285）。
+        assert_eq!(obj["contractRevision"], json!("1.285"));
 
         let device = obj["deviceCapabilities"]
             .as_object()
@@ -7103,9 +7154,11 @@ fn engine_protocol_capabilities_self_report_shape() {
 fn version_self_report_shape() {
     let assert_shape = |result: &Value| {
         let obj = result.as_object().expect("result object");
+        // 旧双键 {name, version} 不回归；O1 握手引擎腿（2026-11-10，
+        // wire additive）新增 contractRevision，值 = 单源常量。
         assert_eq!(
             obj.keys().collect::<Vec<_>>().as_slice(),
-            ["name", "version"]
+            ["contractRevision", "name", "version"]
         );
         assert_eq!(obj["name"], json!("kt-signal-engine"));
         let version = obj["version"].as_str().expect("version string");
@@ -7114,6 +7167,7 @@ fn version_self_report_shape() {
             version.chars().next().is_some_and(|c| c.is_ascii_digit()),
             "version is semver-ish (digit-leading)"
         );
+        assert_eq!(obj["contractRevision"], json!("1.285"));
     };
 
     // real 模式 + 全新数据目录：doctor 探针同形空参应答；零参数方法多余
@@ -7132,6 +7186,35 @@ fn version_self_report_shape() {
     let fake_dir = temp_dir("version-fake");
     let mut fake_engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
     assert_shape(&fake_engine.request("version", json!({}))["result"]);
+}
+
+/// O1 握手引擎腿（connector `src/engine_contract.rs`，共享契约 1.285）：
+/// 两个自证面必须自报同一个 `contractRevision`（单源常量派生），且旧字段
+/// 零回归——connector 以 capabilities 面为权威、version 面为回退，两面同值
+/// 才能稳定判 `match`；任一缺失/分叉会退化成 `legacy` 或失配。
+#[test]
+fn self_report_faces_share_one_contract_revision() {
+    let fake_dir = temp_dir("contract-revision-fake");
+    let mut engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
+    let version = engine.request("version", json!({}))["result"].clone();
+    let capabilities = engine.request("engine.protocolCapabilities", json!({}))["result"].clone();
+    assert_eq!(version["contractRevision"], json!("1.285"));
+    assert_eq!(
+        capabilities["contractRevision"], version["contractRevision"],
+        "两面契约修订必须同值（单源常量）"
+    );
+    // 旧字段不回归：version 双键、自证面四键照常在手。
+    for key in ["name", "version"] {
+        assert!(!version[key].is_null(), "version.{key} 不回归");
+    }
+    for key in [
+        "baseline",
+        "deviceCapabilities",
+        "deviceCapabilitiesUpload",
+        "linkCapabilities",
+    ] {
+        assert!(capabilities.get(key).is_some(), "capabilities.{key} 不回归");
+    }
 }
 
 /// engine.perfMetrics（S2a 性能基线打点层 + A1 per-account 观测，KT 扩展

@@ -630,6 +630,27 @@
 - `presage-store-sqlite/src/content.rs`（同批）— `profile_keys()`
   sqlite 实现（`SELECT uuid, key FROM profile_keys ORDER BY uuid`，坏行
   filter_map 诚实丢弃；.sqlx 离线描述随批）。
+- `presage-store-sqlite/src/{content.rs,lib.rs}`（2026-11-10 接收 duplicate
+  phase1，决策 B；表已在 phase2 DROP，见下条）— ①`save_messages` 停止写
+  `kt_outbox`（表与迁移保留 phase2 前）；②`save_message_on_tx` 补写 `server_ts`（重放保留信封
+  服务器时刻；运行期 SQL 不走宏，离线 `.sqlx` 缓存零改动）；③新增
+  `messages_by_sender_and_timestamp`（同 sender+ts 跨 thread 全行读面）与
+  `kt_outbox_len`（诊断/回归计数），`sent_message_by_timestamp` 收口到共享
+  行解码（recipient_id 按 BLOB UUID 解，修正既有 TEXT 假定）；④store 侧
+  四件回归：两群同 sender+ts 各自可重放、远端删除墓碑重放 NullMessage、
+  重投单行且 outbox 零增长、pni_verified/server_ts 重建保持。
+- `presage-store-sqlite/{migrations,rollback,src}`（2026-11-10 接收
+  duplicate phase2，决策 B）— ①新增迁移
+  `20261110120000_drop_kt_outbox.sql`（`DROP TABLE IF EXISTS kt_outbox`；
+  随表去掉 dedupe_key 的隐式 UNIQUE 索引，本表从无显式索引）。旧库下次
+  open 补跑、新库同链先建后 DROP，双向收敛且可重复执行；②新增回滚脚本
+  `rollback/20261110120000_drop_kt_outbox_rollback.sql`：重建 phase1 表 +
+  清 `_sqlx_migrations` 该版本行（sqlx 会拒绝迁移表比二进制新的库，二进制
+  回退必须配套跑它；phase2 二进制再 open 会重新 DROP）；③删除
+  `kt_outbox_get` / `kt_outbox_confirm` / `kt_outbox_len`；④新增
+  `src/migration_test.rs` 四件回归（新库无表、phase1 库升级带行且无关数据
+  保留、回滚脚本恢复 schema/UNIQUE 后可再前滚、重开幂等）；phase1 的两件
+  断言改为「表已不存在」。
 
 ## 更新纪律
 

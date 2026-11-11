@@ -1,108 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! E: protocol outbox semantics before persistence.
-//! seq is assigned in-order; dedupe_key is unique; confirm only moves forward.
-
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::Path;
-
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct OutboxRow {
-    pub seq: u64,
-    pub epoch: u64,
-    pub dedupe_key: String,
-    pub payload: String,
-    pub confirmed: bool,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-pub(crate) struct OutboxModel {
-    next_seq: u64,
-    rows: BTreeMap<u64, OutboxRow>,
-}
-
-impl OutboxModel {
-    pub(crate) fn enqueue(&mut self, epoch: u64, dedupe_key: &str, payload: &str) -> u64 {
-        if let Some(existing) = self.rows.values().find(|row| row.dedupe_key == dedupe_key) {
-            return existing.seq;
-        }
-        self.next_seq += 1;
-        let seq = self.next_seq;
-        self.rows.insert(
-            seq,
-            OutboxRow {
-                seq,
-                epoch,
-                dedupe_key: dedupe_key.to_string(),
-                payload: payload.to_string(),
-                confirmed: false,
-            },
-        );
-        seq
-    }
-
-    pub(crate) fn confirm(&mut self, seq: u64) -> bool {
-        match self.rows.get_mut(&seq) {
-            Some(row) if !row.confirmed => {
-                row.confirmed = true;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    pub(crate) fn pull_unconfirmed(&self, after: u64, limit: usize) -> Vec<OutboxRow> {
-        self.rows
-            .range(after.saturating_add(1)..)
-            .filter(|(_, row)| !row.confirmed)
-            .take(limit)
-            .map(|(_, row)| row.clone())
-            .collect()
-    }
-
-    pub(crate) fn save(&self, path: &Path) -> std::io::Result<()> {
-        let tmp = path.with_extension("tmp");
-        let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
-        fs::write(&tmp, bytes)?;
-        fs::rename(tmp, path)
-    }
-
-    pub(crate) fn load(path: &Path) -> std::io::Result<Self> {
-        let bytes = fs::read(path)?;
-        serde_json::from_slice(&bytes).map_err(std::io::Error::other)
-    }
-
-    pub(crate) fn snapshot(&self) -> Vec<OutboxRow> {
-        self.rows.values().cloned().collect()
-    }
-
-    pub(crate) fn restore(rows: Vec<OutboxRow>) -> Self {
-        let next_seq = rows.iter().map(|row| row.seq).max().unwrap_or(0);
-        Self {
-            next_seq,
-            rows: rows.into_iter().map(|row| (row.seq, row)).collect(),
-        }
-    }
-
-    pub(crate) fn pull_unconfirmed_for_epoch(
-        &self,
-        epoch: u64,
-        after: u64,
-        limit: usize,
-    ) -> Vec<OutboxRow> {
-        self.pull_unconfirmed(after, usize::MAX)
-            .into_iter()
-            .filter(|row| row.epoch == epoch)
-            .take(limit)
-            .collect()
-    }
-}
+//! Duplicate-envelope wire key: `dup:{sender}:{client_timestamp}`.
+//!
+//! Phase2 (2026-11-10, receive-duplicate decision B): the key is a wire-level
+//! label only. Store rows are located by thread+ts (receive arm) or sender+ts
+//! (legacy `receive.replay` face), never by this key, so the pre-persistence
+//! `OutboxModel` that once mirrored the presage `kt_outbox` table is gone
+//! together with the table.
 
 pub(crate) fn duplicate_dedupe_key(sender: &str, timestamp: u64) -> String {
     format!("dup:{sender}:{timestamp}")
+}
+
+/// Phase2：dup key 只作为 wire 标识解析，不再是 store 行键。返回
+/// `(sender, client_timestamp)`；格式不符（缺前缀、空 sender、ts 非整数）
+/// 一律 None，调用方按 Failed 收口（无法定位行 ≠ 确认无行，不能 flush
+/// 后 ack）。
+pub(crate) fn parse_duplicate_dedupe_key(key: &str) -> Option<(String, u64)> {
+    let rest = key.strip_prefix("dup:")?;
+    let (sender, timestamp) = rest.rsplit_once(':')?;
+    if sender.is_empty() {
+        return None;
+    }
+    Some((sender.to_owned(), timestamp.parse().ok()?))
 }
 
 #[cfg(test)]
@@ -119,36 +39,18 @@ mod tests {
     }
 
     #[test]
-    fn outbox_sequences_dedupes_confirms_and_pulls() {
-        let mut outbox = OutboxModel::default();
-        assert_eq!(outbox.enqueue(1, "a", "{}"), 1);
-        assert_eq!(outbox.enqueue(1, "a", "{}"), 1);
-        assert_eq!(outbox.enqueue(1, "b", "{}"), 2);
-        assert_eq!(outbox.pull_unconfirmed(0, 10).len(), 2);
-        assert!(outbox.confirm(1));
-        assert!(!outbox.confirm(1));
-        let rest = outbox.pull_unconfirmed(0, 10);
-        assert_eq!(rest.len(), 1);
-        assert_eq!(rest[0].seq, 2);
-
-        // Duplicate after confirm: same seq, still confirmed, no new row.
-        assert_eq!(outbox.enqueue(1, "a", "{}"), 1);
-        assert!(outbox
-            .pull_unconfirmed(0, 10)
-            .iter()
-            .all(|row| row.seq != 1));
-        assert_eq!(outbox.pull_unconfirmed_for_epoch(1, 0, 10).len(), 1);
-        assert!(outbox.pull_unconfirmed_for_epoch(2, 0, 10).is_empty());
-
-        let restored = OutboxModel::restore(outbox.snapshot());
-        assert_eq!(restored.pull_unconfirmed(0, 10).len(), 1);
-        assert_eq!(restored.next_seq, 2);
-
-        let path = std::env::temp_dir().join(format!("kt-outbox-{}.json", std::process::id()));
-        outbox.save(&path).unwrap();
-        let loaded = OutboxModel::load(&path).unwrap();
-        let _ = fs::remove_file(&path);
-        assert_eq!(loaded.pull_unconfirmed(0, 10).len(), 1);
-        assert_eq!(loaded.next_seq, 2);
+    fn duplicate_key_roundtrips_and_rejects_garbage() {
+        let key = duplicate_dedupe_key("11111111-2222-4333-8444-555555555555", 1_700_000_000_000);
+        assert_eq!(
+            parse_duplicate_dedupe_key(&key),
+            Some((
+                "11111111-2222-4333-8444-555555555555".to_owned(),
+                1_700_000_000_000
+            ))
+        );
+        assert_eq!(parse_duplicate_dedupe_key("aci-a:42"), None);
+        assert_eq!(parse_duplicate_dedupe_key("dup::42"), None);
+        assert_eq!(parse_duplicate_dedupe_key("dup:aci-a:not-a-ts"), None);
+        assert_eq!(parse_duplicate_dedupe_key("dup:aci-a"), None);
     }
 }

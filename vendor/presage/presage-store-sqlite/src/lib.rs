@@ -18,6 +18,8 @@ use sqlx::{
 mod content;
 mod data;
 mod error;
+#[cfg(test)]
+mod migration_test;
 mod protocol;
 
 pub use error::SqliteStoreError;
@@ -37,31 +39,6 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
-    /// E: confirm (delete) a receive-outbox row after downstream commit.
-    pub async fn kt_outbox_confirm(
-        &self,
-        dedupe_key: &str,
-    ) -> Result<bool, SqliteStoreError> {
-        let result = sqlx::query("DELETE FROM kt_outbox WHERE dedupe_key=?1")
-            .bind(dedupe_key)
-            .execute(&self.db)
-            .await?;
-        Ok(result.rows_affected() == 1)
-    }
-    /// E: read a receive-outbox marker written by save_messages.
-    pub async fn kt_outbox_get(
-        &self,
-        dedupe_key: &str,
-    ) -> Result<Option<(Vec<u8>, String, String)>, SqliteStoreError> {
-        sqlx::query_as(
-            "SELECT content, sender, metadata_json FROM kt_outbox WHERE dedupe_key=?1",
-        )
-        .bind(dedupe_key)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(Into::into)
-    }
-
     pub async fn open(
         url: &str,
         trust_new_identities: OnNewIdentity,

@@ -244,25 +244,29 @@ where
         // if it fails or stalls (= we should at least split the API calls so clients can decide what to do)
         let attachment_upload_form = self
             .service
-            .get_attachment_v4_upload_attributes()
+            .get_attachment_v4_upload_attributes(contents.len() as u64)
             .instrument(tracing::trace_span!("requesting upload attributes"))
             .await?;
 
-        let resumable_upload_url = self
-            .service
-            .get_attachment_resumable_upload_url(&attachment_upload_form)
-            .await?;
-
-        let attachment_digest = self
-            .service
-            .upload_attachment_v4(
-                attachment_upload_form.cdn,
-                &resumable_upload_url,
-                contents.len() as u64,
-                attachment_upload_form.headers,
-                &mut std::io::Cursor::new(&contents),
-            )
-            .await?;
+        let attachment_digest = if attachment_upload_form.cdn == 3 {
+            self.service
+                .upload_attachment_v4_direct(&attachment_upload_form, contents.clone())
+                .await?
+        } else {
+            let resumable_upload_url = self
+                .service
+                .get_attachment_resumable_upload_url(&attachment_upload_form)
+                .await?;
+            self.service
+                .upload_attachment_v4(
+                    attachment_upload_form.cdn,
+                    &resumable_upload_url,
+                    contents.len() as u64,
+                    attachment_upload_form.headers,
+                    &mut std::io::Cursor::new(&contents),
+                )
+                .await?
+        };
 
         Ok(AttachmentPointer {
             content_type: Some(spec.content_type),

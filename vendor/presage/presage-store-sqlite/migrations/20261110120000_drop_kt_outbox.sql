@@ -1,0 +1,21 @@
+-- KT (receive duplicate phase2, decision B, 2026-11-10): the presage-side
+-- receive recovery copy is retired for good.
+--
+-- Replay rebuilds Content from the durable thread_messages row (thread+ts, or
+-- sender+ts for the legacy key face), so kt_outbox is a second copy of the
+-- same content that no read path consumes.
+--
+-- Indexes: DROP TABLE removes the table's implicit UNIQUE index on
+-- dedupe_key (sqlite_autoindex_kt_outbox_1). No explicit index was ever
+-- created for this table — 20261107000000_add_kt_outbox.sql only contains the
+-- CREATE TABLE, and no later migration adds one — so nothing else to drop.
+--
+-- Idempotent by construction: a fresh data dir (table created by the earlier
+-- migration, zero rows) and a phase1-era store (table present, possibly with
+-- rows) both converge on "no table". Re-running it is a no-op.
+--
+-- Rollback (binary downgrade to phase1) lives next to this file in
+-- ../rollback/20261110120000_drop_kt_outbox_rollback.sql; it recreates the
+-- pre-drop schema and clears the _sqlx_migrations row so the older migrator
+-- resolves the database again.
+DROP TABLE IF EXISTS kt_outbox;

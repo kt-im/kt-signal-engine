@@ -20,7 +20,9 @@
 //! （HTTP + WebSocket 同一 client）统一走该出口。最终网络路径在启动同步段以
 //! 恰一条 stderr INFO 行声明（direct/explicit-env/std-env/system-http/
 //! system-socks + 具体地址），供排障对账；解析失败只降级不 panic。stdin EOF
-//! 是唯一干净退出路径（exit 0）；argv 非法 exit 2；内部致命 exit 1。stderr
+//! 是唯一干净退出路径（exit 0）；argv 非法 exit 2；内部致命 exit 1（含
+//! stdout writer 死亡——写失败/任务 panic 记 error 日志后 exit 1，交给
+//! connector supervision 重启，不留「进程活着但出口已死」的僵尸）。stderr
 //! 除该 INFO 行与代理配置错误行外保持安静（connector watchdog 只把
 //! websocket 异常形状的行判死活，INFO 行刻意避开该形状；不落消息正文/号码/
 //! URI/密钥）。
@@ -31,15 +33,14 @@
 //! （presage future 持有非 Send 状态，进不了 tokio::spawn），finishLink
 //! 阻塞不饿死其他方法；启动即为每个已登记账号拉起接收管线。
 
+/// 契约修订单源（version / engine.protocolCapabilities 两面共取）。
+mod contract;
 #[allow(dead_code)]
 mod dispatch_model;
-#[allow(dead_code)]
-mod event_store;
 mod history;
 mod jsonrpc;
 mod logfile;
 mod methods;
-#[allow(dead_code)]
 mod outbox_model;
 mod proto;
 mod service;
@@ -70,7 +71,26 @@ use state::EngineState;
 /// engine faulted 并杀掉子进程（2026-10-19 实证）。
 /// 超限行吞到行尾后按 -32700 拒绝（进程不死），拒绝面落结构化 warn
 /// （帧字节数 + 上限，不含任何内容字节）。
+///
+/// M4 评估（与桌面/connector 帧合约漂移）：不下调到历史
+/// 参考值 16 MiB——100MB 附件的 base64 单帧约 133 MiB，下调会
+/// 直接切断附件发送；也不上调（不放大帧面）。内存上界改由
+/// INBOUND_QUEUE_CAPACITY + INBOUND_PENDING_BYTES_BUDGET 兜底。
 pub(crate) const MAX_LINE_BYTES: usize = 160 * 1024 * 1024;
+
+/// 入站通道容量（帧数，M4）：stdin 读线程与 dispatch 环之间的有界桥。
+/// 队列满时读线程 blocking_send 阻塞（OS 管道 + connector 写端背压），
+/// 不再像无界 channel 一样把整帧无限堆进内存。
+pub(crate) const INBOUND_QUEUE_CAPACITY: usize = 64;
+
+/// 入站队列在途字节上限（M4/M5 内存面）：帧数有界之外再给内存上界。
+/// 160MiB 单帧帽 × 64 槽的朴素组合可达 10GiB，故按字节再兜一层——
+/// 队列里最多积压 2 个满帧；读线程在预算用尽时等待 dispatch 环取走帧。
+pub(crate) const INBOUND_PENDING_BYTES_BUDGET: usize = 2 * MAX_LINE_BYTES;
+
+/// 同刻在飞请求上限（M4）：超限帧立即回结构化 busy 错误（不静默丢、
+/// 不用 spawn 无界膨胀请求队列）。
+pub(crate) const INFLIGHT_REQUEST_LIMIT: usize = 8;
 
 const USAGE: &str = "usage: kt-signal-engine --data-dir <dir> jsonRpc \
 [--receive-mode <mode>] [--ignore-attachments] [--ignore-stories] [--ignore-stickers]";
@@ -474,16 +494,25 @@ async fn amain() -> ExitCode {
     // 全局队列有界（稳定性批，2026-10-20）：连接器读得慢时 writer 反压
     // 到 send().await，而不是把响应/投影堆进无界内存；每账号队列的隔离
     // 背压见 service::outbound。
+    //
+    // writer 死亡监视线程（僵尸出口批）：stdout writer 是唯一出口，写失败/
+    // panic 后不能留「进程活着但永不再产出」的假活——入站环 select 该
+    // JoinHandle，死亡即记录日志并以 exit 1 退出，由 connector supervision
+    // 重启整条引擎（顺带回收 WS 连接与 store）。
     let (outbound_tx, outbound_rx) =
         mpsc::channel::<OutboundFrame>(service::outbound::OUTBOUND_GLOBAL_CAPACITY);
     let outbound = service::outbound::OutboundHub::new(outbound_tx);
-    let writer = tokio::spawn(run_outbound_writer(
+    let mut writer = tokio::spawn(run_outbound_writer(
         outbound_rx,
         tokio::io::BufWriter::new(tokio::io::stdout()),
     ));
 
-    // stdin 有界读（阻塞线程；P1a 逻辑原样）→ 桥进 tokio。
-    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<Inbound>();
+    // stdin 有界读（阻塞线程）→ 有界桥进 tokio（M4）：队列容量 64 帧 +
+    // 在途字节预算 2 帧，队列/预算满时读线程阻塞（背压到 OS 管道与
+    // connector 写端），不再无界堆帧。
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_QUEUE_CAPACITY);
+    let inbound_budget = Arc::new(InboundBudget::new(INBOUND_PENDING_BYTES_BUDGET));
+    let reader_budget = Arc::clone(&inbound_budget);
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut line: Vec<u8> = Vec::new();
@@ -497,12 +526,19 @@ async fn amain() -> ExitCode {
                         line.pop();
                     }
                     let frame = std::mem::take(&mut line);
-                    if inbound_tx.send(Inbound::Line(frame)).is_err() {
+                    let queued_bytes = frame.len();
+                    // 先占字节预算再入队：预算满时阻塞在 condvar（不是丢帧）。
+                    reader_budget.reserve(queued_bytes);
+                    if inbound_tx.blocking_send(Inbound::Line(frame)).is_err() {
+                        reader_budget.release(queued_bytes);
                         break;
                     }
                 }
                 ReadOutcome::Overlong { bytes } => {
-                    if inbound_tx.send(Inbound::Overlong { bytes }).is_err() {
+                    if inbound_tx
+                        .blocking_send(Inbound::Overlong { bytes })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -513,39 +549,213 @@ async fn amain() -> ExitCode {
     // presage 的 Manager/接收流 future 持有非 Send 状态（ThreadRng、
     // dyn ProtocolStore），请求 dispatch 与接收管线统一跑在本线程 LocalSet。
     let local = tokio::task::LocalSet::new();
+    // writer 死亡结局（None = stdin EOF 的干净收尾）。fatal = 需要 exit 1
+    // 让 connector supervision 重启；日志在 report_writer_exit 单点落。
+    let mut writer_exit: Option<WriterExit> = None;
+    let mut writer_fatal = false;
     local
         .run_until(async {
             let service =
                 service::Service::new(args.data_dir, Arc::clone(&state), Arc::clone(&outbound));
             service.spawn_receive_pipelines().await;
 
-            while let Some(inbound) = inbound_rx.recv().await {
-                let state = Arc::clone(&state);
-                let service = Arc::clone(&service);
-                let outbound = Arc::clone(&outbound);
-                tokio::task::spawn_local(async move {
-                    let response = methods::respond(&inbound, state, service).await;
-                    let _ = outbound.send_global(OutboundFrame::notice(response)).await;
-                });
+            writer_exit = run_engine_input_loop(
+                Arc::clone(&state),
+                Arc::clone(&service),
+                Arc::clone(&outbound),
+                &mut inbound_rx,
+                &inbound_budget,
+                &mut writer,
+            )
+            .await;
+
+            match &writer_exit {
+                Some(exit) => {
+                    writer_fatal = report_writer_exit(exit);
+                    if writer_fatal {
+                        // stderr 固定形状（无正文/号码）：给连接器一个立即的
+                        // 异常退出证据；退出码 1 才触发 supervision 重启。
+                        eprintln!(
+                            "kt-signal-engine: ERROR event=engine_exit code=StdoutWriterDead (stdout writer died; expecting supervisor restart)"
+                        );
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        target: "engine.lifecycle",
+                        stage = "stdin_eof",
+                        "engine stdin reached EOF; shutting down"
+                    );
+                }
             }
 
             // A4 干净退出：停全部接收管线并等待收口（在飞信封处理臂完成、
             // Manager drop 时 SQLite store 刷盘），再退出 LocalSet。
-            tracing::warn!(
-                target: "engine.lifecycle",
-                stage = "stdin_eof",
-                "engine stdin reached EOF; shutting down"
-            );
             service.shutdown_all().await;
         })
         .await;
 
-    // EOF：干净退出 0（在途请求不保证落盘——连接器仅在关闭引擎时断 stdin）。
-    // abort 丢弃 writer 接收端：在途的通知/响应与等待许可的 notify 立即
-    // 落错，不悬挂（有界队列语义见 service::outbound）。
+    // 收尾：丢弃 outbound 发送端并 abort writer（在途通知/响应与等待许可的
+    // notify 立即落错，不悬挂；有界队列语义见 service::outbound）。
+    // stdin EOF 干净退出 0；writer 死亡（写失败/panic）exit 1 → supervision
+    // 重启，绝不以「进程活着、出口已死」的形态继续持写端。
     drop(outbound);
     writer.abort();
-    ExitCode::SUCCESS
+    if writer_fatal {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// JSON-RPC 入站分派环（LocalSet 内）：select 同时监视线程 stdout writer。
+///
+/// 返回 Some(exit) = writer 先死（写失败/panic/通道关闭），主装配据此记录
+/// 日志并决定是否 exit 1；返回 None = stdin EOF 的干净收尾。writer 单独 spawn
+/// 且只在这里被 await，死亡不再静默——否则 stdout 写失败后仅 flush 栅栏
+/// 超时、接收管线停摆，进程仍持写端假活。
+async fn run_engine_input_loop(
+    state: Arc<AsyncMutex<EngineState>>,
+    service: Arc<service::Service>,
+    outbound: Arc<service::outbound::OutboundHub>,
+    inbound_rx: &mut mpsc::Receiver<Inbound>,
+    inbound_budget: &InboundBudget,
+    writer: &mut tokio::task::JoinHandle<WriterExit>,
+) -> Option<WriterExit> {
+    // 在飞请求许可（M4）：取不到许可的帧立即回结构化 busy，绝不排队等
+    // 待、绝不丢弃。许可随 dispatch 任务持有到应答入队，写出口慢时在飞
+    // 数也不会超过上限。
+    let inflight = Arc::new(tokio::sync::Semaphore::new(INFLIGHT_REQUEST_LIMIT));
+    loop {
+        tokio::select! {
+            inbound = inbound_rx.recv() => {
+                let inbound = inbound?;
+                inbound_budget.release(inbound.queued_bytes());
+
+                // 解析只做一次：原始帧在产出 Prepared 后立即释放（160MiB
+                // 大帧不再横跨整段 dispatch 生命周期）。
+                let prepared = methods::prepare(&inbound);
+                drop(inbound);
+
+                // 坏行/超帧是廉价的解析错误面：不占在飞许可、
+                // 不受 busy 拒绝，也不为它们 spawn 无限任务。
+                if !matches!(prepared, methods::Prepared::Request(_)) {
+                    let response = methods::respond_prepared(
+                        prepared,
+                        Arc::clone(&state),
+                        Arc::clone(&service),
+                    )
+                    .await;
+                    let _ = outbound
+                        .send_global(OutboundFrame::notice(response))
+                        .await;
+                    continue;
+                }
+
+                let permit = match Arc::clone(&inflight).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "engine.dispatch",
+                            stage = "inflight_limit",
+                            limit = INFLIGHT_REQUEST_LIMIT,
+                            "request rejected: in-flight limit reached"
+                        );
+                        // 背压优先：busy 应答走同一 stdout 队列；队列关闭
+                        // 说明 writer 已死，下一轮 select 的 writer 臂接管。
+                        let response = methods::busy_response(&prepared);
+                        let _ = outbound
+                            .send_global(OutboundFrame::notice(response))
+                            .await;
+                        continue;
+                    }
+                };
+
+                let state = Arc::clone(&state);
+                let service = Arc::clone(&service);
+                let outbound = Arc::clone(&outbound);
+                tokio::task::spawn_local(async move {
+                    let budget = methods::request_timeout_budget(&prepared);
+                    let method = methods::prepared_method(&prepared).unwrap_or("-").to_owned();
+                    let timeout_id = methods::prepared_id(&prepared);
+                    let response = respond_with_budget(
+                        budget,
+                        methods::respond_prepared(prepared, state, service),
+                        || {
+                            tracing::warn!(
+                                target: "engine.dispatch",
+                                stage = "request_timeout",
+                                method = %method,
+                                budget_ms = budget.as_millis() as u64,
+                                "rpc request timed out; dispatch future cancelled"
+                            );
+                            methods::timeout_response(&timeout_id, budget)
+                        },
+                    )
+                    .await;
+                    let _ = outbound.send_global(OutboundFrame::notice(response)).await;
+                    // 应答已入队（或出口已死）后才释放在飞许可。
+                    drop(permit);
+                });
+            }
+            joined = &mut *writer => {
+                return Some(join_writer(joined));
+            }
+        }
+    }
+}
+
+/// 超时包裹单点（M5）：预算内正常返回；超时则 drop（取消）dispatch
+/// future 并调用 on_timeout 造结构化错误面。抽成泛型便于单测钉定
+/// 「超时确实取消 future」而不依赖真实 Service。
+async fn respond_with_budget<F>(
+    budget: std::time::Duration,
+    future: F,
+    on_timeout: impl FnOnce() -> Value,
+) -> Value
+where
+    F: std::future::Future<Output = Value>,
+{
+    match tokio::time::timeout(budget, future).await {
+        Ok(response) => response,
+        Err(_) => on_timeout(),
+    }
+}
+
+/// 入站队列字节预算（M4）：读线程与 LocalSet 分属两个线程，阻塞等待用
+/// std condvar（不能在阻塞线程上 await tokio Semaphore）。
+struct InboundBudget {
+    pending: std::sync::Mutex<usize>,
+    drained: std::sync::Condvar,
+    capacity: usize,
+}
+
+impl InboundBudget {
+    fn new(capacity: usize) -> Self {
+        Self {
+            pending: std::sync::Mutex::new(0),
+            drained: std::sync::Condvar::new(),
+            capacity,
+        }
+    }
+
+    /// 预留字节；预算不足时等待 dispatch 环取走帧（保留 1 帧的推进余量：
+    /// 即使单帧本身等于容量，也不让读写互锁）。
+    fn reserve(&self, bytes: usize) {
+        let bytes = bytes.min(self.capacity);
+        let mut pending = self.pending.lock().expect("inbound budget lock");
+        while *pending > 0 && pending.saturating_add(bytes) > self.capacity {
+            pending = self.drained.wait(pending).expect("inbound budget wait");
+        }
+        *pending += bytes;
+    }
+
+    /// 帧被 dispatch 环取走后释放预算。
+    fn release(&self, bytes: usize) {
+        let mut pending = self.pending.lock().expect("inbound budget lock");
+        *pending = pending.saturating_sub(bytes.min(self.capacity));
+        self.drained.notify_all();
+    }
 }
 
 enum ReadOutcome {
@@ -588,10 +798,79 @@ impl OutboundFrame {
     }
 }
 
-/// writer 主循环：Notice 逐条 write+flush（任一步失败即退出，栅栏 oneshot
-/// 随帧弃置自然落在等待方 false）；Flush 就地解决（FIFO 保证此前 Notice
-/// 已 flush）。`permit` 在本臂结束（写完+flush 之后）才随帧释放。
-async fn run_outbound_writer<W>(mut rx: mpsc::Receiver<OutboundFrame>, mut out: W)
+/// stdout writer 退出原因（supervision 面：writer 是进程唯一出口，死亡不
+/// 得静默——否则连接器会看到一个「进程还活着但永不再产出」的僵尸，
+/// flush 栅栏失败后接收管线停摆而进程仍在持写端假活）。
+#[derive(Debug)]
+pub(crate) enum WriterExit {
+    /// 出站队列发送端全部弃置（引擎正常收尾）。
+    ChannelClosed,
+    /// 写 stdout 失败（连接器死亡/管道破裂/半开写不出去）。stage 区分
+    /// write_all 与 flush 两段。
+    WriteFailed {
+        stage: &'static str,
+        error: std::io::Error,
+    },
+    /// writer 任务 panic（JoinError；不落 payload，防正文入日志）。
+    Panicked,
+    /// writer 任务被 abort（正常收尾的主动取消）。
+    Aborted,
+}
+
+/// JoinHandle 收口：panic / 取消归类（不静默丢弃 JoinError）。
+fn join_writer(joined: Result<WriterExit, tokio::task::JoinError>) -> WriterExit {
+    match joined {
+        Ok(exit) => exit,
+        Err(error) if error.is_panic() => WriterExit::Panicked,
+        Err(_) => WriterExit::Aborted,
+    }
+}
+
+/// writer 死亡结局 → 日志 + 是否请求进程退出（exit 1，交给 connector
+/// supervision 重启整条引擎；writer 已死时原地不退等于持写端假活）。
+fn report_writer_exit(exit: &WriterExit) -> bool {
+    match exit {
+        WriterExit::ChannelClosed => {
+            tracing::warn!(
+                target: "engine.lifecycle",
+                stage = "writer_channel_closed",
+                "stdout writer stopped after the outbound queue closed"
+            );
+            false
+        }
+        WriterExit::WriteFailed { stage, error } => {
+            tracing::error!(
+                target: "engine.lifecycle",
+                stage = "writer_failed",
+                write_stage = *stage,
+                error = %error,
+                "stdout writer failed; exiting for connector supervision restart"
+            );
+            true
+        }
+        WriterExit::Panicked => {
+            tracing::error!(
+                target: "engine.lifecycle",
+                stage = "writer_panicked",
+                "stdout writer task panicked; exiting for connector supervision restart"
+            );
+            true
+        }
+        WriterExit::Aborted => {
+            tracing::warn!(
+                target: "engine.lifecycle",
+                stage = "writer_aborted",
+                "stdout writer task was aborted"
+            );
+            false
+        }
+    }
+}
+
+/// writer 主循环：Notice 逐条 write+flush（任一步失败即携原因退出，栅栏
+/// oneshot 随帧弃置自然落在等待方 false）；Flush 就地解决（FIFO 保证此前
+/// Notice 已 flush）。`permit` 在本臂结束（写完+flush 之后）才随帧释放。
+async fn run_outbound_writer<W>(mut rx: mpsc::Receiver<OutboundFrame>, mut out: W) -> WriterExit
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -601,8 +880,17 @@ where
             OutboundFrame::Notice { value, permit } => {
                 let mut text = serde_json::to_string(&value).expect("line serializes");
                 text.push('\n');
-                if out.write_all(text.as_bytes()).await.is_err() || out.flush().await.is_err() {
-                    break;
+                if let Err(error) = out.write_all(text.as_bytes()).await {
+                    return WriterExit::WriteFailed {
+                        stage: "write_all",
+                        error,
+                    };
+                }
+                if let Err(error) = out.flush().await {
+                    return WriterExit::WriteFailed {
+                        stage: "flush",
+                        error,
+                    };
                 }
                 drop(permit);
             }
@@ -612,6 +900,7 @@ where
             }
         }
     }
+    WriterExit::ChannelClosed
 }
 
 /// flush 栅栏的通道侧实现（`Service::flush_barrier` 委托；自由函数便于
@@ -1103,6 +1392,154 @@ mod tests {
         assert!(died, "barrier must fail once the writer has died");
     }
 
+    /// writer 死亡（stdout 写失败）→ 退出原因可观测且被判 fatal（exit 1 /
+    /// connector supervision 重启）；干净通道关闭不 fatal。
+    #[tokio::test]
+    async fn writer_failure_requests_process_exit() {
+        struct FailingWriter;
+        impl tokio::io::AsyncWrite for FailingWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(std::io::Error::other("stdout broken")))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<super::OutboundFrame>(8);
+        let writer = tokio::spawn(super::run_outbound_writer(rx, FailingWriter));
+        tx.send(super::OutboundFrame::notice(serde_json::json!({"m": 1})))
+            .await
+            .unwrap();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("writer exits after a failed write")
+            .expect("writer task joins");
+        assert!(
+            matches!(
+                exit,
+                super::WriterExit::WriteFailed {
+                    stage: "write_all",
+                    ..
+                }
+            ),
+            "unexpected writer exit: {exit:?}"
+        );
+        assert!(
+            super::report_writer_exit(&exit),
+            "a dead stdout writer must request process exit for supervision restart"
+        );
+
+        // 干净收尾（发送端全弃）不是 fatal：不触发重启。
+        let (tx, rx) = tokio::sync::mpsc::channel::<super::OutboundFrame>(1);
+        drop(tx);
+        let clean = tokio::spawn(super::run_outbound_writer(rx, FailingWriter));
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), clean)
+            .await
+            .expect("writer exits on channel close")
+            .expect("writer task joins");
+        assert!(matches!(exit, super::WriterExit::ChannelClosed));
+        assert!(!super::report_writer_exit(&exit));
+    }
+
+    /// writer 任务 panic 不能被吞成静默退出：JoinError 归类为 Panicked 且 fatal。
+    #[tokio::test]
+    async fn writer_panic_requests_process_exit() {
+        let handle = tokio::spawn(async { panic!("writer panic probe") });
+        let exit = super::join_writer(handle.await);
+        assert!(matches!(exit, super::WriterExit::Panicked));
+        assert!(super::report_writer_exit(&exit));
+    }
+
+    /// writer 死亡必须在 stdin EOF 之前打断入站环（进程退出/重启信号）：
+    /// 验证修复接线——stdout 写失败后引擎不再「活着但永不出帧」。
+    #[tokio::test]
+    async fn writer_death_breaks_input_loop_for_restart() {
+        use tokio::sync::mpsc;
+
+        struct FailingWriter;
+        impl tokio::io::AsyncWrite for FailingWriter {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(std::io::Error::other("stdout broken")))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-writer-death-{:016x}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0)
+                ));
+                let state = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    super::EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = crate::service::outbound::test_hub();
+                let service = crate::service::Service::new(
+                    data_dir.clone(),
+                    std::sync::Arc::clone(&state),
+                    std::sync::Arc::clone(&outbound),
+                );
+                let (inbound_tx, mut inbound_rx) =
+                    mpsc::channel::<super::Inbound>(super::INBOUND_QUEUE_CAPACITY);
+                let inbound_budget = super::InboundBudget::new(super::INBOUND_PENDING_BYTES_BUDGET);
+                let (tx, rx) = mpsc::channel::<super::OutboundFrame>(8);
+                let mut writer = tokio::spawn(super::run_outbound_writer(rx, FailingWriter));
+                tx.send(super::OutboundFrame::notice(serde_json::json!({"m": 1})))
+                    .await
+                    .unwrap();
+                let exit = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    super::run_engine_input_loop(
+                        std::sync::Arc::clone(&state),
+                        service,
+                        outbound,
+                        &mut inbound_rx,
+                        &inbound_budget,
+                        &mut writer,
+                    ),
+                )
+                .await
+                .expect("writer death must break the input loop before stdin EOF");
+                assert!(matches!(exit, Some(super::WriterExit::WriteFailed { .. })));
+                drop(inbound_tx);
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
     // —— 入站有界读帧（帧帽对齐批：超帽帧吞到行尾 + 字节计数 + 重同步）——
 
     use super::{read_bounded_line_with_limit, ReadOutcome};
@@ -1222,5 +1659,214 @@ mod tests {
             read_bounded_line_with_limit(&mut tail, &mut buf, 2),
             ReadOutcome::Eof
         ));
+    }
+
+    // —— M4/M5：有界入站队列、在飞上限、请求超时、取消与正常路径 ——
+
+    #[tokio::test]
+    async fn inbound_queue_is_bounded_and_backpressures_without_dropping() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<super::Inbound>(2);
+        tx.send(super::Inbound::Line(b"a".to_vec()))
+            .await
+            .expect("first slot");
+        tx.send(super::Inbound::Line(b"b".to_vec()))
+            .await
+            .expect("second slot");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            let sent = tx
+                .blocking_send(super::Inbound::Line(b"c".to_vec()))
+                .is_ok();
+            let _ = done_tx.send(sent);
+        });
+
+        // 队列满只背压生产者；接收侧照常取帧（不阻塞、不丢弃）。
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "producer must block while the bounded queue is full"
+        );
+        match rx.recv().await {
+            Some(super::Inbound::Line(line)) => assert_eq!(line, b"a"),
+            _ => panic!("expected the first queued frame"),
+        }
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("producer resumes after the consumer drains one slot"));
+        producer.join().expect("producer joins");
+        match rx.recv().await {
+            Some(super::Inbound::Line(line)) => assert_eq!(line, b"b"),
+            _ => panic!("expected the second queued frame"),
+        }
+        match rx.recv().await {
+            Some(super::Inbound::Line(line)) => assert_eq!(line, b"c"),
+            _ => panic!("the backpressured frame must not be dropped"),
+        }
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn inbound_byte_budget_waits_for_drain_and_never_drops() {
+        let budget = std::sync::Arc::new(super::InboundBudget::new(10));
+        budget.reserve(6);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let budget = std::sync::Arc::clone(&budget);
+            std::thread::spawn(move || {
+                budget.reserve(6);
+                let _ = done_tx.send(());
+                budget.release(6);
+            })
+        };
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "second reservation must wait while the byte budget is exhausted"
+        );
+        budget.release(6);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("reservation completes after the dispatcher drains a frame");
+        waiter.join().expect("waiter joins");
+    }
+
+    #[test]
+    fn inflight_limit_answers_structured_busy_without_dropping_the_frame() {
+        let permits =
+            std::sync::Arc::new(tokio::sync::Semaphore::new(super::INFLIGHT_REQUEST_LIMIT));
+        let mut held = Vec::new();
+        for _ in 0..super::INFLIGHT_REQUEST_LIMIT {
+            held.push(
+                std::sync::Arc::clone(&permits)
+                    .try_acquire_owned()
+                    .expect("permit"),
+            );
+        }
+        assert!(
+            std::sync::Arc::clone(&permits).try_acquire_owned().is_err(),
+            "in-flight cap reached"
+        );
+        let prepared = crate::methods::prepare(&super::Inbound::Line(
+            br#"{"jsonrpc":"2.0","id":42,"method":"listAccounts","params":{}}"#.to_vec(),
+        ));
+        let response = crate::methods::busy_response(&prepared);
+        assert_eq!(response["id"], serde_json::json!(42));
+        assert_eq!(response["error"]["code"], serde_json::json!(-32000));
+        assert_eq!(
+            response["error"]["data"]["reason"],
+            serde_json::json!("ENGINE_BUSY")
+        );
+        assert_eq!(
+            response["error"]["data"]["inFlightLimit"],
+            serde_json::json!(super::INFLIGHT_REQUEST_LIMIT)
+        );
+        assert!(response["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("EngineBusyException"));
+        drop(held);
+    }
+
+    #[test]
+    fn request_timeout_budget_classifies_plain_attachment_and_link_requests() {
+        use crate::methods::{
+            prepare, request_timeout_budget, ATTACHMENT_REQUEST_TIMEOUT, LINK_FINISH_TIMEOUT,
+            REQUEST_TIMEOUT,
+        };
+        let budget = |body: serde_json::Value| {
+            request_timeout_budget(&prepare(&super::Inbound::Line(
+                body.to_string().into_bytes(),
+            )))
+        };
+        assert_eq!(
+            budget(serde_json::json!({"id": 1, "method": "listAccounts", "params": {}})),
+            REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            budget(serde_json::json!({
+                "id": 2, "method": "send",
+                "params": {"account": "+1", "message": "hi"},
+            })),
+            REQUEST_TIMEOUT,
+            "plain send is not an upload request"
+        );
+        assert_eq!(
+            budget(serde_json::json!({
+                "id": 3, "method": "send",
+                "params": {
+                    "account": "+1", "message": "hi",
+                    "attachments": ["data:image/png;base64,aGVsbG8="],
+                },
+            })),
+            ATTACHMENT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            budget(serde_json::json!({
+                "id": 4, "method": "sendStory",
+                "params": {
+                    "account": "+1", "message": "hi",
+                    "attachment": "data:image/png;base64,aGVsbG8=",
+                },
+            })),
+            ATTACHMENT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            budget(serde_json::json!({"id": 5, "method": "finishLink", "params": {}})),
+            LINK_FINISH_TIMEOUT
+        );
+        assert!(ATTACHMENT_REQUEST_TIMEOUT > REQUEST_TIMEOUT);
+        assert!(LINK_FINISH_TIMEOUT > ATTACHMENT_REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn timed_out_dispatch_is_cancelled_and_answers_with_structured_error() {
+        struct CancelProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = CancelProbe(std::sync::Arc::clone(&cancelled));
+        let future = async move {
+            let _probe = probe;
+            std::future::pending::<serde_json::Value>().await
+        };
+        let id = serde_json::json!(9);
+        let timeout = std::time::Duration::from_millis(20);
+        let response = super::respond_with_budget(timeout, future, || {
+            crate::methods::timeout_response(&id, timeout)
+        })
+        .await;
+
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "timeout must drop (cancel) the dispatch future"
+        );
+        assert_eq!(response["id"], serde_json::json!(9));
+        assert_eq!(response["error"]["code"], serde_json::json!(-32000));
+        assert_eq!(
+            response["error"]["data"]["reason"],
+            serde_json::json!("REQUEST_TIMEOUT")
+        );
+        assert_eq!(
+            response["error"]["data"]["timeoutMs"],
+            serde_json::json!(20)
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_dispatch_path_is_unchanged_by_the_timeout_wrapper() {
+        let response = super::respond_with_budget(
+            std::time::Duration::from_secs(5),
+            async { serde_json::json!({"ok": true}) },
+            || panic!("must not time out"),
+        )
+        .await;
+        assert_eq!(response, serde_json::json!({"ok": true}));
     }
 }

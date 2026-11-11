@@ -37,8 +37,13 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # 串行是门禁本体，不是性能选项：测试并行时多用例共享 SQLite/进程级
+      # 全局态，偶发全局锁死锁（挂死整个 job）。RUST_MIN_STACK 只给仍留在
+      # 门禁里的深栈用例留余量——已知栈溢出用例已 #[ignore]，不靠它兜底。
       - name: cargo test
-        run: cargo test --all-targets
+        env:
+          RUST_MIN_STACK: "8388608"
+        run: cargo test --all-targets -- --test-threads=1
 
       - name: cargo build
         run: cargo build --release
