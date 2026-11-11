@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -20,9 +21,10 @@ use futures::StreamExt;
 use presage::libsignal_service::configuration::{Endpoint, ServiceCredentials, SignalServers};
 use presage::libsignal_service::content::{Content, ContentBody};
 use presage::libsignal_service::prelude::PushService;
+use presage::libsignal_service::prelude::ServiceError as ProvisioningServiceError;
 use presage::libsignal_service::protocol::{IdentityKeyPair, ServiceId};
 use presage::libsignal_service::provisioning::{
-    link_device, NewDeviceRegistration, SecondaryDeviceProvisioning,
+    link_device, NewDeviceRegistration, ProvisioningError, SecondaryDeviceProvisioning,
 };
 use presage::libsignal_service::push_service::HttpAuthOverride;
 use presage::libsignal_service::utils::phonenumber_from_signal;
@@ -909,6 +911,10 @@ pub(crate) fn mode_from_env() -> bool {
 pub(crate) enum LinkError {
     /// finishLink 校验失败的契约错误原文（-1，compat §3）。
     UnknownUri,
+    /// 链接会话在 URL 交付后终局失败（B1，issue #951）：provisioning WS
+    /// 关闭/超时/流结束即 QR 必死，finishLink 以 -1 + LINK_LOST 确定性应答
+    /// （不是 -32603，避免 connector 把会话死亡当引擎内部错误重试）。
+    Lost,
     /// 内部失败（-32603，细节不外泄）。
     Internal,
 }
@@ -916,6 +922,7 @@ pub(crate) enum LinkError {
 /// finishLink 成功应答投影：号码 + 账号自有 ACI（wire additive，connector
 /// 契约 1.142 消费面）。`aci` 是可选键的取值位：None = wire 整键缺席（不
 /// 出 null）——fake 面、并发幂等臂、store 不可读均诚实落 None。
+#[derive(Clone)]
 pub(crate) struct LinkedAccount {
     pub(crate) number: String,
     pub(crate) aci: Option<String>,
@@ -2492,6 +2499,10 @@ impl LinkResultSlot {
         self.resolved.notify_waiters();
     }
 
+    fn is_unresolved(&self) -> bool {
+        self.outcome.lock().expect("outcome lock").is_none()
+    }
+
     async fn wait(&self) -> Result<LinkOutcome, ()> {
         loop {
             if let Some(outcome) = self.outcome.lock().expect("outcome lock").clone() {
@@ -2502,10 +2513,170 @@ impl LinkResultSlot {
     }
 }
 
-struct PendingLink {
-    uri: String,
+/// 链接会话状态（B1，issue #951）：pending = 等待手机确认；lost = URL 已
+/// 交付后 provisioning 链路终局失败（WS 关闭/超时/流结束），该 QR 必死。
+/// lostAt 是首次观察到终局失败的毫秒时间戳，用于诊断/connector 对账。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkSessionState {
+    Pending,
+    Lost { lost_at: u64 },
+}
+
+impl LinkSessionState {
+    fn lost_at(self) -> Option<u64> {
+        match self {
+            Self::Pending => None,
+            Self::Lost { lost_at } => Some(lost_at),
+        }
+    }
+}
+
+fn mark_link_lost(state: &StdMutex<LinkSessionState>) -> u64 {
+    let mut state = state.lock().expect("link state lock");
+    match *state {
+        LinkSessionState::Pending => {
+            let lost_at = now_ms();
+            *state = LinkSessionState::Lost { lost_at };
+            lost_at
+        }
+        LinkSessionState::Lost { lost_at } => lost_at,
+    }
+}
+
+fn link_lost_at(state: &StdMutex<LinkSessionState>) -> Option<u64> {
+    state.lock().expect("link state lock").lost_at()
+}
+
+/// 单个 link 会话的独立记录（uri 键控）：finishLink 只等自己 uri 的记录，
+/// 新 startLink 取走旧记录后，旧 finish 不可能再拿到别人的结果冒充成功。
+struct PendingRecord {
     store_dir: PathBuf,
+    /// 链接 store 的第二个句柄：flow 收口后由 finish 复用，避免刚 drop 连接
+    /// 池就重开同一 SQLite 文件（sqlx 池关闭是异步的）。提交重试时为空才
+    /// 回退 open_store。
+    store: StdMutex<Option<SqliteStore>>,
     result: Arc<LinkResultSlot>,
+    /// link_flow 的 spawn_local 句柄（B1）：新 startLink 必须 abort 旧任务，
+    /// 仅从表里摘掉记录会让旧 provisioning WS 继续跑并可能写注册数据。
+    /// 用 Option 承载是为了 retire 时能从 Arc<PendingRecord> 里取出 await。
+    task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 会话状态共享槽：link_flow 任务落 lost/lostAt，finishLink 据此回
+    /// LINK_LOST（与结果槽分离，结果只负责唤醒等待者）。
+    state: Arc<StdMutex<LinkSessionState>>,
+    /// 提交门 + 已提交结果：只有真正执行过 `state.add_account` 的 finish
+    /// 才会落 Some。并发同 uri finish 用它做单飞，连接器超时重试用它做
+    /// 幂等应答；未提交记录永远不会借此返回成功。
+    committed: AsyncMutex<Option<LinkedAccount>>,
+    /// 被更新的 startLink 顶掉：置位后任何 finish 都不得再提交或返回成功。
+    superseded: AtomicBool,
+}
+
+/// provisioning 会话终局失败来源（B1）：把「URL 是否已交付」和失败类型
+/// 分开，才能保证只有交付后的会话终局归 LINK_LOST。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkTerminalCause {
+    /// provisioning WS 关闭 / 读流结束。
+    StreamClosed,
+    /// keepalive 超时（由 link_device 的 ServiceError::Timeout 归入）。
+    KeepaliveTimeout,
+    /// startLink 的 URL 有界等待超时 / URL 无法交付给调用方。
+    UrlTimeout,
+    /// 注册数据序列化、落库或重载失败（进程内错误，不是会话终局）。
+    StoreWrite,
+}
+
+/// provisioning 终局错误 → 映射输入。只有明确的超时才归 keepalive 超时；
+/// 其余 WS 关闭/流结束统一按 StreamClosed 收口（两者在 URL 交付后都 = Lost）。
+fn provisioning_terminal_cause(error: &ProvisioningError) -> LinkTerminalCause {
+    match error {
+        ProvisioningError::ServiceError(ProvisioningServiceError::Timeout { .. }) => {
+            LinkTerminalCause::KeepaliveTimeout
+        }
+        _ => LinkTerminalCause::StreamClosed,
+    }
+}
+
+/// 纯映射（B1）：URL 交付后的 provisioning 终局（关闭/超时/流结束）才是
+/// `LinkError::Lost`；URL 交付前失败、URL 等待超时、注册数据落库失败都是
+/// 引擎内部失败 `LinkError::Internal`（-32603），不能冒充 LINK_LOST。
+/// URL 尚未交付就失败（连 URL 都没拿到 / 流出错）：内部失败，不是 lost。
+fn terminal_before_url() -> LinkError {
+    classify_link_terminal(false, LinkTerminalCause::StreamClosed)
+}
+
+/// 调用方已超时丢弃 url_rx（没有可 finish 的会话）：内部失败。
+fn terminal_url_timeout() -> LinkError {
+    classify_link_terminal(false, LinkTerminalCause::UrlTimeout)
+}
+
+/// URL 已交付后流结束/WS 关闭：会话必死 = Lost。
+///
+/// 单点出口：生产链路只经这里产出“交付后死亡”（测试锁住它，避免有人把
+/// 常量改成 false 后整条 B1 静默退回 -32603）。
+fn terminal_after_url_closed() -> LinkError {
+    classify_link_terminal(true, LinkTerminalCause::StreamClosed)
+}
+
+fn classify_link_terminal(url_delivered: bool, cause: LinkTerminalCause) -> LinkError {
+    match (url_delivered, cause) {
+        (true, LinkTerminalCause::StreamClosed) | (true, LinkTerminalCause::KeepaliveTimeout) => {
+            LinkError::Lost
+        }
+        _ => LinkError::Internal,
+    }
+}
+
+/// 注册数据落库/重载失败的归型（URL 已交付，但不是会话终局）。
+fn link_store_error() -> LinkError {
+    classify_link_terminal(true, LinkTerminalCause::StoreWrite)
+}
+
+/// 等 link_flow 任务真正收尾（store 连接随 future drop）。
+///
+/// 结果槽已 Ok 时任务只剩收尾几行，await 不会阻塞；retire 可能已取走句柄，
+/// None = 任务已收口。finish 在提交段复用链接期句柄前先走这一步，确保 flow
+/// 自己的 store 句柄已经 drop，同一 SQLite 池只剩记录里的那个句柄。
+async fn wait_link_task(record: &PendingRecord) {
+    let task = record.task.lock().expect("link task lock").take();
+    if let Some(task) = task {
+        let _ = task.await;
+    }
+    // sqlx 池关闭是异步的：任务收口后再让出几个调度窗口，避免紧随其后的
+    // open_store 与刚 drop 的连接池抢同一 SQLite 文件的 acquire 预算。
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// 收口一个待决链接记录：先立 superseded 旗（在途 finish 不得再提交），
+/// 再 abort 旧 flow，最后只回收从未提交为账号的 store。
+///
+/// 返回 lostAt；若记录已经提交为真账号则返回 None（不抹掉成功）。
+async fn retire_pending_record(record: Arc<PendingRecord>) -> Option<u64> {
+    // 先立旗再 abort：finish 拿到旧结果槽的 Ok 后也必须看见 superseded。
+    record.superseded.store(true, Ordering::Release);
+    let task = record.task.lock().expect("link task lock").take();
+    if let Some(task) = task {
+        task.abort();
+        // 等 abort 真正 drop 旧 future（store 连接与未完成写入一起结束），
+        // 再探测/回收目录；仅置 superseded 不会停掉旧 provisioning WS。
+        let _ = task.await;
+    }
+    // 与在途 finish 的提交门串行：提交成功 = 记录已是真账号，store 必须
+    // 保留；未提交 = 这条会话从未成为账号，连同注册数据一起回收，绝不
+    // 留下引擎不认识的孤儿 store（用户重扫即可）。
+    let committed = record.committed.lock().await;
+    if committed.is_some() {
+        return None;
+    }
+    // 先放掉 finish 复用的 store 句柄，再删目录（避免自己持有连接时删库）。
+    let _ = record.store.lock().expect("link store lock").take();
+    let lost_at = Some(mark_link_lost(&record.state));
+    if record.result.is_unresolved() {
+        record.result.complete(Err(()));
+    }
+    let _ = remove_link_store(&record.store_dir).await;
+    lost_at
 }
 
 /// provisioning 一次性迁移密钥的收口前行囊：link_flow 解构后原样暂存，
@@ -2745,7 +2916,17 @@ async fn duplicate_replay_contents(
 }
 
 struct Inner {
-    pending: Option<PendingLink>,
+    /// 链接会话独立记录：uri → PendingRecord。finishLink 只按自己的 uri
+    /// 找记录；新 startLink 取走并 retire 旧记录，不再用单个 pending 槽
+    /// 让所有会话互相冒充。
+    links: HashMap<String, Arc<PendingRecord>>,
+    /// supersede 代次：每个 startLink 递增。URL 拿到后只有代次仍是自己
+    /// 才允许登记 pending；旧 start 的迟到结果直接丢弃并清理 store。
+    link_epoch: u64,
+    /// lost 墓碑：uri → lostAt。记录已从 links 摘掉并回收 store 之后，重复
+    /// finishLink 仍要稳定回 LINK_LOST（B1 幂等约定），不能被答成 UnknownUri。
+    /// 只保留最近若干条，避免无界增长；新 startLink 不需要清它（uri 唯一）。
+    lost_link_tombstones: StdMutex<Vec<(String, u64)>>,
     fake_pending_uri: Option<String>,
 }
 
@@ -2762,7 +2943,9 @@ impl Service {
             state,
             outbound,
             inner: AsyncMutex::new(Inner {
-                pending: None,
+                links: HashMap::new(),
+                link_epoch: 0,
+                lost_link_tombstones: StdMutex::new(Vec::new()),
                 fake_pending_uri: None,
             }),
             pipelines: AsyncMutex::new(HashMap::new()),
@@ -3192,11 +3375,51 @@ impl Service {
             inner.fake_pending_uri = Some(uri.clone());
             return Ok(uri);
         }
+        self.start_link_with_flow(link_flow).await
+    }
 
-        let mut inner = self.inner.lock().await;
-        // 新会话作废旧会话：丢掉 url_rx（presage 内部 send 失败 → 流程按
-        // Err 收口，任务自行清理目录）。
-        inner.pending = None;
+    /// startLink 主体（B1）：flow 由调用方注入，生产走 link_flow；单测用
+    /// 无网络 flow 复用同一套收口/URL 等待/超时/abort 逻辑。
+    ///
+    /// 锁纪律：`self.inner` 内只登记 supersede 代次并取走旧记录；abort +
+    /// await、spawn flow、30s URL 等待全部在锁外——否则一个慢 provisioning
+    /// WS 会把并发 start/finish 串行阻塞。
+    async fn start_link_with_flow<F, Fut>(
+        self: &Arc<Self>,
+        flow_factory: F,
+    ) -> Result<String, LinkError>
+    where
+        F: FnOnce(SqliteStore, futures::channel::oneshot::Sender<url::Url>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<LinkOutcome, LinkError>> + 'static,
+    {
+        // 锁内只做两件事：登记本次 supersede 代次、取走旧记录。旧 flow
+        // 的 abort/await 与目录回收都放到锁外（retire_pending_record）。
+        let (epoch, retired) = {
+            let mut inner = self.inner.lock().await;
+            inner.link_epoch = inner.link_epoch.wrapping_add(1);
+            let epoch = inner.link_epoch;
+            let retired = inner
+                .links
+                .drain()
+                .map(|(_, record)| record)
+                .collect::<Vec<_>>();
+            (epoch, retired)
+        };
+        // 旧会话真正收口（B1）：旧 flow 必须 abort，不能只从表里摘掉记录
+        // 让旧 provisioning WS 继续跑。旧结果槽同步落 lost 并唤醒可能在等
+        // 的 finishLink（确定性 LINK_LOST）。
+        for old in retired {
+            let lost_at = retire_pending_record(old).await;
+            if let Some(lost_at) = lost_at {
+                tracing::warn!(
+                    target: "engine.link",
+                    stage = "superseded",
+                    state = "lost",
+                    lost_at,
+                    "previous link flow superseded by startLink"
+                );
+            }
+        }
 
         let store_dir = self.data_dir.join("accounts").join(random_dir_name());
         let store = open_store(&store_dir)
@@ -3205,42 +3428,103 @@ impl Service {
                 tracing::warn!(target: "engine.link", stage = "open_store", ?error, "startLink store open failed");
                 LinkError::Internal
             })?;
+        // 给 finish 留一个同池句柄：flow 任务收尾 drop 自己的句柄后，提交段
+        // 直接复用本句柄，不重开同一 SQLite 文件。
+        let finish_store = store.clone();
 
         let (url_tx, url_rx) = futures::channel::oneshot::channel::<url::Url>();
         let slot = Arc::new(LinkResultSlot::new());
+        let state = Arc::new(StdMutex::new(LinkSessionState::Pending));
 
         // 链接流程 future 同样非 Send：spawn_local 承载（见 spawn_pipeline）。
         // start_link 只会从 LocalSet 内的 dispatch 被调用，上下文必然在。
         let task_slot = Arc::clone(&slot);
-        tokio::task::spawn_local(async move {
-            match link_flow(store, url_tx).await {
+        let task_state = Arc::clone(&state);
+        let task_store_dir = store_dir.clone();
+        let task = tokio::task::spawn_local(async move {
+            match flow_factory(store, url_tx).await {
                 Ok(outcome) => task_slot.complete(Ok(outcome)),
-                Err(()) => task_slot.complete(Err(())),
+                Err(LinkError::Lost) => {
+                    let lost_at = mark_link_lost(&task_state);
+                    tracing::warn!(
+                        target: "engine.link",
+                        stage = "link_lost",
+                        state = "lost",
+                        lost_at,
+                        "link flow lost after URL handoff"
+                    );
+                    task_slot.complete(Err(()));
+                    // lost = QR 必死，但此刻 PendingRecord 仍持同一 SqlitePool
+                    // （store.clone() 同池），Windows 上删目录必撞 sharing
+                    // violation。目录回收一律交给 retire_pending_record：
+                    // 它会先 take store 句柄再删，跨平台安全。这里只留痕。
+                    tracing::warn!(
+                        target: "engine.link",
+                        stage = "link_lost_store_deferred",
+                        "link store reclamation deferred to retire (open pool handle)"
+                    );
+                    let _ = &task_store_dir;
+                }
+                Err(_) => task_slot.complete(Err(())),
             }
         });
 
         // URL 产出有界等待：provisioning WS 正常亚秒级出 URL。超时/失败时
-        // url_rx 随返回值丢弃，链接任务自行收口。
+        // 链接任务必须 abort（不能让它继续跑），本次 store 安全回收。
         let uri = match tokio::time::timeout(Duration::from_secs(30), url_rx).await {
             Ok(Ok(uri)) => uri.to_string(),
             Ok(Err(_)) => {
                 tracing::warn!(target: "engine.link", stage = "url_channel_closed", "startLink provisioning URL channel closed");
-                let _ = tokio::fs::remove_dir_all(&store_dir).await;
+                task.abort();
+                let _ = task.await;
+                drop(finish_store);
+                let _ = remove_link_store(&store_dir).await;
                 return Err(LinkError::Internal);
             }
             Err(_) => {
                 tracing::warn!(target: "engine.link", stage = "url_timeout", "startLink provisioning URL timed out");
-                let _ = tokio::fs::remove_dir_all(&store_dir).await;
+                task.abort();
+                let _ = task.await;
+                drop(finish_store);
+                let _ = remove_link_store(&store_dir).await;
                 return Err(LinkError::Internal);
             }
         };
 
-        inner.pending = Some(PendingLink {
-            uri,
-            store_dir,
-            result: slot,
-        });
-        Ok(inner.pending.as_ref().expect("just set").uri.clone())
+        // 拿到 URL 后重新加锁做 supersede 复核：等待期间可能有更新的
+        // startLink 抢先把代次推高。只有代次仍是自己才允许登记 pending；
+        // 否则本次迟到结果直接丢弃（abort flow + 清理本次 store），绝不
+        // 覆盖新会话或留下未登记 store。
+        let mut inner = self.inner.lock().await;
+        if inner.link_epoch != epoch {
+            let superseded_epoch = inner.link_epoch;
+            drop(inner);
+            tracing::warn!(
+                target: "engine.link",
+                stage = "superseded_before_commit",
+                epoch,
+                superseded_epoch,
+                "startLink result discarded after URL handoff"
+            );
+            task.abort();
+            let _ = task.await;
+            drop(finish_store);
+            let _ = remove_link_store(&store_dir).await;
+            return Err(LinkError::Internal);
+        }
+        inner.links.insert(
+            uri.clone(),
+            Arc::new(PendingRecord {
+                store_dir,
+                store: StdMutex::new(Some(finish_store)),
+                result: slot,
+                task: StdMutex::new(Some(task)),
+                state,
+                committed: AsyncMutex::new(None),
+                superseded: AtomicBool::new(false),
+            }),
+        );
+        Ok(uri)
     }
 
     pub(crate) async fn finish_link(
@@ -3267,45 +3551,147 @@ impl Service {
             return Ok(LinkedAccount { number, aci: None });
         }
 
-        // 锁内只做会话查找；等待手机确认必须放锁（finishLink 可能阻塞数分钟，
-        // 其他方法必须继续可用）。
-        let slot = {
+        // 每个 link 会话独立记录：finishLink 只等自己 uri 的记录。被更新的
+        // startLink 顶掉的记录已从表里取走 → UnknownUri，绝不拿别的会话
+        // 的结果冒充成功。
+        let record = {
             let inner = self.inner.lock().await;
-            let pending = inner.pending.as_ref().ok_or(LinkError::UnknownUri)?;
-            if pending.uri != uri {
-                return Err(LinkError::UnknownUri);
+            match inner.links.get(uri).cloned() {
+                Some(record) => record,
+                None => {
+                    // 记录已按 lost 收口并回收 store：重复 finish 仍答 LINK_LOST。
+                    let tombstoned = inner
+                        .lost_link_tombstones
+                        .lock()
+                        .expect("lost tombstone lock")
+                        .iter()
+                        .any(|(tombstone_uri, _)| tombstone_uri == uri);
+                    if tombstoned {
+                        return Err(LinkError::Lost);
+                    }
+                    return Err(LinkError::UnknownUri);
+                }
             }
-            Arc::clone(&pending.result)
         };
-        let (number, pending_transfer) = slot.wait().await.map_err(|_| LinkError::Internal)?;
+
+        // 已提交记录的重试（connector 超时重试）：只有真正执行过
+        // state.add_account 的记录才会落 Some，直接返回同一账号。
+        {
+            let committed = record.committed.lock().await;
+            if let Some(account) = committed.as_ref() {
+                return Ok(account.clone());
+            }
+        }
+
+        // 锁内只做记录查找；等待手机确认必须放锁（finishLink 可能阻塞数分钟，
+        // 其他方法必须继续可用）。
+        let (number, pending_transfer) = match record.result.wait().await {
+            Ok(outcome) => outcome,
+            Err(()) => {
+                // B1：URL 交付后 Provisioning WS 关闭/超时/流结束 = 会话
+                // 已死。记录的 state/lostAt 是判别器（-1 LINK_LOST）；
+                // 没有 lost 记录才是真正的内部失败（-32603）。
+                if let Some(lost_at) = link_lost_at(&record.state) {
+                    tracing::warn!(
+                        target: "engine.link",
+                        stage = "finish_link",
+                        state = "lost",
+                        lost_at,
+                        "finishLink rejected: link session lost"
+                    );
+                    // 会话已死：把记录从表里摘掉并按 retire 纪律回收 store
+                    // （先 take 句柄再删目录，Windows 才删得掉）。否则这份
+                    // 未注册目录要等到下一次 startLink 才可能被清理。
+                    {
+                        let mut inner = self.inner.lock().await;
+                        if inner
+                            .links
+                            .get(uri)
+                            .is_some_and(|current| Arc::ptr_eq(current, &record))
+                        {
+                            inner.links.remove(uri);
+                        }
+                        // 墓碑让重复 finish 稳定答 LINK_LOST（幂等）；上限
+                        // 64 条，先到先出。
+                        let mut tombstones = inner
+                            .lost_link_tombstones
+                            .lock()
+                            .expect("lost tombstone lock");
+                        tombstones.push((uri.to_string(), lost_at));
+                        let overflow = tombstones.len().saturating_sub(64);
+                        if overflow > 0 {
+                            tombstones.drain(0..overflow);
+                        }
+                    }
+                    let _ = retire_pending_record(record).await;
+                    return Err(LinkError::Lost);
+                }
+                return Err(LinkError::Internal);
+            }
+        };
+
+        // 结果槽 Ok 只代表 flow 产出号码；先等任务收尾，确保 flow 自己的
+        // store 句柄已 drop；提交段复用记录里的同池句柄，不重开同一文件。
+        wait_link_task(&record).await;
+
+        // 提交单飞：同 uri 的并发 finish 只允许一个执行 add_account。
+        let mut committed = record.committed.lock().await;
+        if let Some(account) = committed.as_ref() {
+            return Ok(account.clone());
+        }
+        // 结果槽可能是 Ok（旧 flow 已产出号码），但记录若已被新 start 顶掉，
+        // 这条 Ok 不属于任何已登记账号——必须按 LINK_LOST 收口，不能返回
+        // 假成功（旧实现的 Ok(number, aci:None) 会留下孤儿 store）。
+        {
+            let inner = self.inner.lock().await;
+            let active = inner
+                .links
+                .get(uri)
+                .is_some_and(|current| Arc::ptr_eq(current, &record));
+            if !active || record.superseded.load(Ordering::Acquire) {
+                drop(inner);
+                // 先放掉记录里的 store 句柄，再删目录（跨平台删除都不怕
+                // 自己持有连接）。
+                let _ = record.store.lock().expect("link store lock").take();
+                let _ = remove_link_store(&record.store_dir).await;
+                tracing::warn!(
+                    target: "engine.link",
+                    stage = "finish_link",
+                    state = "superseded",
+                    "finishLink rejected: link record superseded before commit"
+                );
+                return Err(LinkError::Lost);
+            }
+        }
 
         // 成功：会话收口。设备名（ADR 0004）：改写 store 注册数据后启动接收
         // 管线；名字只落本地注册数据，管线不回写服务器（B4 起停发
         // AccountAttributes PUT——官方链接设备从不 PUT attributes，compat §5）。
-        let mut inner = self.inner.lock().await;
-        if inner
-            .pending
-            .as_ref()
-            .is_none_or(|pending| pending.uri != uri)
-        {
-            // 并发重试已完成收口：幂等返回同一号码。ACI 不为此回查 store
-            //（会话槽已收走，锁结构不为一枚 additive 键复杂化）——键缺席
-            // 无害，重试消费方按可选键语义退回旧行为。
-            return Ok(LinkedAccount { number, aci: None });
-        }
-        let pending = inner.pending.take().expect("checked");
-        // 会话槽已收走：后续 store/state/pipeline 收口均不持 inner 锁。
-        drop(inner);
         self.clear_terminal_account(&number);
+        // 复用链接期句柄读取一次注册数据：设备名改写与 aci 投影共用同一次
+        // 读取，避免刚收口就重开 SQLite 池（池关闭是异步的）。句柄缺席
+        //（前次提交失败已取走）才回退 open_store。
+        let mut store = record.store.lock().expect("link store lock").take();
+        if store.is_none() {
+            store = Some(
+                open_store(&record.store_dir)
+                    .await
+                    .map_err(|_| LinkError::Internal)?,
+            );
+        }
+        let mut store = store.expect("store handle");
+        let registration = store
+            .load_registration_data()
+            .await
+            .map_err(|_| LinkError::Internal)?;
+        // ACI additive 投影（connector 契约 1.142）：链接成功后读取按
+        // best-effort（注册数据缺席 = aci 整键缺席）——宁缺勿炸，不连坐
+        // 链接主结局。
+        let aci = registration
+            .as_ref()
+            .map(|data| data.service_ids.aci.to_string());
         if !device_name.is_empty() {
-            let mut store = open_store(&pending.store_dir)
-                .await
-                .map_err(|_| LinkError::Internal)?;
-            if let Some(mut data) = store
-                .load_registration_data()
-                .await
-                .map_err(|_| LinkError::Internal)?
-            {
+            if let Some(mut data) = registration {
                 data.device_name = Some(device_name.to_owned());
                 store
                     .save_registration_data(&data)
@@ -3313,10 +3699,11 @@ impl Service {
                     .map_err(|_| LinkError::Internal)?;
             }
         }
-        let rel = pending
+        drop(store);
+        let rel = record
             .store_dir
             .strip_prefix(&self.data_dir)
-            .unwrap_or(&pending.store_dir)
+            .unwrap_or(&record.store_dir)
             .to_string_lossy()
             .to_string();
         self.state
@@ -3324,6 +3711,14 @@ impl Service {
             .await
             .add_account(number.clone(), Some(rel))
             .map_err(|_| LinkError::Internal)?;
+        // add_account 成功 = 记录真正成为账号，提交位此刻置位；此前的任何
+        // 路径（supersede/内部失败）都不得返回 Ok。
+        let account = LinkedAccount {
+            number: number.clone(),
+            aci,
+        };
+        *committed = Some(account.clone());
+        drop(committed);
         // 同号重链换新 store 目录：摘除旧常驻管理器（下次发送按新目录重建）。
         self.send_managers.lock().await.remove(&number);
         // 同号重链：摘除旧 MRM 连接槽（R4 槽按账号生命周期；新身份下次发送
@@ -3342,7 +3737,7 @@ impl Service {
         // 不变：`history.importCancel` 按账号中止在途下载（transfer 腿）。
         if let Some(transfer) = pending_transfer {
             let handle = tokio::task::spawn_local(download_transfer_archive(
-                pending.store_dir.clone(),
+                record.store_dir.clone(),
                 transfer.aci,
                 transfer.backup_key,
                 transfer.credentials,
@@ -3361,11 +3756,9 @@ impl Service {
                 }
             }
         }
-        // ACI additive 投影（connector 契约 1.142）：链接已成功，注册数据
-        // 读取按 best-effort（account_aci）——宁缺勿炸，不连坐链接主结局。
-        let aci = account_aci(&pending.store_dir).await;
         force_initial_sync_on_next_stream(&number);
-        self.spawn_pipeline(number.clone(), pending.store_dir).await;
+        self.spawn_pipeline(number.clone(), record.store_dir.clone())
+            .await;
         // 批 W2（§29.73）：成功链接事件 = 旧孤儿可弃的定局信号（§29.72 硬闸
         // 待办闭环）。隔离区未完成注册件此刻自动清扫；含注册数据件保留并随
         // engine.quarantineDiscarded 待决明细上报（桌面「恢复/弃置」数据面，
@@ -3378,7 +3771,7 @@ impl Service {
                 discard_incomplete_quarantine_stores(&service, &linked).await;
             });
         }
-        Ok(LinkedAccount { number, aci })
+        Ok(account)
     }
 
     /// listAccounts 读投影（wire additive `aci` 键，connector 契约 1.142
@@ -3470,13 +3863,26 @@ impl Service {
         // 避免在飞投影/落库落在已删除目录上。删除是显式破坏性意图，宽限
         // 超时仍继续（不阻塞连接器）。
         self.stop_pipeline(account).await;
-        if let Some(dir) = removed_dir {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
         // 摘除常驻发送管理器（若有在途发送，guard 释放后管理器随 Arc 落弃）。
+        // 必须先摘再删目录：SharedSendManager 与账号 store 共用同一
+        // SqlitePool，Windows 上文件仍被打开时 remove_dir_all 必失败。
         self.send_managers.lock().await.remove(account);
         // MRM 连接槽按账号摘除（R4：其他账号槽不受影响）。
         self.mrm_pool.remove(account);
+        // 池关闭/连接归还是异步 spawn，让出一次再删。
+        tokio::task::yield_now().await;
+        if let Some(dir) = removed_dir {
+            if let Err(error) = std::fs::remove_dir_all(&dir) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        target: "engine.account",
+                        stage = "delete_account_dir",
+                        error = %error,
+                        "delete_account could not remove account store dir"
+                    );
+                }
+            }
+        }
         // A1 观测行随账号生命周期摘除。
         account_metrics::remove_account(account);
         // F 链路观测簿摘除（账号面随注册表生命周期）。
@@ -12286,7 +12692,7 @@ fn qr_link_url(mut url: url::Url) -> url::Url {
 async fn link_flow(
     mut store: SqliteStore,
     url_tx: futures::channel::oneshot::Sender<url::Url>,
-) -> Result<LinkOutcome, ()> {
+) -> Result<LinkOutcome, LinkError> {
     let mut rng = rng();
     let password = Alphanumeric.sample_string(&mut rng, 24);
     let push_service = PushService::new(SignalServers::Production, None, USER_AGENT);
@@ -12305,28 +12711,56 @@ async fn link_flow(
         async move {
             let url = match event_rx.next().await {
                 Some(SecondaryDeviceProvisioning::Url(url)) => url,
-                _ => return Err(()),
+                // URL 都没拿到：startLink 自己的 URL 等待臂收口（Internal）。
+                _ => return Err(terminal_before_url()),
             };
-            let _ = url_tx.send(qr_link_url(url));
+            if url_tx.send(qr_link_url(url)).is_err() {
+                // 调用方已超时/丢弃 url_rx：没有可 finish 的会话，按未交付
+                // URL 收口，不把死会话记成 lost（startLink 会 abort 本任务）。
+                return Err(terminal_url_timeout());
+            }
+            // B1：URL 已交付后，流结束/WS 关闭/超时全部是终局 Lost。
             match event_rx.next().await {
                 Some(SecondaryDeviceProvisioning::NewDeviceRegistration(data)) => Ok(data),
-                _ => Err(()),
+                // URL 已交付后任何非注册事件（流结束/关闭）= Lost。
+                _ => Err(terminal_after_url_closed()),
             }
         },
     )
     .await;
 
-    if let Err(error) = &link_outcome {
-        tracing::warn!(target: "engine.link", stage = "link_device", ?error, "link_device failed");
-    }
-    link_outcome.map_err(|_| ())?;
     let registration = match registration {
         Ok(data) => data,
-        Err(()) => {
-            tracing::warn!(target: "engine.link", stage = "registration_missing", "provisioning registration message missing");
-            return Err(());
+        Err(error) => {
+            // URL 是否已交付由结果槽编码：Lost = 交付后读流结束；Internal =
+            // 交付前失败。再用 link_device 的真实终局错误细分 keepalive 超时
+            // 与普通关闭，最后交给纯映射归型（URL 前一律 Internal）。
+            let url_delivered = matches!(error, LinkError::Lost);
+            let cause = match &link_outcome {
+                Err(link_error) => provisioning_terminal_cause(link_error),
+                Ok(()) => LinkTerminalCause::StreamClosed,
+            };
+            let classified = classify_link_terminal(url_delivered, cause);
+            let stage = if matches!(&classified, LinkError::Lost) {
+                "registration_missing_lost"
+            } else {
+                "registration_missing"
+            };
+            tracing::warn!(target: "engine.link", stage, "provisioning registration message missing");
+            return Err(classified);
         }
     };
+    // registration 已到手 = provisioning 已把完整注册数据交过来；link_device
+    // 的收尾错误不再反悔一次成功链接（旧实现把它误归 Lost，会丢弃有效
+    // 注册数据并把已完成的会话报成死链）。
+    if let Err(error) = &link_outcome {
+        tracing::warn!(
+            target: "engine.link",
+            stage = "link_device_tail",
+            ?error,
+            "link_device failed after registration"
+        );
+    }
     let NewDeviceRegistration {
         phone_number,
         device_id,
@@ -12365,8 +12799,10 @@ async fn link_flow(
     // serde 数据面构造（官方 store 落库格式）：pub(crate) 字段的唯一合法
     // 构造路径；键面与序列化形态由往返单测锁死。
     let number = e164_string(&phonenumber_from_signal(&phone_number));
-    let servers = serde_json::to_value(SignalServers::Production).map_err(|_| ())?;
-    let phone = serde_json::to_value(phonenumber_from_signal(&phone_number)).map_err(|_| ())?;
+    let servers =
+        serde_json::to_value(SignalServers::Production).map_err(|_| link_store_error())?;
+    let phone = serde_json::to_value(phonenumber_from_signal(&phone_number))
+        .map_err(|_| link_store_error())?;
     use base64::Engine as _;
     let profile_key_b64 = base64::engine::general_purpose::STANDARD.encode(profile_key.bytes);
     // 注意 from_str 而非 from_value：上游 serde_profile_key 用借用反序列化
@@ -12386,19 +12822,19 @@ async fn link_flow(
             "pni_registration_id": Some(pni_registration_id),
             "profile_key": profile_key_b64,
         }))
-        .map_err(|_| ())?,
+        .map_err(|_| link_store_error())?,
     )
-    .map_err(|_| ())?;
+    .map_err(|_| link_store_error())?;
 
     // 落库顺序与官方 link_secondary_device 一致。
     store
         .set_aci_identity_key_pair(IdentityKeyPair::new(aci_public_key, aci_private_key))
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| link_store_error())?;
     store
         .set_pni_identity_key_pair(IdentityKeyPair::new(pni_public_key, pni_private_key))
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| link_store_error())?;
     let master_key = account_entropy_pool.as_ref().and_then(|aep| {
         presage::libsignal_service::prelude::MasterKey::from_slice(aep.derive_svr_key().as_slice())
             .ok()
@@ -12406,19 +12842,21 @@ async fn link_flow(
     store
         .store_master_key(master_key.as_ref())
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| link_store_error())?;
     store
         .store_account_entropy_pool(account_entropy_pool.as_ref())
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| link_store_error())?;
     store
         .save_registration_data(&registration_data)
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| link_store_error())?;
 
     // 回归既有收发管线的门禁：标准 load 路径能读回（本任务内 Manager 即弃，
     // 接收管线在 finish_link 后由 spawn_pipeline 自行 load）。
-    Manager::load_registered(store).await.map_err(|_| ())?;
+    Manager::load_registered(store)
+        .await
+        .map_err(|_| link_store_error())?;
 
     // 一次性迁移密钥：原样装入行囊移交 finish_link——收口清理（同号旧
     // 任务 cancel + 进度清缺）必须先于新任务启动，spawn 留在本函数会被
@@ -13784,6 +14222,58 @@ async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
         .map_err(|error| {
             eprintln!("kt-signal-engine: sqlite store open failed: {error}");
         })
+}
+
+/// 回收本次已死链接的未注册 store（B1，issue #951）。
+///
+/// 只删能证明未注册的 lk-* 目录（store 可打开且 load_registration_data
+/// 为 None）：有注册数据、打不开或非 lk-* 一律保留——宁留孤儿，不删凭证。
+#[cfg_attr(not(test), allow(dead_code))]
+async fn remove_unregistered_link_store(store_dir: &Path) -> bool {
+    let Some(name) = store_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !name.starts_with("lk-") || !store_dir.try_exists().unwrap_or(false) {
+        return false;
+    }
+    let registration = match open_store(store_dir).await {
+        Ok(store) => store.load_registration_data().await,
+        Err(_) => return false,
+    };
+    if !matches!(registration, Ok(None)) {
+        return false;
+    }
+    tokio::fs::remove_dir_all(store_dir).await.is_ok()
+}
+
+/// 回收一个被新 startLink 顶掉、且从未提交为账号的 link store。
+///
+/// 与 [`remove_unregistered_link_store`] 不同：这里的记录已被 supersede
+/// 且 finish 未执行 `state.add_account`，store 里的注册数据属于引擎永远
+/// 不会承认的孤儿账号，必须连同目录一起清掉（用户重扫即可）。仍然只动
+/// `lk-*` 目录，绝不碰其他账号目录。
+async fn remove_link_store(store_dir: &Path) -> bool {
+    let Some(name) = store_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !name.starts_with("lk-") {
+        return false;
+    }
+    match tokio::fs::remove_dir_all(store_dir).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            // 删不掉要留痕：Windows 上池句柄未释放会 sharing violation，
+            // 静默吞掉会让未注册目录长期占盘且无人知晓。
+            tracing::warn!(
+                target: "engine.link",
+                stage = "remove_link_store",
+                error = %error,
+                "could not remove link store dir"
+            );
+            false
+        }
+    }
 }
 
 /// 回收「注册表缺失」时遗留的失败链接 store。
@@ -18599,17 +19089,14 @@ mod tests {
         assert_eq!(round2, value);
     }
 
-    /// 测试夹具：向 store 写一份合法注册数据（官方落库 JSON 形，ACI 直给；
-    /// 其余键值与往返测试同款合法值），返回 store 目录。store 连接随返回
-    /// drop（sqlx WAL 多连接安全，被测面 account_aci/list_accounts 自行
-    /// 重开，生产路径 open_registered 同模式）。
-    async fn seed_store_with_aci(data_dir: &Path, rel: &str, aci: &str) -> PathBuf {
+    /// 合法注册数据夹具（官方落库 JSON 形，ACI 直给；其余键值与往返测试
+    /// 同款合法值）。
+    fn link_test_registration_data(aci: &str) -> RegistrationData {
         use presage::libsignal_service::utils::TryIntoE164;
 
-        let store_dir = data_dir.join(rel);
         let e164 = "+15551234567".try_into_e164().expect("e164");
         let phone_number = presage::libsignal_service::utils::phonenumber_from_signal(&e164);
-        let data: RegistrationData = serde_json::from_str(
+        serde_json::from_str(
             &json!({
                 "signal_servers": "Production",
                 "device_name": "KT Signal Engine",
@@ -18624,7 +19111,16 @@ mod tests {
             })
             .to_string(),
         )
-        .expect("registration data deserializes");
+        .expect("registration data deserializes")
+    }
+
+    /// 测试夹具：向 store 写一份合法注册数据（官方落库 JSON 形，ACI 直给；
+    /// 其余键值与往返测试同款合法值），返回 store 目录。store 连接随返回
+    /// drop（sqlx WAL 多连接安全，被测面 account_aci/list_accounts 自行
+    /// 重开，生产路径 open_registered 同模式）。
+    async fn seed_store_with_aci(data_dir: &Path, rel: &str, aci: &str) -> PathBuf {
+        let store_dir = data_dir.join(rel);
+        let data = link_test_registration_data(aci);
         let mut store = open_store(&store_dir).await.expect("store opens");
         store
             .save_registration_data(&data)
@@ -18654,6 +19150,680 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!empty.exists(), "未注册空 store 可以安全回收");
         assert!(registered.exists(), "含注册数据的 store 必须保留");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 把测试服务里所有 link 记录取走并收口（测试收尾；不等 30s URL 超时）。
+    async fn retire_all_links(service: &Arc<Service>) {
+        let records: Vec<Arc<PendingRecord>> = {
+            let mut inner = service.inner.lock().await;
+            inner.links.drain().map(|(_, record)| record).collect()
+        };
+        for record in records {
+            let _ = retire_pending_record(record).await;
+        }
+    }
+
+    /// 等到某个 link 的结果槽落定（Ok/Err），避免测试与 spawn_local 抢时序。
+    async fn wait_link_result_resolved(service: &Arc<Service>, uri: &str) {
+        for _ in 0..400 {
+            let resolved = {
+                let inner = service.inner.lock().await;
+                inner
+                    .links
+                    .get(uri)
+                    .is_some_and(|record| !record.result.is_unresolved())
+            };
+            if resolved {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("link result did not resolve");
+    }
+
+    /// 停掉接收管线（防止测试收尾留下在途网络任务）。
+    async fn abort_pipelines(service: &Arc<Service>) {
+        let handles: Vec<_> = {
+            let mut pipelines = service.pipelines.lock().await;
+            pipelines.drain().map(|(_, handle)| handle).collect()
+        };
+        for handle in handles {
+            let _ = handle.shutdown.send(true);
+            handle.done.abort();
+        }
+    }
+
+    /// B1（issue #951）：URL 交付后 link_flow 终局失败 → 记录 state=lost
+    /// （带 lostAt），finishLink 确定性回 LinkError::Lost（wire -1 LINK_LOST），
+    /// 且该 lk-* 目录被删除；重复 finishLink 保持同一 lost 结论。
+    #[tokio::test]
+    async fn lost_link_flow_answers_link_lost_and_removes_store() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-lost-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=aaaaaaaa-2222-4333-8444-555555555555&pub_key=AAAA",
+                            )
+                            .expect("url"),
+                        );
+                        Err(LinkError::Lost)
+                    })
+                    .await
+                    .expect("start link");
+
+                let store_dir = {
+                    let inner = service.inner.lock().await;
+                    let record = inner.links.get(&uri).expect("link record");
+                    // 真实判别（不是 Pending|Lost 的恒真断言）：lost flow 从未
+                    // 执行 add_account，提交位必须仍是 None。
+                    assert!(
+                        record.committed.try_lock().expect("commit lock").is_none(),
+                        "lost flow must not be marked committed"
+                    );
+                    record.store_dir.clone()
+                };
+
+                let mut lost_at = None;
+                for _ in 0..200 {
+                    let seen = {
+                        let inner = service.inner.lock().await;
+                        inner
+                            .links
+                            .get(&uri)
+                            .map(|record| *record.state.lock().expect("state lock"))
+                    };
+                    if let Some(LinkSessionState::Lost { lost_at: at }) = seen {
+                        lost_at = Some(at);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let lost_at = lost_at.expect("lost state recorded");
+                assert!(lost_at > 0, "lostAt must be a real timestamp");
+
+                let err = match service.finish_link(&uri, "KT").await {
+                    Err(error) => error,
+                    Ok(_) => panic!("lost session must fail"),
+                };
+                assert!(matches!(err, LinkError::Lost), "first finish: {err:?}");
+
+                for _ in 0..200 {
+                    if !store_dir.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(!store_dir.exists(), "lost link store must be removed");
+
+                // 重复 finishLink（connector 超时重试）仍回同一确定错误。
+                let err = match service.finish_link(&uri, "KT").await {
+                    Err(error) => error,
+                    Ok(_) => panic!("repeat finish must fail"),
+                };
+                assert!(matches!(err, LinkError::Lost), "repeat finish: {err:?}");
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// B1：新 startLink 必须 abort 旧 link_flow——旧任务被取消后不得再写
+    /// 注册数据；旧未注册目录被回收，accounts/ 只留当前会话的一个 lk-*。
+    #[tokio::test]
+    async fn new_start_link_aborts_old_flow_without_registration_write() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-abort-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let wrote_registration = Arc::new(AtomicBool::new(false));
+                let wrote = Arc::clone(&wrote_registration);
+                let first_uri = service
+                    .start_link_with_flow(move |mut store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=aaaaaaaa-2222-4333-8444-555555555555&pub_key=AAAA",
+                            )
+                            .expect("url"),
+                        );
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        let data = link_test_registration_data(
+                            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                        );
+                        store
+                            .save_registration_data(&data)
+                            .await
+                            .map_err(|_| LinkError::Internal)?;
+                        wrote.store(true, Ordering::SeqCst);
+                        Ok(("+15550000001".to_owned(), None))
+                    })
+                    .await
+                    .expect("first start");
+                let first_dir = {
+                    let inner = service.inner.lock().await;
+                    inner
+                        .links
+                        .get(&first_uri)
+                        .expect("first record")
+                        .store_dir
+                        .clone()
+                };
+
+                let second_uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=bbbbbbbb-2222-4333-8444-555555555555&pub_key=BBBB",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("second start");
+                assert_ne!(first_uri, second_uri);
+
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    !wrote_registration.load(Ordering::SeqCst),
+                    "aborted old flow must not write registration data"
+                );
+                assert!(!first_dir.exists(), "superseded unregistered store removed");
+
+                let mut stores = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(data_dir.join("accounts")) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                            && name.starts_with("lk-")
+                        {
+                            stores.push(name);
+                        }
+                    }
+                }
+                assert_eq!(stores.len(), 1, "only the current link store remains: {stores:?}");
+
+                // 清掉第二个在途会话（测试收尾，不影响断言）。
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项：旧 flow 已产出 Ok 但未提交时，新 start 顶掉旧记录；
+    /// 旧 finish 不得返回 Ok（旧实现会回假的 Ok(number, aci:None) 且不
+    /// add_account），旧 store 必须随 supersede 回收，不留孤儿。
+    #[tokio::test]
+    async fn superseded_ok_flow_never_finishes_successfully_or_leaves_store() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-ok-superseded-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let first_uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=aaaaaaaa-2222-4333-8444-555555555555&pub_key=AAAA",
+                            )
+                            .expect("url"),
+                        );
+                        Ok(("+15550001111".to_owned(), None))
+                    })
+                    .await
+                    .expect("first start");
+                wait_link_result_resolved(&service, &first_uri).await;
+                let first_dir = {
+                    let inner = service.inner.lock().await;
+                    let record = inner.links.get(&first_uri).expect("first record");
+                    assert!(
+                        record.committed.try_lock().expect("commit lock").is_none(),
+                        "flow Ok must not imply committed"
+                    );
+                    record.store_dir.clone()
+                };
+
+                let second_uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=bbbbbbbb-2222-4333-8444-555555555555&pub_key=BBBB",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("second start");
+                assert_ne!(first_uri, second_uri);
+
+                match service.finish_link(&first_uri, "KT").await {
+                    Err(LinkError::UnknownUri) | Err(LinkError::Lost) => {}
+                    Ok(_) => panic!("superseded finish must not return Ok"),
+                    Err(other) => panic!("unexpected superseded finish error: {other:?}"),
+                }
+                let accounts = { service.state.lock().await.accounts().to_vec() };
+                assert!(
+                    accounts.is_empty(),
+                    "superseded flow must not add an account: {accounts:?}"
+                );
+                assert!(
+                    !first_dir.exists(),
+                    "superseded uncommitted store must be removed"
+                );
+                {
+                    let inner = service.inner.lock().await;
+                    assert!(inner.links.contains_key(&second_uri));
+                }
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项（旧 fake-Ok 窗口）：结果槽已 Ok，但记录已被新 start 取走 /
+    /// 顶掉；finish 不得把这条 Ok 冒充成功（旧实现在 "pending 不是自己" 时
+    /// 回 Ok(number, aci:None)，不 add_account → 孤儿 store）。
+    #[tokio::test]
+    async fn ok_result_with_superseded_record_never_finishes_successfully() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-fake-ok-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=dddddddd-2222-4333-8444-555555555555&pub_key=DDDD",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("start");
+                let record = {
+                    let inner = service.inner.lock().await;
+                    inner.links.get(&uri).expect("record").clone()
+                };
+                let first_dir = record.store_dir.clone();
+
+                // 让 finish 先查到记录并停在结果槽等待（poll 到 pending）。
+                let mut finish = Box::pin(service.finish_link(&uri, "KT"));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), finish.as_mut())
+                        .await
+                        .is_err(),
+                    "finish must be waiting for the result slot"
+                );
+
+                // 结果槽已 Ok，同时记录被新 start 取走（supersede）——旧实现
+                // 会在这里回假的 Ok 且不 add_account。
+                {
+                    let mut inner = service.inner.lock().await;
+                    record.result.complete(Ok(("+15550001111".to_owned(), None)));
+                    assert!(inner.links.remove(&uri).is_some(), "record removed");
+                }
+                let _ = retire_pending_record(Arc::clone(&record)).await;
+
+                let err = match finish.await {
+                    Err(error) => error,
+                    Ok(_) => panic!("Ok result of superseded record must not return Ok"),
+                };
+                assert!(
+                    matches!(err, LinkError::Lost),
+                    "superseded Ok result must be LINK_LOST: {err:?}"
+                );
+                assert!(service.state.lock().await.accounts().is_empty());
+                assert!(!first_dir.exists(), "superseded store must be removed");
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项：finish 已进入等待后被新 start 顶掉，必须回 LINK_LOST，
+    /// 不能拿到旧记录的结果冒充成功，也不能留下未提交 store。
+    #[tokio::test]
+    async fn pending_finish_superseded_by_new_start_returns_link_lost() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-waiting-superseded-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let first_uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=aaaaaaaa-2222-4333-8444-555555555555&pub_key=AAAA",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("first start");
+                let first_dir = {
+                    let inner = service.inner.lock().await;
+                    inner
+                        .links
+                        .get(&first_uri)
+                        .expect("first record")
+                        .store_dir
+                        .clone()
+                };
+
+                let finish_service = Arc::clone(&service);
+                let finish_uri = first_uri.clone();
+                let finish = tokio::task::spawn_local(async move {
+                    finish_service.finish_link(&finish_uri, "KT").await
+                });
+                // 让 finish 先查到记录并进入结果槽等待。
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert!(!finish.is_finished(), "finish should be waiting for confirmation");
+
+                let second_uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=bbbbbbbb-2222-4333-8444-555555555555&pub_key=BBBB",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("second start");
+                assert_ne!(first_uri, second_uri);
+
+                let err = match finish.await.expect("finish task") {
+                    Err(error) => error,
+                    Ok(_) => panic!("superseded waiting finish must not return Ok"),
+                };
+                assert!(
+                    matches!(err, LinkError::Lost),
+                    "superseded waiting finish: {err:?}"
+                );
+                assert!(service.state.lock().await.accounts().is_empty());
+                assert!(!first_dir.exists(), "superseded store must be removed");
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项：第一个 start 卡在 URL 等待时，第二个 start 必须能进入
+    /// （旧实现持 inner 锁跨 30s url_rx 等待，第二个会被串行阻塞）。
+    #[tokio::test]
+    async fn concurrent_start_link_is_not_blocked_by_slow_url_wait() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-concurrent-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let (gate_tx, gate_rx) = futures::channel::oneshot::channel::<()>();
+                let slow_service = Arc::clone(&service);
+                let slow = tokio::task::spawn_local(async move {
+                    slow_service
+                        .start_link_with_flow(move |_store, url_tx| async move {
+                            let _ = gate_rx.await;
+                            let _ = url_tx.send(
+                                url::Url::parse(
+                                    "sgnl://link?uuid=aaaaaaaa-2222-4333-8444-555555555555&pub_key=AAAA",
+                                )
+                                .expect("url"),
+                            );
+                            Err(LinkError::Internal)
+                        })
+                        .await
+                });
+                // 让第一个 start 进入 URL 等待（持锁实现会在这里卡住第二个）。
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(!slow.is_finished(), "first start must still wait for its URL");
+
+                let second_uri = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    service.start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=bbbbbbbb-2222-4333-8444-555555555555&pub_key=BBBB",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    }),
+                )
+                .await
+                .expect("second start must not block on the first URL wait")
+                .expect("second start");
+
+                let _ = gate_tx.send(());
+                let slow_result = slow.await.expect("slow start task");
+                assert!(
+                    matches!(slow_result, Err(LinkError::Internal)),
+                    "stale start must be discarded: {slow_result:?}"
+                );
+                {
+                    let inner = service.inner.lock().await;
+                    assert!(inner.links.contains_key(&second_uri));
+                    assert_eq!(inner.links.len(), 1, "stale start must not overwrite pending");
+                }
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项：正常 finish 仍成功；只有 add_account 成功后才返回 Ok，
+    /// 连接器重试返回同一提交结果。
+    #[tokio::test]
+    async fn finish_link_commits_account_once_and_returns_number() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-finish-ok-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=cccccccc-2222-4333-8444-555555555555&pub_key=CCCC",
+                            )
+                            .expect("url"),
+                        );
+                        Ok(("+15550002222".to_owned(), None))
+                    })
+                    .await
+                    .expect("start");
+                wait_link_result_resolved(&service, &uri).await;
+
+                let linked = service.finish_link(&uri, "KT").await.expect("finish link");
+                assert_eq!(linked.number, "+15550002222");
+                assert!(linked.aci.is_none());
+                {
+                    let state = service.state.lock().await;
+                    assert!(
+                        state
+                            .accounts()
+                            .iter()
+                            .any(|entry| entry.number == linked.number),
+                        "finish must add the account"
+                    );
+                }
+
+                let retry = service.finish_link(&uri, "KT").await.expect("finish retry");
+                assert_eq!(retry.number, linked.number);
+                assert_eq!(retry.aci, linked.aci);
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 终局归型纯函数：URL 前失败仍 Internal；URL 后关闭/keepalive 超时 =
+    /// Lost；注册数据落库失败不是会话终局，仍 Internal。
+    /// 生产出口锁：link_flow 只用三个具名出口产出终局。若有人把
+    /// terminal_after_url_closed 的 true 改成 false（或把 before/timeout 弄
+    /// 反），这条测试必红——纯映射表测试拦不住这种改动。
+    #[test]
+    fn production_terminal_exits_keep_the_url_handoff_boundary() {
+        assert!(
+            matches!(terminal_after_url_closed(), LinkError::Lost),
+            "URL delivered + stream closed must be Lost"
+        );
+        assert!(
+            matches!(terminal_before_url(), LinkError::Internal),
+            "pre-URL failure must stay Internal"
+        );
+        assert!(
+            matches!(terminal_url_timeout(), LinkError::Internal),
+            "caller-dropped url_rx must stay Internal"
+        );
+    }
+
+    #[test]
+    fn link_terminal_classification_maps_url_state_and_cause() {
+        for cause in [
+            LinkTerminalCause::StreamClosed,
+            LinkTerminalCause::KeepaliveTimeout,
+            LinkTerminalCause::UrlTimeout,
+        ] {
+            assert!(
+                matches!(classify_link_terminal(false, cause), LinkError::Internal),
+                "pre-URL failure must stay internal: {cause:?}"
+            );
+        }
+        assert!(matches!(
+            classify_link_terminal(true, LinkTerminalCause::StreamClosed),
+            LinkError::Lost
+        ));
+        assert!(matches!(
+            classify_link_terminal(true, LinkTerminalCause::KeepaliveTimeout),
+            LinkError::Lost
+        ));
+        assert!(matches!(
+            classify_link_terminal(true, LinkTerminalCause::StoreWrite),
+            LinkError::Internal
+        ));
+        assert!(matches!(
+            classify_link_terminal(false, LinkTerminalCause::StoreWrite),
+            LinkError::Internal
+        ));
+
+        // 真实 link_device 终局错误 → 映射输入：超时归 keepalive，其余关闭
+        // 归 stream closed；两者在 URL 交付后都落 Lost。
+        assert_eq!(
+            provisioning_terminal_cause(&ProvisioningError::ServiceError(
+                ProvisioningServiceError::Timeout {
+                    reason: "keepalive"
+                }
+            )),
+            LinkTerminalCause::KeepaliveTimeout
+        );
+        assert_eq!(
+            provisioning_terminal_cause(&ProvisioningError::WsClosing),
+            LinkTerminalCause::StreamClosed
+        );
+    }
+
+    /// B1：lost 清理只删未注册目录；含注册数据的 store 必须保留。
+    #[tokio::test]
+    async fn lost_store_cleanup_keeps_registered_store() {
+        let root = std::env::temp_dir().join(format!(
+            "kt-engine-link-lost-cleanup-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let empty = root.join("accounts/lk-empty");
+        let store = open_store(&empty).await.expect("empty store opens");
+        drop(store);
+        let registered = seed_store_with_aci(
+            &root,
+            "accounts/lk-registered",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+
+        assert!(
+            remove_unregistered_link_store(&empty).await,
+            "unregistered lost store is removed"
+        );
+        assert!(
+            !remove_unregistered_link_store(&registered).await,
+            "registered store is never removed"
+        );
+        assert!(!empty.exists());
+        assert!(registered.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

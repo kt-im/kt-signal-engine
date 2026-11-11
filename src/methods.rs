@@ -27,6 +27,11 @@ use crate::state::EngineState;
 /// 上游对非法 deviceLinkUri 的错误原文（夹具逐字对齐）。
 const UNKNOWN_LINK_URI: &str = "Unknown device link uri.";
 
+/// finishLink 链接会话 lost 的确定性错误码（-1，引擎结构化错误风格，
+/// B1/issue #951）：URL 交付后 provisioning WS 关闭/超时/流结束 = QR 必死。
+/// 不折叠成 -32603——connector 需要把「会话已死」与引擎内部故障分开。
+const LINK_LOST: &str = "LINK_LOST";
+
 /// 解绑态错误原文（上游把 AuthorizationFailedException 包进
 /// UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
 const USER_UNBOUND_MESSAGE: &str =
@@ -372,10 +377,7 @@ async fn dispatch(
                         }
                         jsonrpc::success_response(id, Value::Object(row))
                     }
-                    Err(LinkError::UnknownUri) => {
-                        jsonrpc::error_response(id, &RpcError::new(-1, UNKNOWN_LINK_URI))
-                    }
-                    Err(LinkError::Internal) => internal_error(id),
+                    Err(error) => finish_link_error(id, error),
                 },
                 // 参数缺失按非法链接会话处理（上游 fail-closed 同口径）。
                 _ => jsonrpc::error_response(id, &RpcError::new(-1, UNKNOWN_LINK_URI)),
@@ -5287,6 +5289,17 @@ fn internal_error(id: &Value) -> Value {
     jsonrpc::error_response(id, &RpcError::new(-32603, "Internal error"))
 }
 
+/// finishLink 错误面归型（B1/issue #951）：Lost 是 URL 交付后会话死亡的
+/// 确定性错误（-1 LINK_LOST），不是引擎内部错误 -32603；UnknownUri 保持
+/// 上游原文逐字兼容。
+fn finish_link_error(id: &Value, error: LinkError) -> Value {
+    match error {
+        LinkError::UnknownUri => jsonrpc::error_response(id, &RpcError::new(-1, UNKNOWN_LINK_URI)),
+        LinkError::Lost => jsonrpc::error_response(id, &RpcError::new(-1, LINK_LOST)),
+        LinkError::Internal => internal_error(id),
+    }
+}
+
 /// calls.* 材料字节 → 标准 base64（凭据/presentation 字节面统一编码点；
 /// 字节内容零日志零落盘纪律不变，此处只编码出 RPC 响应）。
 fn calls_b64(bytes: &[u8]) -> String {
@@ -5527,6 +5540,24 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B1（issue #951）：finishLink 会话 lost 必须是 -1 + LINK_LOST
+    /// （确定性错误码），不能折叠成 -32603 内部错误；UnknownUri 原文不变。
+    #[test]
+    fn finish_link_error_faces_pin_link_lost_and_unknown_uri() {
+        let lost = finish_link_error(&Value::from(7), LinkError::Lost);
+        assert_eq!(lost["id"], json!(7));
+        assert_eq!(lost["error"]["code"], json!(-1));
+        assert_eq!(lost["error"]["message"], json!("LINK_LOST"));
+
+        let unknown = finish_link_error(&Value::from(8), LinkError::UnknownUri);
+        assert_eq!(unknown["error"]["code"], json!(-1));
+        assert_eq!(unknown["error"]["message"], json!(UNKNOWN_LINK_URI));
+
+        let internal = finish_link_error(&Value::from(9), LinkError::Internal);
+        assert_eq!(internal["error"]["code"], json!(-32603));
+        assert_eq!(internal["error"]["message"], json!("Internal error"));
+    }
 
     /// 2026-10-20 隐私修复：账号前缀日志必须不可逆。原实现取 E.164 前 8
     /// 字符（`+8618827…`）直接落盘；改为 SHA-256 前 8 hex 后，同一账号
