@@ -131,10 +131,31 @@ jobs:
           if [ "$TARGET" = "x86_64-pc-windows-msvc" ]; then artifact="kt-signal-engine-windows-x64.exe"; src="dist/kt-signal-engine-$TARGET.exe"; else artifact="kt-signal-engine-macos-arm64"; src="dist/kt-signal-engine-$TARGET"; fi
           obj="$OSS_PREFIX/$version/$artifact"
           echo "publishing $src -> oss://$OSS_BUCKET/$obj"
-          curl -sSL -o ossutil "https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil64" || curl -sSL -o ossutil "https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil"
-          chmod +x ossutil
-          ./ossutil config -e "$OSS_ENDPOINT" -i "$OSS_ACCESS_KEY_ID" -k "$OSS_ACCESS_KEY_SECRET" -t "$OSS_STS_TOKEN" --force
-          ./ossutil cp -f "$src" "oss://$OSS_BUCKET/$obj"
-          ./ossutil stat "oss://$OSS_BUCKET/$obj"
-          echo "public url: https://download.ktai.im/$obj"
+
+          python3 -m pip install --quiet --disable-pip-version-check oss2
+          export SRC="$src" OSS_KEY="$obj"
+          python3 - <<'PYEOF'
+          import os, hashlib, oss2
+          auth = oss2.StsAuth(os.environ['OSS_ACCESS_KEY_ID'], os.environ['OSS_ACCESS_KEY_SECRET'], os.environ['OSS_STS_TOKEN'])
+          bucket = oss2.Bucket(auth, 'https://' + os.environ['OSS_ENDPOINT'], os.environ['OSS_BUCKET'])
+          src, key = os.environ['SRC'], os.environ['OSS_KEY']
+          with open(src, 'rb') as f:
+              local_sha = hashlib.sha256(f.read()).hexdigest()
+          local_size = os.path.getsize(src)
+          if bucket.object_exists(key):
+              meta = bucket.head_object(key)
+              remote_sha = (meta.headers or {}).get('x-oss-meta-sha256', '')
+              if remote_sha and remote_sha != local_sha:
+                  raise SystemExit(f"FATAL: oss://{os.environ['OSS_BUCKET']}/{key} holds sha256={remote_sha}, refusing overwrite with {local_sha}. Bump version in Cargo.toml.")
+              if meta.content_length != local_size:
+                  raise SystemExit(f"FATAL: size {meta.content_length} != local {local_size}. Bump version instead of reusing this path.")
+              print(f"already published with identical content, skip: {key}")
+          else:
+              bucket.put_object_from_file(key, src, headers={'x-oss-meta-sha256': local_sha})
+              meta = bucket.head_object(key)
+              assert meta.content_length == local_size, 'size mismatch after upload'
+              print(f"uploaded {key} size={meta.content_length} sha256={local_sha}")
+          print(f"public url: https://download.ktai.im/{key}")
+          PYEOF
+
 
