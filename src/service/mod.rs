@@ -2366,6 +2366,21 @@ fn initial_sync_due(last_elapsed_ms: Option<u64>) -> bool {
     }
 }
 
+/// gate-trace 定位打点（SIGNAL-GATE-TRACE-PLAN §1，2026-11-12）：收件箱闸
+/// 四跳断链定位专用，固定单行格式供 grep `[gate-trace]`。账号只落不可逆
+/// 短哈希（`probe_account8`），detail 只放枚举/布尔/计数——号码、名字、
+/// 消息正文一律不落。纯日志发射，不参与任何判定（零行为语义）。
+fn gate_trace(event: &str, account: &str, face: &str, detail: &str) {
+    tracing::warn!(
+        target: "engine.gate_trace",
+        "[gate-trace] hop=engine event={} account={} face={} detail={}",
+        event,
+        crate::methods::probe_account8(Some(account)),
+        face,
+        detail
+    );
+}
+
 /// FetchLatest STORAGE_MANIFEST 触发判别（T-9 消费臂入口纯函数面）：官方
 /// 「实时」= 改了 manifest 的设备发普通 E2E 信封 SyncMessage.fetchLatest
 /// {STORAGE_MANIFEST}，收方 HTTP 重拉（服务器 websocket 只推 E2E 信封 +
@@ -2452,12 +2467,25 @@ async fn pull_storage_manifest(
     if groups.is_err() {
         perf_metrics::add(perf_metrics::keys::STORAGE_MANIFEST_PULL_ERR, 1);
     }
+    let contacts_ok = contacts.is_ok();
+    let groups_ok = groups.is_ok();
     service
         .notify(
             account,
-            storage_pull_notification(account, trigger, contacts.is_ok(), groups.is_ok()),
+            storage_pull_notification(account, trigger, contacts_ok, groups_ok),
         )
         .await;
+    // gate-trace 第 1 点：engine.storagePull 发射后一行（trigger + 两腿布尔）。
+    gate_trace(
+        "storage-pull",
+        account,
+        if contacts_ok && groups_ok {
+            "ok"
+        } else {
+            "fail"
+        },
+        &format!("trigger={trigger} contactsOk={contacts_ok} groupsOk={groups_ok}"),
+    );
     (contacts, groups)
 }
 
@@ -3456,6 +3484,16 @@ impl Service {
                     false
                 }
             };
+        // 诊断面（2026-11-12）：栅栏慢（stdout 背压）是收流停滞的嫌疑面。
+        if started.elapsed().as_millis() >= 200 {
+            tracing::warn!(
+                target: "engine.latency",
+                stage = "flush_barrier",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                ok = resolved,
+                "stdout flush barrier slow"
+            );
+        }
         // S2a 打点：栅栏时长 + 成败计数（O3 flush_barrier 批量化候选的
         // 基线测量面；只测不改，语义零变化）。
         perf_metrics::record_us(
@@ -8879,6 +8917,14 @@ async fn receive_account_loop(
 ) {
     // 存量联系人补同步的一次性纪律：60s 内断连重开不重复轰主设备。
     let mut last_contacts_sync: Option<std::time::Instant> = None;
+    // gate-trace 第 4 点：双同步（三 sync 请求 + 登录期 manifest 拉）共用的
+    // 60s 一次性窗口随本管线重建 = 窗口作废/重开的现场证据。
+    gate_trace(
+        "window-restart",
+        number,
+        "-",
+        "window-restart reason=pipeline-start",
+    );
     // DERM 重试防环计数（同管线生命周期；断连重开不清——防环窗口以
     // 原始消息时间戳为键，跨重连持续有效）。
     let mut derm_guard = DermRetryGuard::default();
@@ -9490,7 +9536,20 @@ async fn serve_account_stream(
     // （maintenance_tick 书签判到期同纪律），量触发刷新书签让时间窗重开。
     let mut quick_last_ms: Option<u64> = None;
     let mut quick_seen: u64 = 0;
+    // 诊断面（2026-11-12）：接收循环每轮入口记gap。gap 大 = 上一轮在循环内
+    // 忙别的（或没被唤醒）；配合 ws_frame_to_loop 可区分「没取」与「取了没处理」。
+    let mut last_iter_at = std::time::Instant::now();
     loop {
+        let iter_gap_ms = last_iter_at.elapsed().as_millis() as u64;
+        if iter_gap_ms >= 200 {
+            tracing::warn!(
+                target: "engine.latency",
+                stage = "receive_loop_gap",
+                gap_ms = iter_gap_ms,
+                "receive loop iteration gap"
+            );
+        }
+        last_iter_at = std::time::Instant::now();
         tokio::select! {
             _ = shutdown.changed() => return StreamOutcome::Connected,
             _ = async {
@@ -9530,6 +9589,7 @@ async fn serve_account_stream(
                     let manifest_service = Arc::clone(service);
                     let manifest_account = number.to_owned();
                     let manifest_join = tokio::task::spawn_local(async move {
+                        let manifest_started = std::time::Instant::now();
                         let outcome = tokio::time::timeout(
                             RECEIVE_JOB_TIMEOUT,
                             pull_storage_manifest(
@@ -9540,6 +9600,16 @@ async fn serve_account_stream(
                         )
                         .await
                         .ok();
+                        // 诊断面（2026-11-12）：登录期 manifest 拉取耗时。它与
+                        // 收流循环同在一个 LocalSet，重活在 await 之间会把循环
+                        // 按在原地——同步慢的嫌疑对象之一。
+                        tracing::warn!(
+                            target: "engine.latency",
+                            stage = "login_manifest_pull",
+                            ok = outcome.is_some(),
+                            elapsed_ms = manifest_started.elapsed().as_millis() as u64,
+                            "login manifest pull finished"
+                        );
                         if outcome.is_none() {
                             tracing::warn!(
                                 target: "engine.receive",
@@ -9607,6 +9677,13 @@ async fn serve_account_stream(
                                 ),
                             )
                             .await;
+                        // gate-trace 第 2 点：engine.initialSyncComplete 发射后一行。
+                        gate_trace(
+                            "initial-sync",
+                            &join_account,
+                            if manifest_ok && profiles_ok { "ok" } else { "fail" },
+                            &format!("manifestOk={manifest_ok} profilesOk={profiles_ok}"),
+                        );
                         // 启动预热批（send 性能批 2026-10-16，compat §5）：
                         // 刷新批之后同一沉降带一次发送路径预热（近活跃会话
                         // 目标收集 → 独立 Manager ensure_session，零真实
@@ -9812,9 +9889,19 @@ async fn serve_account_stream(
                     // 也恒产出、每流恰一次，vendored presage 无条件透传
                     // 不丢弃，武装必达）。
                     skew_gate.arm();
+                    let notify_started = std::time::Instant::now();
                     service
                         .notify(number, queue_emptied_notification(number))
                         .await;
+                    let notify_ms = notify_started.elapsed().as_millis() as u64;
+                    if notify_ms >= 200 {
+                        tracing::warn!(
+                            target: "engine.latency",
+                            stage = "queue_empty_notify",
+                            elapsed_ms = notify_ms,
+                            "queue-empty notification blocked"
+                        );
+                    }
                 }
                 // contacts 由 presage 自动入库（号码/名字面随之可用）。P15a
                 // 项3：解析后的联系人记录随 Received::Contacts 上抛（vendored
@@ -9835,6 +9922,13 @@ async fn serve_account_stream(
                         complete = sync.complete,
                         records = sync.contacts.len(),
                         "contact sync attachment received"
+                    );
+                    // gate-trace 第 3 点：contacts sync 信封到达（complete 面 + 记录数）。
+                    gate_trace(
+                        "contact-sync",
+                        number,
+                        if sync.complete { "ok" } else { "-" },
+                        &format!("complete={} records={}", sync.complete, sync.contacts.len()),
                     );
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTACTS, 1);
                     quick_seen += 1;
@@ -10023,27 +10117,49 @@ async fn serve_account_stream(
                             ),
                         )
                         .await;
-                    for notification in
-                        project_content(
+                    let project_started = std::time::Instant::now();
+                    let project_ms;
+                    let notify_ms;
+                    {
+                        let notifications = project_content(
                             number,
                             manager.store(),
                             &content,
                             &service.terminated_groups,
                             Some(service),
                         )
-                        .await
-                    {
-                        service.notify(number, notification).await;
+                        .await;
+                        project_ms = project_started.elapsed().as_millis() as u64;
+                        let notify_started = std::time::Instant::now();
+                        for notification in notifications {
+                            service.notify(number, notification).await;
+                        }
+                        notify_ms = notify_started.elapsed().as_millis() as u64;
                     }
+                    let flush_started = std::time::Instant::now();
                     // G1：ack 前等 flush 栅栏（同 Content 臂）。
                     if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
+                    }
+                    if project_ms >= 200 || notify_ms >= 200 || flush_started.elapsed().as_millis() >= 200 {
+                        tracing::warn!(
+                            target: "engine.latency",
+                            stage = "content_steps",
+                            project_ms,
+                            notify_ms,
+                            flush_ms = flush_started.elapsed().as_millis() as u64,
+                            "content arm step timings"
+                        );
                     }
                     quick_seen += 1;
                     record_receive_envelope(number, envelope_started);
                     ack.ack();
                 }
                 Some(Received::Content(content, ack)) => {
+                    // 诊断面（2026-11-12）：单封信封在循环里的处理耗时。
+                    // 与 ws_frame_to_loop 的排队耗时相加即为「帧到 → 已处理」
+                    // 的全链；用于把同步慢的 20 秒归因到具体分段。
+                    let handled_started = std::time::Instant::now();
                     {
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -10160,6 +10276,12 @@ async fn serve_account_stream(
                     }
                     quick_seen += 1;
                     record_receive_envelope(number, envelope_started);
+                    tracing::warn!(
+                        target: "engine.latency",
+                        stage = "envelope_handled",
+                        elapsed_ms = handled_started.elapsed().as_millis() as u64,
+                        "envelope handled"
+                    );
                     ack.ack();
                 }
                     None => {

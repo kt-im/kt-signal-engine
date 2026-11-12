@@ -615,6 +615,25 @@ async fn amain() -> ExitCode {
         .run_until(async {
             let service =
                 service::Service::new(args.data_dir, Arc::clone(&state), Arc::clone(&outbound));
+            // 诊断面（2026-11-12）：单线程 LocalSet 被阻塞活卡住时，接收流会
+            // 整段停摆。心跳只在「上一拍迟到 ≥2s」时落一行，不刷屏。
+            tokio::task::spawn_local(async move {
+                let mut last = std::time::Instant::now();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let now = std::time::Instant::now();
+                    let gap_ms = now.duration_since(last).as_millis() as u64;
+                    if gap_ms >= 2000 {
+                        tracing::warn!(
+                            target: "engine.health",
+                            stage = "local_set_stall",
+                            gap_ms,
+                            "local set was stalled"
+                        );
+                    }
+                    last = now;
+                }
+            });
             service.spawn_receive_pipelines().await;
 
             writer_exit = run_engine_input_loop(
