@@ -183,11 +183,15 @@ impl EngineState {
     pub(crate) fn add_account(&mut self, number: String, dir: Option<String>) -> io::Result<()> {
         self.accounts.retain(|existing| existing.number != number);
         self.accounts.push(AccountEntry {
-            number,
+            number: number.clone(),
             dir,
             post_registration_syncs_complete: false,
         });
-        self.persist()
+        self.persist()?;
+        // 阶段 1-1：新链路/同号重链开新同步窗口（旧窗口的落定面随注册表一起
+        // 作废——上一次链接的 done 不得冒充本次 gate），见 `sync_state` 模块头注。
+        crate::sync_state::note_account_linked(&number);
+        Ok(())
     }
 
     /// 摘除并返回被删条目（fake 账号 dir=None；真实账号由调用方清目录）。
@@ -199,6 +203,8 @@ impl EngineState {
             .map(|index| self.accounts.remove(index));
         if removed.is_some() {
             self.persist()?;
+            // 阶段 1-1：窗口簿随注册表一起消失（解绑/删除后不再有可查的窗口）。
+            crate::sync_state::note_account_removed(account);
         }
         Ok(removed)
     }
@@ -222,6 +228,9 @@ impl EngineState {
             if !entry.post_registration_syncs_complete {
                 entry.post_registration_syncs_complete = true;
                 self.persist()?;
+                // 阶段 1-1：contacts 半边落定面（`contactSync.complete` 的
+                // 持久化钩子；首次落定优先，迟到重复不改写）。
+                crate::sync_state::note_contacts_complete(account);
             }
         }
         Ok(())

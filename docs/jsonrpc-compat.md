@@ -201,6 +201,7 @@ profile/群头像走 cdn_upload 自有字节帽，不在本闸。
 | 方法 | params（关键字段） | result | 错误 | 对齐状态 |
 |---|---|---|---|---|
 | `version` | `{}`（零参数，params 忽略——wire 宽容，generateInviteLinkPassword 同口径；账号无关，未绑定账号照常应答） | `{name, version, contractRevision}`（旧双键恒在：name = 引擎本名 `kt-signal-engine`、version = 引擎本仓版本——诚实自报不冒充上游名；libsignal 基线不在本面，`engine.protocolCapabilities.baseline` 所有，不自造字段。**2026-11-10 O1 握手引擎腿 additive【engine-compat】**：`contractRevision` = 引擎共享契约修订字符串，单源常量 `src/contract.rs::CONTRACT_REVISION`（当前 `1.285`），与 `engine.protocolCapabilities.contractRevision` 同值；connector `src/engine_contract.rs` O1 握手以闭区间 `1.200-1.285` 数字比较，本面是 capabilities 权威面的回退面） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-14 real（白名单补齐批，wire additive，engine-compat）**：上游 signal-cli JSON-RPC 元方法——connector `runtime.doctor`（§4.79）版本探针的引擎腿，doctor 以空参/只读车道/3s 诊断预算调用并把应答**原样透传**（verbatim，不 re-key 不归一，doctor-contract.md 钉定）；缺该方法的引擎被 doctor 按「上游错误类」降级（`present:false` + 固定理由文案「an engine that does not carry it surfaces the upstream class」冒上桌面——真机验收发现的根因面）；读面不落调度日志零 stderr；fake：同码路真实答。**2026-11-10 O1 握手引擎腿（wire additive【engine-compat】）**：新增 `contractRevision`（单源常量 1.285，与 `engine.protocolCapabilities` 同值），旧 `{name, version}` 双键零变化，见 §5 O1 块 |
+| `getSyncState` | `{account}`（未注册/已摘除账号 `-32603`；params 其余键忽略，读面惯例） | `{contacts, storage, profile, sinceMs}`（三半边相位词表封闭 `idle`/`inflight`/`done`/`failed`；`sinceMs` = 当前窗口开窗时刻 epoch ms——消费方的新鲜度锚，窗口开在调用方自己的 gate 之前即视为陈旧面） | 未注册/已摘除账号 `-32603`；其余无业务错误面（纯读，不触网） | **2026-11-12 real（阶段 1-1，SIGNAL-STAGE1-DESIGN §二 P-B-3，wire additive【engine-compat】，§5 块）**：收件箱 gate 的「拉」兜底查询——登录窗 sync 臂内部簿记的只读投影，零新状态机（无定时器/无重试/无决策）。数据源：注册表窗口簿（`add_account`/`remove_account`/启动装载）+ contacts 半边的 `post_registration_syncs_complete`（`contactSync.complete` 持久化位）+ storage 半边的 `engine.storagePull`（`trigger=login`，T-9b 结果事件两腿 join 面）与 `engine.initialSyncComplete.manifestOk`（登录拉被 30s 上限掐断时的兜底面）+ profile 半边的 `initialSyncComplete.profilesOk`。观测点唯一在 `service::outbound`（通知出口），只解析两个低频事件。相位语义：`inflight` = 窗口在飞且该半边未落定（窗口 TTL 120s 内）；`done`/`failed` = 观测到的首次落定面（迟到重复不改写）；`idle` = 无窗口或窗口已过 TTL 仍未落定（一次性窗已过，不发明 failed）；contacts 半边无 `failed` 面（三请求上行 best-effort，进程内无可观测失败事件，如实缺席）。**纯读幂等**：查询不建簿不改簿，重复调用逐字节一致（验收项）。fake：恒 `{idle,idle,idle}`（无真实同步臂，不伪装在飞） |
 | `startLink` | `{}` | `{deviceLinkUri, linkAttemptId, slots}`（`deviceLinkUri` = 第 0 槽，旧端逐字兼容；`linkAttemptId`（attempt 键）与 `slots: [{deviceLinkUri, slot}]`（live 槽表，slot 号 = 下标）是 2026-11-11 双槽轮换 additive 键。real：官方 `sgnl://linkdevice?uuid=…&pub_key=…` + **单个** `capabilities=nopni,nopni2,backup5` 参数，`qr_link_url` 收敛面） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩。**2026-10-15 real（转移弹窗修复批，engine-compat）**：capabilities 收敛为单参数并保证 `backup5` 在位——此前 `link_uri`（nopni,nopni2）+ `append_pair`（backup5）产出两个同名参数，Android 扫码侧 `Uri.getQueryParameter`（单数）只取第一个，`backup5` 被吞 → 手机判 VALID_WITHOUT_SYNC：链接成功但不弹「转移聊天记录」、不上传迁移档案；**2026-11-11 real（双槽 QR 轮换引擎腿，wire additive【engine-compat】，§5 块）**：新增 `linkAttemptId`/`slots` 两键，第 0 槽仍由顶层 `deviceLinkUri` 表达——没有 rotate 的调用方行为零变化（单槽语义原样），新 startLink 仍作废上一个 attempt（旧 attempt 的全部槽按未注册回收、在飞 finish 回 LINK_LOST） |
 | `rotateLink` | `{linkAttemptId}`（attempt 键，来自本 attempt 的 startLink 应答；缺席/非字符串 fail-closed 到同一码位） | `{deviceLinkUri, slot, slots}`（新槽 uri + 槽号 + 该 attempt 当前 live 槽全表；槽号 = live 槽表下标，收回后重排，调用方按 `slots` 全量重渲染） | `-1` `LINK_ATTEMPT_NOT_FOUND`（attempt 不存在/已被新 startLink 顶掉/已随提交收口）；其余折叠 `-32603` | **2026-11-11 real（双槽 QR 轮换引擎腿，wire additive【engine-compat】，§5 块）**：为同一 attempt 铸新 provisioning 会话（复用 startLink 的单槽铸造路径 `mint_link_slot`）；live 槽上限 2，第 3 个槽进 = 最旧槽退（abort 其 flow、按未注册回收、落 LINK_LOST 墓碑）；要退的槽上有在飞 finish 时不 abort（只置退休旗，收口延后到它归零）——轮换绝不丢掉用户正在确认的那次提交 |
 | `finishLink` | `{deviceLinkUri, deviceName}` | `{number, aci?}`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批） | `-1` `Unknown device link uri.`；`-1` `LINK_LOST`（B1/issue #951：URL 交付后 provisioning WS 关闭/超时/流结束 = 会话已死，确定性失败，不是 -32603） | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩。**2026-11-11 real（B1 链接会话 lost 批，wire additive【engine-compat】，§5 块）**：link_flow 在 URL 交付后 provisioning 会话终局（WS 关闭/keepalive 超时/流结束）归类 LinkError::Lost，注册数据落库/重载失败仍 Internal；每个 link 用独立 `uri→PendingRecord{state,result,committed}`，finishLink 只等自己的记录，只有真正执行过 add_account 的记录才回 Ok，被新 start 顶掉的旧 finish 回 LINK_LOST/UnknownUri；新 start 以 supersede 代次复核后登记 pending，锁外 abort 旧 flow（JoinHandle + state 收口），旧未提交 store 回收 |
@@ -7202,3 +7203,64 @@ announcements/terminated、收件人解析、profileSharing 白名单）仅 real
   （保证幂等，崩溃残留不重放、不重复追加），再按 `params.account` 归属追加到
   分文件；不可归属的行丢弃并 warn。
 - 权限：Unix 下文件 0600、目录 0700（每次写入校正；盐文件 0600）。
+
+## 阶段 1-1：`getSyncState` 登录窗同步投影（2026-11-12，wire additive【engine-compat】）
+
+**动机**（`SIGNAL-STAGE1-DESIGN.md` §二 P-B-3「gate 改拉」）：桌面收件箱 gate 目前
+只靠事件路径（`engine.storagePull` / `engine.initialSyncComplete`）。四跳管道任何一处
+丢帧，gate 就只能等 2min 半边超时。本方法把「sync 臂已经跟踪的三件套状态」变成
+**可拉取、幂等、账号域**的只读查询：gate 每 5s 拉一次（上限 24 次 = 120s），看到某半边
+`done` 即 poll-settled 放行；事件路径不变，仍是快路径。
+
+**wire 形状**（method `getSyncState`，params `{account}`）：
+
+```jsonc
+{ "contacts": "idle|inflight|done|failed",
+  "storage":  "idle|inflight|done|failed",
+  "profile":  "idle|inflight|done|failed",
+  "sinceMs":  1760000000000 }
+```
+
+- 四键恒在（no-null：相位词恒是四词之一，`sinceMs` 恒是整数）。
+- `sinceMs` = 当前窗口的开窗时刻（epoch ms）——消费方的新鲜度锚：窗口开在调用方
+  自己的 gate/激活之前 = 上一次链接/启动留下的旧面，应按陈旧处理而不是当作落定。
+- 未登记/已摘除账号 `-32603`（读面惯例折叠）。其余无业务错误面：查询不触网、
+  不落调度日志、零 stderr。
+
+**数据源（零新状态机：只观测引擎已经在跟踪的簿记）**：
+
+| 半边 | 权威簿记 | 观测/落定面 |
+|---|---|---|
+| 窗口起算 | 注册表（`EngineState`） | `add_account` = 新链路/同号重链开窗；`remove_account` = 窗口作废；启动装载时 `post_registration_syncs_complete == false` 的账号 = 首流窗口（收流臂 `initial_sync_due(None)` 同门，一定会安排这一窗）；已完成的账号启动不再跑本窗，如实 `idle` |
+| contacts | `post_registration_syncs_complete`（`contactSync` `complete` 到达时收流臂落盘） | state 层落盘钩子 `note_contacts_complete`（首次落定优先）。没有 `failed` 面：三请求上行 best-effort（失败只 warn、下次链路重补），进程内无可观测失败事件 |
+| storage | `engine.storagePull`（`trigger=login`，T-9b 结果事件的两腿 join 布尔）+ `engine.initialSyncComplete.manifestOk` | 通知出口观测；`initialSyncComplete` 的 `manifestOk` 兜底「登录拉被 30s 上限掐断、没有 storagePull 事件」的窗口 |
+| profile | `engine.initialSyncComplete.profilesOk`（首轮 profile 刷新腿 join 结论） | 通知出口观测 |
+
+**观测点唯一**：`service::outbound::OutboundHub::notify`（全部通知的唯一出口）。
+只解析 `engine.storagePull` 与 `engine.initialSyncComplete` 两个低频事件；逐消息的
+`receive` 通知只比一次方法名，不做深解析。观测在入队背压之前落簿——出口慢不会让
+状态滞后。
+
+**相位语义**：
+
+- `inflight`：窗口在飞且该半边尚未落定（窗口 TTL 120s 内：登录拉 30s 上限 + profile
+  10s 沉降之后仍无落定的半边不再报在飞）；
+- `done` / `failed`：观测到的**首次**落定面（迟到的相反结论不改写，重复事件幂等）；
+- `idle`：没有窗口，或窗口已过 TTL 仍未落定（一次性窗已过，不再假装在飞——不发明
+  `failed`；消费方自己的半边超时兜底）。
+
+**幂等**：`getSyncState` 是纯读——不建簿、不改簿、不触发拉取，重复调用逐字节一致。
+这是 P-B-3 轮询兜底的硬前提（轮询本身不得改变任何状态）。
+
+**fake 面**：`KT_ENGINE_FAKE_SERVICE=1` 没有真实同步臂，三半边恒 `idle`（`sinceMs` =
+进程启动时刻），不伪装在飞。
+
+**测试**：`src/sync_state.rs` 单测钉定——形状与幂等（同刻重复调用逐字节一致）、
+首发落定优先、非 `login` 触发不落 storage 半边、TTL 后 `inflight`→`idle`、已完成
+注册读 `idle`+`contacts=done`、坏形状观测忽略；connector 侧
+`accounts.getSyncState` 形状闸与 fake-engine 臂见 connector
+`docs/implementation-plan.md` §4.281。
+
+**门禁**：`cargo fmt` / `cargo clippy --all-targets -- -D warnings` / `cargo test` /
+release build；connector 侧 `cargo fmt` / `cargo clippy --all-targets -- -D warnings` /
+`cargo test`（含 `tests/sync_state.rs` 与 `tests/schema_consistency.rs`）。

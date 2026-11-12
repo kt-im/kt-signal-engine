@@ -4753,6 +4753,25 @@ async fn dispatch(
         // 稳定性批（2026-10-20，A1）additive：追加 `accounts`（逐账号接收
         // 在飞/分位延迟/建流结局/崩溃）与 `outbound`（全局 + 逐账号在途）。
         "engine.perfMetrics" => jsonrpc::success_response(id, service.perf_metrics_snapshot()),
+        // getSyncState（阶段 1-1，SIGNAL-STAGE1-DESIGN §二 P-B-3；compat §3 行 +
+        // §5 块）：只读查询面——登录窗 sync 臂三件套的当前投影
+        // `{contacts, storage, profile, sinceMs}`（词表 idle|inflight|done|failed；
+        // sinceMs = 当前窗口开窗时刻，供消费方判新鲜度）。纯读：不触网、不落
+        // 调度日志、不建簿，重复调用逐字节一致（幂等验收）。数据源见
+        // `sync_state` 模块头注（注册表窗口簿 + storagePull 登录拉结果事件 +
+        // initialSyncComplete 两腿 join 面 + contacts 持久化完成位）。未登记/
+        // 已摘除账号 -32603（读面惯例折叠）；fake 模式无真实同步臂，恒答
+        // idle（fake 面 = 进程真实态，不伪装在飞）。
+        "getSyncState" => {
+            let account = params
+                .get("account")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match crate::sync_state::snapshot(account) {
+                Some(face) => jsonrpc::success_response(id, face),
+                None => internal_error(id),
+            }
+        }
         // engine.deviceCapabilities（D5 设备面能力注册）：PUT
         // /v1/devices/capabilities（官方 registerCapabilities 同端点）并回
         // 读上传面。触网方法（fake 恒已注册，getUserStatus 同款）；仅 401

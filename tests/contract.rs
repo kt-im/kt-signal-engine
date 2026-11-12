@@ -1258,6 +1258,69 @@ fn devices_fake_shapes_and_param_fail_closed() {
     assert_eq!(code, -32603, "unknown account folds to internal error");
 }
 
+/// getSyncState 契约面（阶段 1-1，SIGNAL-STAGE1-DESIGN §二 P-B-3）：fake
+/// 模式无真实同步臂，三半边恒 idle + sinceMs 整数；查询纯读幂等（重复调用
+/// 逐字节一致）；未登记账号/缺参/坏参折 -32603；删号后窗口簿随注册表消失。
+#[test]
+fn sync_state_fake_shape_and_idempotency() {
+    let dir = temp_dir("sync-state-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // 未登记账号 / 缺 account / 非字符串 account：读面惯例折叠 -32603
+    // （不建簿、不发明窗口）。
+    let (code, _) = engine.error_of("getSyncState", json!({ "account": "+15550009999" }));
+    assert_eq!(code, -32603, "unknown account folds to internal error");
+    let (code, _) = engine.error_of("getSyncState", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("getSyncState", json!({ "account": 7 }));
+    assert_eq!(code, -32603);
+
+    // fake 链接一个账号 → 注册表写入、窗口簿随之开窗；fake 面没有真实
+    // 同步臂，三半边如实 idle（不伪装在飞）。
+    let started = engine.request("startLink", json!({}));
+    let uri = started["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("deviceLinkUri string")
+        .to_owned();
+    let finished = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    );
+    let number = finished["result"]["number"]
+        .as_str()
+        .expect("number string")
+        .to_owned();
+    let account = number.clone();
+
+    let first = engine.request("getSyncState", json!({ "account": account }))["result"].clone();
+    assert_eq!(
+        first,
+        json!({
+            "contacts": "idle",
+            "storage": "idle",
+            "profile": "idle",
+            "sinceMs": first["sinceMs"],
+        }),
+        "fake 面恒 idle，四键恒在（{first}）"
+    );
+    assert!(
+        first["sinceMs"].as_u64().is_some(),
+        "sinceMs 必须是整数：{first}"
+    );
+
+    // 幂等：重复调用逐字节一致（纯读，不建簿不改簿）。
+    let second = engine.request("getSyncState", json!({ "account": account }))["result"].clone();
+    assert_eq!(first, second, "getSyncState is a pure snapshot");
+
+    // 删号后窗口簿随注册表一起消失：不再可查（-32603）。
+    assert_eq!(
+        engine.request("deleteLocalAccountData", json!({ "account": number }))["result"],
+        json!({})
+    );
+    let (code, _) = engine.error_of("getSyncState", json!({ "account": account }));
+    assert_eq!(code, -32603, "the window book leaves with the registry row");
+}
+
 /// 贴纸包安装状态同步（P5 扩面，Storage Service 真相源）：fake 模式空列表
 /// 成功面 + 参数面 fail-closed 逐形状（-32603，结构化码只覆盖 storage 链路，
 /// 参数错误不占用；uninstall 忽略 packKey 内容与 position）。

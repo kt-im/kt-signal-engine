@@ -76,6 +76,9 @@ mod store_migrate;
 /// M6 C 阶段：store 文件状态分类 + 打开失败的结构化错误码（connector 可区分
 /// 的固定码面；同一份设计文档 §3.4 决策表 / §7 C 阶段）。
 mod store_open;
+/// 阶段 1-1：`getSyncState` 只读投影簿（SIGNAL-STAGE1-DESIGN §二 P-B-3；
+/// 观测点唯一在 `service::outbound` 的通知出口，查询是纯读）。
+mod sync_state;
 
 // Android 本地备份导出面（engine-compat 备份批）：内部 Rust API，装配链由
 // 消费批任务层（service::backup_task，契约 §10.3/§10.4）接线。
@@ -535,6 +538,9 @@ async fn amain() -> ExitCode {
         Ok(state) => state,
         Err(_) => return ExitCode::from(1),
     };
+    // 阶段 1-1：注册表即同步窗口簿的初始快照（compat §5 `getSyncState` 块）——
+    // 必须在任何收流管线启动之前装载，且只读注册表，不落盘。
+    sync_state::init(&state);
     // S5 单账号护栏：注册表 >1 账号 = 该 data-dir 属于多账号进程，池槽
     // 误指会破坏「一账号一进程」的隔离前提，fail closed（P0-B 的清扫逻辑
     // 不参与：这里在清扫之前退出，不动任何账号目录）。
