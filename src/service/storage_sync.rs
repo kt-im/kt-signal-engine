@@ -366,7 +366,7 @@ pub(crate) fn account_item_key_of(manifest: &ManifestRecord) -> Option<Vec<u8>> 
 /// 写面记录类别（manifest identifier type：Account=4、StickerPack=6、
 /// Contact=1、GroupV1=2、GroupV2=3、StoryDistributionList=5、CallLink=7、
 /// ChatFolder=8、NotificationProfile=9）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum StorageRecordKind {
     Account,
     StickerPack,

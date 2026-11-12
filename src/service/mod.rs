@@ -93,6 +93,9 @@ pub(crate) mod stickers;
 pub(crate) mod storage_call_link;
 pub(crate) mod storage_merge;
 pub(crate) mod storage_records;
+/// BUG-6 收尾：storage 记录按账号缓存（sticker/folders/pinned 三类读面的
+/// 网络税消除；失效只认 storage-pull-settled + 60s TTL 下限，见模块头）。
+pub(crate) mod storage_records_cache;
 pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
 /// F 链路入站观测面（模块头注载语义/帽/取舍纪律）：Storage 合并驱动的会话
@@ -2469,6 +2472,10 @@ async fn pull_storage_manifest(
     }
     let contacts_ok = contacts.is_ok();
     let groups_ok = groups.is_ok();
+    // BUG-6 收尾（用户护栏 2）：manifest 拉取落定 = 贴纸包/聊天文件夹/置顶
+    // 记录缓存的唯一事件失效点（云上记录可能已被其他设备改写）；下一轮
+    // storage.* 读懒回源，不主动预取、不在事件里刷新。
+    service.storage_contexts.invalidate_records(account).await;
     service
         .notify(
             account,
@@ -7054,7 +7061,12 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_sync::read_pinned(&context).await
+        // BUG-6 收尾：按账号记录缓存（60s TTL 下限 + storage-pull-settled
+        // 失效；写穿见 setConversationPinned）。
+        context
+            .records
+            .pinned(now_ms(), || storage_sync::read_pinned(&context))
+            .await
     }
 
     /// getBlockedConversations（P5 扩面 + 窗D B7 blockedAt 透出）：读
@@ -7179,7 +7191,13 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_sync::write_pinned(&context, conversation, pinned).await
+        let result = storage_sync::write_pinned(&context, conversation, pinned).await;
+        // 写穿：返回的是写后全量投影 = 云端真相，直接更新缓存槽
+        //（不是主动回源）。
+        if let Ok(entries) = result.as_ref() {
+            context.records.store_pinned(now_ms(), entries.clone());
+        }
+        result
     }
 
     /// setConversationBlocked（拉黑写面）：官方写语义（读改写目标会话
@@ -7263,7 +7281,10 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_sticker::read_sticker_packs(&context).await
+        context
+            .records
+            .sticker_packs(now_ms(), || storage_sticker::read_sticker_packs(&context))
+            .await
     }
 
     /// setStickerPackSync（P5 扩面）：安装/卸载写面（官方 toStickerPackRecord
@@ -7277,7 +7298,12 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_sticker::write_sticker_pack(&context, &intent, now_ms()).await
+        let now = now_ms();
+        let result = storage_sticker::write_sticker_pack(&context, &intent, now).await;
+        if let Ok(packs) = result.as_ref() {
+            context.records.store_sticker_packs(now, packs.clone());
+        }
+        result
     }
 
     /// storage.getCallLinks（窗D A6）：读全部 call link 投影（存储序 =
@@ -7396,7 +7422,19 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::read_records(&context, storage_sync::StorageRecordKind::ChatFolder).await
+        context
+            .records
+            .records(
+                storage_sync::StorageRecordKind::ChatFolder,
+                now_ms(),
+                || {
+                    storage_records::read_records(
+                        &context,
+                        storage_sync::StorageRecordKind::ChatFolder,
+                    )
+                },
+            )
+            .await
     }
 
     /// chatFolders.setRecords（Storage 跨设备同步批）：官方 upload 语义
@@ -7412,13 +7450,22 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::write_records(
+        let now = now_ms();
+        let result = storage_records::write_records(
             &context,
             storage_sync::StorageRecordKind::ChatFolder,
             records,
             remove_ids,
         )
-        .await
+        .await;
+        if let Ok(values) = result.as_ref() {
+            context.records.store_records(
+                storage_sync::StorageRecordKind::ChatFolder,
+                now,
+                values.clone(),
+            );
+        }
+        result
     }
 
     /// notificationProfiles.list（Storage 跨设备同步批）：同 chatFolders
@@ -7431,11 +7478,19 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::read_records(
-            &context,
-            storage_sync::StorageRecordKind::NotificationProfile,
-        )
-        .await
+        context
+            .records
+            .records(
+                storage_sync::StorageRecordKind::NotificationProfile,
+                now_ms(),
+                || {
+                    storage_records::read_records(
+                        &context,
+                        storage_sync::StorageRecordKind::NotificationProfile,
+                    )
+                },
+            )
+            .await
     }
 
     /// notificationProfiles.setRecords（Storage 跨设备同步批）：同
@@ -7450,13 +7505,22 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::write_records(
+        let now = now_ms();
+        let result = storage_records::write_records(
             &context,
             storage_sync::StorageRecordKind::NotificationProfile,
             records,
             remove_ids,
         )
-        .await
+        .await;
+        if let Ok(values) = result.as_ref() {
+            context.records.store_records(
+                storage_sync::StorageRecordKind::NotificationProfile,
+                now,
+                values.clone(),
+            );
+        }
+        result
     }
 
     /// storyDistributionLists.list（Stories 跨设备名单同步批）：同
@@ -7469,11 +7533,19 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::read_records(
-            &context,
-            storage_sync::StorageRecordKind::StoryDistributionList,
-        )
-        .await
+        context
+            .records
+            .records(
+                storage_sync::StorageRecordKind::StoryDistributionList,
+                now_ms(),
+                || {
+                    storage_records::read_records(
+                        &context,
+                        storage_sync::StorageRecordKind::StoryDistributionList,
+                    )
+                },
+            )
+            .await
     }
 
     /// storyDistributionLists.setRecords（Stories 跨设备名单同步批）：同
@@ -7488,13 +7560,22 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::write_records(
+        let now = now_ms();
+        let result = storage_records::write_records(
             &context,
             storage_sync::StorageRecordKind::StoryDistributionList,
             records,
             remove_ids,
         )
-        .await
+        .await;
+        if let Ok(values) = result.as_ref() {
+            context.records.store_records(
+                storage_sync::StorageRecordKind::StoryDistributionList,
+                now,
+                values.clone(),
+            );
+        }
+        result
     }
 
     /// setAccountConfiguration（P5 扩面，官方 updateConfiguration 等价）：
@@ -8101,6 +8182,9 @@ pub(crate) struct StorageContext {
     /// 本机 ACI/PNI（UUID；群凭据 present 面，groups 模块消费，不入日志）。
     pub(crate) aci_uuid: presage::libsignal_service::prelude::Uuid,
     pub(crate) pni_uuid: presage::libsignal_service::prelude::Uuid,
+    /// BUG-6 收尾：storage 记录按账号缓存（sticker/folders/pinned 读面），
+    /// 与上下文同生命周期——解绑/换号/删库即随条目丢弃。
+    pub(crate) records: Arc<storage_records_cache::StorageRecordsCache>,
     /// 群凭据双族缓存句柄（Service 共享，进程内存不落盘；P4c 切一）。
     pub(crate) group_credentials: Arc<call_links::GroupCredentialCache>,
     /// 所属 Service 弱句柄 + 账号名（群态成员 profileKey 新落 → profile
@@ -8137,6 +8221,8 @@ pub(crate) struct StorageContextCache {
 struct CachedStorageContext {
     account_dir: PathBuf,
     cell: Arc<OnceCell<Arc<StorageContext>>>,
+    /// storage 记录缓存（与 cell 同条目：换目录/解绑时随整条一起丢弃）。
+    records: Arc<storage_records_cache::StorageRecordsCache>,
 }
 
 impl StorageContextCache {
@@ -8152,22 +8238,39 @@ impl StorageContextCache {
         &self,
         account: &str,
         account_dir: &Path,
-    ) -> Arc<OnceCell<Arc<StorageContext>>> {
+    ) -> (
+        Arc<OnceCell<Arc<StorageContext>>>,
+        Arc<storage_records_cache::StorageRecordsCache>,
+    ) {
         let mut cells = self.cells.lock().await;
         if let Some(cached) = cells.get(account) {
             if cached.account_dir.as_path() == account_dir {
-                return Arc::clone(&cached.cell);
+                return (Arc::clone(&cached.cell), Arc::clone(&cached.records));
             }
         }
         let cell = Arc::new(OnceCell::new());
+        let records = Arc::new(storage_records_cache::StorageRecordsCache::new());
         cells.insert(
             account.to_owned(),
             CachedStorageContext {
                 account_dir: account_dir.to_path_buf(),
                 cell: Arc::clone(&cell),
+                records: Arc::clone(&records),
             },
         );
-        cell
+        (cell, records)
+    }
+
+    /// 「storage-pull-settled」失效：manifest 两腿落定后清该账号记录缓存
+    /// （只清已存在的条目，不为未注册/未建上下文的账号建条目）。
+    async fn invalidate_records(&self, account: &str) {
+        let records = {
+            let cells = self.cells.lock().await;
+            cells.get(account).map(|cached| Arc::clone(&cached.records))
+        };
+        if let Some(records) = records {
+            records.invalidate();
+        }
     }
 
     /// 摘除并关闭账号上下文（解绑/注销/同号重链）：map 持有一份 Arc，摘除
@@ -8221,6 +8324,7 @@ async fn build_storage_context(
     service: &Arc<Service>,
     account: &str,
     account_dir: PathBuf,
+    records: Arc<storage_records_cache::StorageRecordsCache>,
 ) -> Result<StorageContext, storage_sync::StorageSyncError> {
     let store = open_store(&account_dir)
         .await
@@ -8237,6 +8341,7 @@ async fn build_storage_context(
         push,
         device_id: data.device_id.unwrap_or(1),
         account_dir,
+        records,
         aci_uuid: data.service_ids.aci,
         pni_uuid: data.service_ids.pni,
         group_credentials: service.group_credentials.clone(),
@@ -8261,7 +8366,7 @@ async fn storage_context(
             .ok_or(storage_sync::StorageSyncError::UnknownAccount)?;
         service.data_dir.join(rel)
     };
-    let cell = service
+    let (cell, records) = service
         .storage_contexts
         .cell_for(account, &account_dir)
         .await;
@@ -8270,7 +8375,7 @@ async fn storage_context(
             // 只有真正执行开库的那一个调用 +1；并发等在同一 cell 上的调用
             // 由 OnceCell 唤醒后直接拿结果，不重复计数。
             service.storage_contexts.note_open();
-            build_storage_context(service, account, account_dir)
+            build_storage_context(service, account, account_dir, records)
                 .await
                 .map(Arc::new)
         })
@@ -30788,6 +30893,271 @@ mod tests {
             1,
             "同号仍只一条"
         );
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// BUG-6 收尾（用户验收）：缓存命中后 sticker/folders/pinned 三连查
+    /// 全部为进程内 clone——warm p95 < 50ms（真机 before 见台账：
+    /// 贴纸 1307~3627ms / 文件夹 1439~3249ms / 置顶 1416~2888ms）。
+    /// 通过写穿/种子投影构造「已 warm」状态，逐次量三条 RPC 的耗时。
+    #[tokio::test]
+    async fn storage_record_cache_warm_three_queries_p95_under_50ms() {
+        fn percentile(samples: &[Duration], percent: usize) -> Duration {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            sorted[(sorted.len() * percent / 100).min(sorted.len() - 1)]
+        }
+        fn p95(samples: &[Duration]) -> Duration {
+            percentile(samples, 95)
+        }
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-record-cache-p95-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006041";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-record-p95",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(
+                account.to_owned(),
+                Some("accounts/bug6-record-p95".to_owned()),
+            )
+            .expect("add account");
+
+        // warm 前置：写穿/水合面已把三条投影落进账号缓存（生产由首轮读或
+        // 写面完成；测试直接种子，避免网络面）。
+        let context = storage_context(&service, account).await.expect("context");
+        let seeded_at = now_ms();
+        context.records.store_pinned(
+            seeded_at,
+            vec![storage_sync::PinnedEntry {
+                id: None,
+                raw: Default::default(),
+            }],
+        );
+        context.records.store_records(
+            storage_sync::StorageRecordKind::ChatFolder,
+            seeded_at,
+            vec![serde_json::json!({ "id": "folder-1", "name": "工作" })],
+        );
+        context.records.store_sticker_packs(
+            seeded_at,
+            vec![storage_sticker::StickerPackSync {
+                pack_id: vec![0xab; 16],
+                pack_key: Some(vec![0xcd; 32]),
+                position: Some(1),
+                deleted_at_timestamp_ms: None,
+            }],
+        );
+        assert_eq!(context.records.cached_slots(), 3);
+
+        const ROUNDS: usize = 200;
+        let mut sticker = Vec::with_capacity(ROUNDS);
+        let mut folders = Vec::with_capacity(ROUNDS);
+        let mut pinned = Vec::with_capacity(ROUNDS);
+        let mut three = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            let started = Instant::now();
+            let started_sticker = Instant::now();
+            let packs = service.sticker_pack_syncs(account).await.expect("packs");
+            sticker.push(started_sticker.elapsed());
+            assert_eq!(packs.len(), 1);
+            let started_folders = Instant::now();
+            let folder_rows = service.chat_folders(account).await.expect("folders");
+            folders.push(started_folders.elapsed());
+            assert_eq!(folder_rows.len(), 1);
+            let started_pinned = Instant::now();
+            let pinned_rows = service.pinned_conversations(account).await.expect("pinned");
+            pinned.push(started_pinned.elapsed());
+            assert_eq!(pinned_rows.len(), 1);
+            three.push(started.elapsed());
+        }
+
+        let limit = Duration::from_millis(50);
+        // BUG-6 台账取证：warm 三连查分位（--nocapture 时可见）。
+        println!(
+            "BUG-6 warm p50/p95: sticker {:?}/{:?}, folders {:?}/{:?}, pinned {:?}/{:?}, three-query {:?}/{:?}",
+            percentile(&sticker, 50),
+            p95(&sticker),
+            percentile(&folders, 50),
+            p95(&folders),
+            percentile(&pinned, 50),
+            p95(&pinned),
+            percentile(&three, 50),
+            p95(&three)
+        );
+        assert!(
+            p95(&sticker) < limit,
+            "getStickerPackSyncs warm p95 {:?}",
+            p95(&sticker)
+        );
+        assert!(
+            p95(&folders) < limit,
+            "chatFolders.list warm p95 {:?}",
+            p95(&folders)
+        );
+        assert!(
+            p95(&pinned) < limit,
+            "getPinnedConversations warm p95 {:?}",
+            p95(&pinned)
+        );
+        assert_eq!(context.records.fills(), 0, "warm 三连查全部命中，不得回源");
+        assert_eq!(
+            context.records.hits(),
+            (ROUNDS * 3) as u64,
+            "每轮三条查询各命中一次"
+        );
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// BUG-6 收尾（用户护栏 2）：storage-pull-settled 是记录缓存的唯一事件
+    /// 失效点——manifest 拉取落定调用的 invalidate_records 必须清空贴纸/
+    /// 文件夹/置顶三槽（下一轮读懒回源，不在事件里主动预取）。
+    #[tokio::test]
+    async fn storage_pull_settled_invalidates_storage_record_cache() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-record-cache-pull-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006051";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-record-pull",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(
+                account.to_owned(),
+                Some("accounts/bug6-record-pull".to_owned()),
+            )
+            .expect("add account");
+
+        let context = storage_context(&service, account).await.expect("context");
+        let at = now_ms();
+        context.records.store_pinned(
+            at,
+            vec![storage_sync::PinnedEntry {
+                id: None,
+                raw: Default::default(),
+            }],
+        );
+        context.records.store_records(
+            storage_sync::StorageRecordKind::ChatFolder,
+            at,
+            vec![serde_json::json!({ "id": "folder-1" })],
+        );
+        context.records.store_sticker_packs(
+            at,
+            vec![storage_sticker::StickerPackSync {
+                pack_id: vec![0xab; 16],
+                pack_key: Some(vec![0xcd; 32]),
+                position: Some(1),
+                deleted_at_timestamp_ms: None,
+            }],
+        );
+        assert_eq!(context.records.cached_slots(), 3);
+
+        // pull_storage_manifest 落定路径调用同一入口（此处直接调用以避开
+        // 网络面；生产单点在 pull_storage_manifest 内）。
+        service.storage_contexts.invalidate_records(account).await;
+        assert_eq!(
+            context.records.cached_slots(),
+            0,
+            "storage-pull-settled 必须清空贴纸/文件夹/置顶三槽"
+        );
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// BUG-6 收尾（用户护栏 1）：换号/同号重链 = 新 store 目录 → 新记录
+    /// 缓存（旧条目随旧上下文不可达）；同账号不同目录不得复用旧 A 的数据。
+    #[tokio::test]
+    async fn account_dir_change_evicts_storage_record_cache() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-record-cache-relink-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006061";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-rec-old",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-rec-old".to_owned()))
+            .expect("add account");
+        let old = storage_context(&service, account).await.expect("old");
+        old.records.store_sticker_packs(
+            now_ms(),
+            vec![storage_sticker::StickerPackSync {
+                pack_id: vec![0xaa; 16],
+                pack_key: Some(vec![0xbb; 32]),
+                position: Some(1),
+                deleted_at_timestamp_ms: None,
+            }],
+        );
+        assert_eq!(old.records.cached_slots(), 1);
+
+        // 同号重链：目录指纹变化 → 全新记录缓存（旧 A 的包列表不可达）。
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-rec-new",
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-rec-new".to_owned()))
+            .expect("relink account");
+        let new = storage_context(&service, account).await.expect("new");
+        assert_eq!(new.account_dir, data_dir.join("accounts/bug6-rec-new"));
+        assert_eq!(
+            new.records.cached_slots(),
+            0,
+            "换号/重链后不得复用旧账号的记录缓存"
+        );
+        assert_eq!(new.records.fills(), 0);
+
+        // 失效入口只作用于新上下文（旧 Arc 已不可达）。
+        service.storage_contexts.invalidate_records(account).await;
+        assert_eq!(new.records.cached_slots(), 0);
 
         drop(service);
         let _ = std::fs::remove_dir_all(&data_dir);
