@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,7 @@ use rand::rng;
 use rand::Rng;
 use reqwest::Method;
 use serde_json::{json, Value};
-use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify};
+use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify, OnceCell};
 
 use crate::state::{AccountEntry, EngineState, ACCOUNTS_DIR, QUARANTINE_DIR, QUARANTINE_LOG};
 use crate::store_cipher;
@@ -3026,6 +3026,10 @@ pub(crate) struct Service {
     /// `discard_incomplete_quarantine_stores` 全进程单飞——重复链接事件
     /// 幂等（后到者扫到已清空的区零通知），并发链接事件不双计。
     quarantine_discard: AsyncMutex<()>,
+    /// storage 面常驻上下文缓存（BUG-6）：账号 → 一次打开的 store + 凭据
+    /// PushService，进程生命周期复用（[`StorageContextCache`]）。条目对已
+    /// 注册账号惰性建立、解绑/同号重链摘除，上界 = 注册账号数。
+    storage_contexts: StorageContextCache,
     /// Account numbers whose receive stream was rejected with 401/403. This is
     /// the engine-owned terminal gate: send-family methods check it before any
     /// vendor sender path (including MRM) can run. Cleared by a fresh link.
@@ -3237,6 +3241,7 @@ impl Service {
             whitelist_refresh_inflight: StdMutex::new(HashSet::new()),
             own_capabilities_cache: own_capabilities::CapabilitiesCache::new(),
             quarantine_discard: AsyncMutex::new(()),
+            storage_contexts: StorageContextCache::new(),
             terminal_accounts: StdMutex::new(HashSet::new()),
         })
     }
@@ -4056,6 +4061,10 @@ impl Service {
         };
         *committed = Some(account.clone());
         drop(committed);
+        // BUG-6：同号重链 = 新 store 目录/新注册数据——旧常驻 storage 上下文
+        // （旧库句柄 + 旧 push 凭据/device_id）必须摘除，新链接的首个
+        // storage.* 调用按新目录重建。
+        self.storage_contexts.invalidate(&number).await;
         // 提交成功 = 本 attempt 收口：其余 live 槽立即收回（abort flow +
         // 未注册回收），attempt 从表里摘掉（rotateLink 此后答 NOT_FOUND）。
         // 等在这些槽结果上的在飞 finish 由 attempt 级提交位拿回同一账号。
@@ -4366,6 +4375,10 @@ impl Service {
         // 两腿），进度/终态快照同步清缺——账号没了终态无人消费，半成品随
         // 下面的目录删除一并消失。
         let _ = self.history_import_cancel(account).await;
+        // BUG-6：先摘常驻 storage 上下文（关掉缓存持有的 SQLite 连接池），
+        // 再做注册表摘除/删目录——缓存句柄不先摘，Windows 上
+        // remove_dir_all 会因库文件仍被打开而失败。
+        self.storage_contexts.invalidate(account).await;
         // 注册表摘除并取回目录（fake 账号 dir=None）。
         let removed_dir: Option<PathBuf> = {
             let mut state = self.state.lock().await;
@@ -4374,6 +4387,10 @@ impl Service {
                 .and_then(|entry| entry.dir.map(|rel| self.data_dir.join(rel)))
         };
         let had_dir = removed_dir.is_some();
+        // 摘注册表与首次摘缓存之间有 await 窗口：期间到达的 storage.* 调用
+        // 可能用旧目录重新建条目。删目录前再摘一次，确保缓存不指向死库
+        //（此后再调用 storage_context 会先因账号不在注册表答 UnknownAccount）。
+        self.storage_contexts.invalidate(account).await;
         // A4 收口顺序（官方 MessageReceiver.stopProcessing → drain 同语义，
         // `ts/textsecure/MessageReceiver.preload.ts:516-547`）：先停接收并等待
         // 任务退出（drop Manager → SQLite store 刷盘），再删 store 目录——
@@ -8071,6 +8088,11 @@ impl Service {
 
 /// storage 面共用上下文：已注册账号的 store + 手工构造凭据的 PushService
 /// + 账号 store 目录（service/mod.rs link_flow 凭据构造先例同构）。
+///
+/// BUG-6 起本结构是**每账号常驻**（[`StorageContextCache`] 持有、clone 取
+/// 用）：SqliteStore/PushService 内部都是 Arc 句柄，clone 共享同一连接池与
+/// 同一凭据面，不再逐 RPC 重开库/重读注册数据。
+#[derive(Clone)]
 pub(crate) struct StorageContext {
     pub(crate) store: SqliteStore,
     pub(crate) push: PushService,
@@ -8086,6 +8108,88 @@ pub(crate) struct StorageContext {
     /// 生命周期）。
     pub(crate) service: Weak<Service>,
     pub(crate) account: String,
+}
+
+/// 账号级 storage 上下文缓存（BUG-6：消除 `storage.*` 逐 RPC 开库税）。
+///
+/// **结构**：账号 → 目录指纹 + `OnceCell<Arc<StorageContext>>`。首次
+/// `storage.*` 调用建库/读注册数据，之后 clone 复用进程生命周期；同号重链
+/// 换新目录时目录指纹不符，旧 cell 被替换（旧 store 句柄随最后一个 clone
+/// 释放关闭）。账号解绑/注销由 `delete_account` 显式摘除。
+///
+/// **并发**：`cells` 是 `tokio::sync::Mutex`，只在取/换 cell 的短临界区持有，
+/// **绝不持锁跨 await**；真正的开库单飞由每账号 `OnceCell` 的
+/// `get_or_try_init` 承担（同时到达的调用只有一个执行开库，其余等结果）。
+/// 因此锁序恒为「cells → OnceCell」，不存在重入路径：开库闭包本身不回调
+/// 本缓存。
+///
+/// **上界**：条目只为已注册账号惰性建立，删除/重链即摘除，故上界 = 账号
+/// 数（无需额外 LRU）；未注册/开库失败不落缓存，错误面与旧实现一致
+/// （`StorageSyncError::UnknownAccount`）。
+pub(crate) struct StorageContextCache {
+    /// 账号 → 目录 + 上下文 cell。锁内只做 HashMap 读写，无 await。
+    cells: AsyncMutex<HashMap<String, CachedStorageContext>>,
+    /// 真实 `open_store` 次数（缓存命中不增；测试断言单飞/复用的观测点）。
+    opens: AtomicU64,
+}
+
+/// 单账号缓存项：目录指纹用于识别同号重链（新 store 目录 = 旧上下文作废）。
+struct CachedStorageContext {
+    account_dir: PathBuf,
+    cell: Arc<OnceCell<Arc<StorageContext>>>,
+}
+
+impl StorageContextCache {
+    fn new() -> Self {
+        Self {
+            cells: AsyncMutex::new(HashMap::new()),
+            opens: AtomicU64::new(0),
+        }
+    }
+
+    /// 取账号 cell：目录一致复用，目录变化（同号重链）替换旧 cell。
+    async fn cell_for(
+        &self,
+        account: &str,
+        account_dir: &Path,
+    ) -> Arc<OnceCell<Arc<StorageContext>>> {
+        let mut cells = self.cells.lock().await;
+        if let Some(cached) = cells.get(account) {
+            if cached.account_dir.as_path() == account_dir {
+                return Arc::clone(&cached.cell);
+            }
+        }
+        let cell = Arc::new(OnceCell::new());
+        cells.insert(
+            account.to_owned(),
+            CachedStorageContext {
+                account_dir: account_dir.to_path_buf(),
+                cell: Arc::clone(&cell),
+            },
+        );
+        cell
+    }
+
+    /// 摘除并关闭账号上下文（解绑/注销/同号重链）：map 持有一份 Arc，摘除
+    /// 后若调用方没有在飞 clone，store 连接池即随 drop 关闭。
+    async fn invalidate(&self, account: &str) {
+        let _removed = self.cells.lock().await.remove(account);
+    }
+
+    /// 真实开库计数（测试注入点；生产只做原子自增）。
+    fn note_open(&self) {
+        self.opens.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn open_count(&self) -> u64 {
+        self.opens.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    async fn cached_len(&self) -> usize {
+        self.cells.lock().await.len()
+    }
 }
 
 /// 凭据构造共用面（storage_context 上下文与 prekey remote config 读面同
@@ -8110,19 +8214,14 @@ pub(crate) fn push_service_from_registration(data: &RegistrationData) -> Option<
     ))
 }
 
-/// 组装 storage 上下文：账号 store + 凭据（照抄 link_flow 先例）。Arc 面
-/// 入参：群态 profileKey 新落触发面需要 Service 弱句柄（StorageContext.service）。
-async fn storage_context(
+/// 组装 storage 上下文（缓存未命中时才走）：账号 store + 凭据（照抄
+/// link_flow 先例）。Arc 面入参：群态 profileKey 新落触发面需要 Service
+/// 弱句柄（StorageContext.service）。
+async fn build_storage_context(
     service: &Arc<Service>,
     account: &str,
+    account_dir: PathBuf,
 ) -> Result<StorageContext, storage_sync::StorageSyncError> {
-    let rel = {
-        let state = service.state.lock().await;
-        state
-            .account_dir(account)
-            .ok_or(storage_sync::StorageSyncError::UnknownAccount)?
-    };
-    let account_dir = service.data_dir.join(&rel);
     let store = open_store(&account_dir)
         .await
         .map_err(|_| storage_sync::StorageSyncError::UnknownAccount)?;
@@ -8144,6 +8243,39 @@ async fn storage_context(
         service: Arc::downgrade(service),
         account: account.to_owned(),
     })
+}
+
+/// 取账号 storage 上下文（BUG-6 缓存入口，语义与旧逐调用组装相同）。
+///
+/// 每次仍解析一次账号目录以保持 `UnknownAccount` 错误面（账号不在注册表 /
+/// fake 账号 → 未命中缓存也永远不建条目），但命中时只 clone 既有 Arc 句柄，
+/// 不再 `open_store` + `load_registration_data` + 重建 push。
+async fn storage_context(
+    service: &Arc<Service>,
+    account: &str,
+) -> Result<StorageContext, storage_sync::StorageSyncError> {
+    let account_dir = {
+        let state = service.state.lock().await;
+        let rel = state
+            .account_dir(account)
+            .ok_or(storage_sync::StorageSyncError::UnknownAccount)?;
+        service.data_dir.join(rel)
+    };
+    let cell = service
+        .storage_contexts
+        .cell_for(account, &account_dir)
+        .await;
+    let context = cell
+        .get_or_try_init(|| async {
+            // 只有真正执行开库的那一个调用 +1；并发等在同一 cell 上的调用
+            // 由 OnceCell 唤醒后直接拿结果，不重复计数。
+            service.storage_contexts.note_open();
+            build_storage_context(service, account, account_dir)
+                .await
+                .map(Arc::new)
+        })
+        .await?;
+    Ok((**context).clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -30410,5 +30542,254 @@ mod tests {
                 Err(SendError::AttachmentBudgetExceeded)
             ));
         });
+    }
+
+    /// BUG-6 缓存命中面：同账号连续两次 storage 调用只 open_store 一次，
+    /// 第二次拿到同一目录/同一 device_id；跨账号各开各的（不串号）。
+    #[tokio::test]
+    async fn storage_context_cache_reuses_store_across_calls() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-cache-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006001";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-cache-a",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-cache-a".to_owned()))
+            .expect("add account");
+
+        let first = storage_context(&service, account).await.expect("first");
+        let second = storage_context(&service, account).await.expect("second");
+        assert_eq!(
+            service.storage_contexts.open_count(),
+            1,
+            "缓存命中：第二次不得再 open_store"
+        );
+        assert_eq!(service.storage_contexts.cached_len().await, 1);
+        assert_eq!(first.account_dir, second.account_dir);
+        assert_eq!(first.device_id, second.device_id);
+
+        // 跨账号隔离：第二条账号独立开库，互不复用。
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-cache-b",
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(
+                "+15550006002".to_owned(),
+                Some("accounts/bug6-cache-b".to_owned()),
+            )
+            .expect("add second account");
+        let other = storage_context(&service, "+15550006002")
+            .await
+            .expect("other");
+        assert_eq!(other.account_dir, data_dir.join("accounts/bug6-cache-b"));
+        assert_eq!(service.storage_contexts.open_count(), 2, "每账号各开一次");
+        assert_eq!(service.storage_contexts.cached_len().await, 2);
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// BUG-6 解绑失效面：deleteAccount 摘除缓存条目（目录删除前句柄已放），
+    /// 删除后再调 storage 只能答 UnknownAccount，且不得再开库。
+    #[tokio::test]
+    async fn delete_account_invalidates_storage_context_cache() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-cache-del-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006011";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-del",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-del".to_owned()))
+            .expect("add account");
+
+        let cached = storage_context(&service, account).await.expect("cached");
+        assert_eq!(service.storage_contexts.cached_len().await, 1);
+        drop(cached);
+
+        let removed = service.delete_account(account).await.expect("delete");
+        assert!(removed);
+        assert_eq!(
+            service.storage_contexts.cached_len().await,
+            0,
+            "解绑后缓存条目必须移除"
+        );
+        assert!(matches!(
+            storage_context(&service, account).await,
+            Err(storage_sync::StorageSyncError::UnknownAccount)
+        ));
+        assert_eq!(
+            service.storage_contexts.cached_len().await,
+            0,
+            "未知账号不得重建条目"
+        );
+        assert_eq!(
+            service.storage_contexts.open_count(),
+            1,
+            "删除路径不得再开库"
+        );
+        assert!(
+            !data_dir.join("accounts/bug6-del").exists(),
+            "缓存句柄先摘，目录已删除"
+        );
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// BUG-6 并发单飞面：两个并发 storage 调用同时未命中时，OnceCell 只让
+    /// 一个执行 open_store，另一个等同一结果（缓存锁不跨 await 持锁）。
+    #[tokio::test]
+    async fn concurrent_storage_context_calls_open_store_once() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-storage-cache-conc-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let _ = std::fs::remove_dir_all(&data_dir);
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+                let account = "+15550006021";
+                seed_store_with_aci(
+                    &data_dir,
+                    "accounts/bug6-conc",
+                    "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                )
+                .await;
+                state
+                    .lock()
+                    .await
+                    .add_account(account.to_owned(), Some("accounts/bug6-conc".to_owned()))
+                    .expect("add account");
+
+                let first_service = Arc::clone(&service);
+                let first_account = account.to_owned();
+                let first = tokio::task::spawn_local(async move {
+                    storage_context(&first_service, &first_account).await
+                });
+                // 让第一个调用推进到 open_store 的 await 点，第二个再到达。
+                tokio::task::yield_now().await;
+                let second_service = Arc::clone(&service);
+                let second_account = account.to_owned();
+                let second = tokio::task::spawn_local(async move {
+                    storage_context(&second_service, &second_account).await
+                });
+                let first = first.await.expect("first task").expect("first context");
+                let second = second.await.expect("second task").expect("second context");
+                assert_eq!(
+                    service.storage_contexts.open_count(),
+                    1,
+                    "并发单飞：只允许一次 open_store"
+                );
+                assert_eq!(first.account_dir, second.account_dir);
+                assert_eq!(service.storage_contexts.cached_len().await, 1);
+
+                drop(service);
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// BUG-6 换绑失效面：同号重链换新 store 目录（目录指纹变化）→ 旧上下文
+    /// 作废，下次 storage 调用按新目录重建（旧库句柄释放）。
+    #[tokio::test]
+    async fn storage_context_rebuilds_after_account_dir_change() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-cache-relink-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006031";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-old",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-old".to_owned()))
+            .expect("add account");
+        let old = storage_context(&service, account)
+            .await
+            .expect("old context");
+        let old_dir = old.account_dir.clone();
+        assert_eq!(old_dir, data_dir.join("accounts/bug6-old"));
+        assert_eq!(service.storage_contexts.open_count(), 1);
+        drop(old);
+
+        // 同号重链：注册表目录换成新链接的 store（旧目录句柄必须释放）。
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-new",
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-new".to_owned()))
+            .expect("relink account");
+        let new = storage_context(&service, account)
+            .await
+            .expect("new context");
+        assert_eq!(new.account_dir, data_dir.join("accounts/bug6-new"));
+        assert_ne!(new.account_dir, old_dir);
+        assert_eq!(
+            service.storage_contexts.open_count(),
+            2,
+            "目录指纹变化必须重建上下文"
+        );
+        assert_eq!(
+            service.storage_contexts.cached_len().await,
+            1,
+            "同号仍只一条"
+        );
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
