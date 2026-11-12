@@ -158,4 +158,85 @@ jobs:
           print(f"public url: https://download.ktai.im/{key}")
           PYEOF
 
+      # 产物落位后更新 catalog（与 connector 同纪律）：
+      # matrix 每个平台只更新 engine 记录里**自己那个 platform** 的 artifact，
+      # 保留另一个平台的既有条目（两个 job 并发写同一记录，读-改-写 + 重试）。
+      - name: Publish catalog entry to download.ktai.im
+        if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
+        env:
+          OSS_ACCESS_KEY_ID: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-id }}
+          OSS_ACCESS_KEY_SECRET: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-secret }}
+          OSS_STS_TOKEN: ${{ steps.aliyun-oidc.outputs.aliyun-security-token }}
+          OSS_BUCKET: kontian-assets
+          OSS_ENDPOINT: oss-us-west-1.aliyuncs.com
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "x86_64-pc-windows-msvc" ]; then
+            platform="windows-x64"; artifact="kt-signal-engine-windows-x64.exe"; src="dist/kt-signal-engine-$TARGET.exe"
+          elif [ "$TARGET" = "aarch64-apple-darwin" ]; then
+            platform="macos-arm64"; artifact="kt-signal-engine-macos-arm64"; src="dist/kt-signal-engine-$TARGET"
+          else
+            echo "platform $TARGET not published to catalog (only windows-x64 / macos-arm64 are consumed)"; exit 0
+          fi
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          python3 -m pip install --quiet --disable-pip-version-check oss2
+          export SRC="$src" PLATFORM="$platform" ARTIFACT="$artifact" COMPONENT_VERSION="$version"
+          python3 - <<'PYEOF'
+          import os, json, hashlib, time, oss2
+          auth = oss2.StsAuth(os.environ['OSS_ACCESS_KEY_ID'], os.environ['OSS_ACCESS_KEY_SECRET'], os.environ['OSS_STS_TOKEN'])
+          bucket = oss2.Bucket(auth, 'https://' + os.environ['OSS_ENDPOINT'], os.environ['OSS_BUCKET'])
+          CATALOG_KEY = 'kt/signal-runtime/catalog.json'
+          BASE = 'https://download.ktai.im/kt/signal-runtime/engine'
+          version, platform, artifact, src = (os.environ[k] for k in ('COMPONENT_VERSION','PLATFORM','ARTIFACT','SRC'))
+
+          with open(src, 'rb') as f:
+              sha = hashlib.sha256(f.read()).hexdigest()
+          size = os.path.getsize(src)
+
+          def load():
+              try:
+                  return json.loads(bucket.get_object(CATALOG_KEY).read())
+              except oss2.exceptions.NoSuchKey:
+                  return {"catalogVersion": 1, "channel": "stable", "generatedAtUnixMs": 0, "releases": []}
+              except Exception as e:
+                  raise SystemExit(f"FATAL: cannot read catalog: {e}")
+
+          allowed = ('https://download.ktai.im/kt/signal-runtime/', 'https://github.com/kt-im/')
+          for attempt in range(5):
+              catalog = load()
+              engine = next((r for r in catalog.get('releases', []) if r.get('component') == 'engine'), None)
+              if engine is None:
+                  engine = {"component": "engine", "version": version, "artifacts": {},
+                            "engineContractRevision": {"min": "1.92", "max": "1.92"},
+                            "desktopApiVersion": {"min": "1.0", "max": "1.0"}}
+                  catalog.setdefault('releases', []).append(engine)
+              engine['version'] = version
+              engine.setdefault('artifacts', {})[platform] = {
+                  "platform": platform,
+                  "sizeBytes": size,
+                  "sha256": sha,
+                  "primaryUrl": f"{BASE}/{version}/{artifact}",
+                  "fallbackUrl": f"https://github.com/kt-im/kt-signal-engine/releases/download/v{version}/{artifact}",
+              }
+              for art in engine['artifacts'].values():
+                  for field in ('primaryUrl', 'fallbackUrl'):
+                      if not art[field].startswith(allowed):
+                          raise SystemExit(f"FATAL: {field} not in allowlist: {art[field]}")
+              catalog['catalogVersion'] = 1
+              catalog['channel'] = catalog.get('channel', 'stable')
+              catalog['generatedAtUnixMs'] = int(time.time() * 1000)
+              body = json.dumps(catalog, ensure_ascii=False, indent=2).encode()
+              try:
+                  bucket.put_object(CATALOG_KEY, body, headers={'x-oss-meta-sha256': hashlib.sha256(body).hexdigest()})
+                  print(f"catalog updated: engine {version} {platform} size={size} sha256={sha}")
+                  print(f"public url: https://download.ktai.im/{CATALOG_KEY}")
+                  break
+              except Exception as e:
+                  if attempt == 4:
+                      raise SystemExit(f"FATAL: catalog write failed after retries: {e}")
+                  time.sleep(2 ** attempt)
+          PYEOF
+
+
 
