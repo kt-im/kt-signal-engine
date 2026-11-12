@@ -217,12 +217,14 @@ jobs:
                   "sizeBytes": size,
                   "sha256": sha,
                   "primaryUrl": f"{BASE}/{version}/{artifact}",
-                  "fallbackUrl": f"https://github.com/kt-im/kt-signal-engine/releases/download/v{version}/{artifact}",
               }
               for art in engine['artifacts'].values():
                   for field in ('primaryUrl', 'fallbackUrl'):
-                      if not art[field].startswith(allowed):
-                          raise SystemExit(f"FATAL: {field} not in allowlist: {art[field]}")
+                      url = art.get(field)
+                      if url is None:
+                          continue
+                      if not url.startswith(allowed):
+                          raise SystemExit(f"FATAL: {field} not in allowlist: {url}")
               catalog['catalogVersion'] = 1
               catalog['channel'] = catalog.get('channel', 'stable')
               catalog['generatedAtUnixMs'] = int(time.time() * 1000)
