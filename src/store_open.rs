@@ -13,8 +13,9 @@
 //!    `code()` 给结构化码，`report_once` 落固定 stderr 行
 //!    `kt-signal-engine: ERROR event=store_open_failed code=<Code> retryable=<bool>`
 //!    （每进程每码恰一次；形状与 `SingleAccountRegistryViolation` 同款，
-//!    只落字面量、无路径/号码/密钥）。`is_terminal()` 把**五类**终态
-//!    （缺能力 / key 形状非法 / 缺 key / 错 key / 库损坏）与可重试失败分开：
+//!    只落字面量、无路径/号码/密钥）。`is_terminal()` 把**六类**终态
+//!    （缺能力 / key 形状非法 / 缺 key / 错 key / 库损坏 / 开关 on 的明文库）
+//!    与可重试失败分开：
 //!    前者**不进**接收管线的 `Recoverable` 退避重连（错 key 重试一万次还是
 //!    错 key，而且每次重试都会再碰一次盘）。**可重试面包括一切 IO 失败**
 //!    （EACCES/EMFILE/EIO/只读挂载/路径不存在），它们不证明库内容坏了——
@@ -90,6 +91,104 @@ impl CorruptDetail {
     }
 }
 
+/// C-1 终态开关的 env 名：`KT_SIGNAL_STORE_REQUIRE_ENCRYPTED`（**默认 off**）。
+///
+/// | 取值（去空白、大小写不敏感） | 结果 |
+/// |---|---|
+/// | 缺席 / 空串 / `off` / `0` / `false` / `no` | off：**今天的行为逐字节不变** |
+/// | `on` / `1` / `true` / `yes` | on：明文库一律终态 |
+/// | 其它（`enable` / `2` / `on!` …） | off + 一条滚动日志 warn |
+///
+/// 认不出的值**不**回落到 on：默认 off 是硬约束
+/// （`docs/plan/engine-store-encryption.md` C-12），笔误不该把一批账号全打成
+/// 终态；真要开的时候显式写 `on` / `1`。
+pub(crate) const REQUIRE_ENCRYPTED_ENV: &str = "KT_SIGNAL_STORE_REQUIRE_ENCRYPTED";
+
+/// 开关取值（第三态「认不出」由 [`parse_require_encrypted`] 的 `None` 表达，
+/// 这里只留两个会改变行为的档）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequireEncrypted {
+    /// 兼容路径：明文库照旧打开（有 key 时打一次 legacy warn）。
+    Off,
+    /// 严格路径：明文库（**无论有没有 key**）一律
+    /// `StorePlaintextRequiresMigration` 终态。
+    On,
+}
+
+impl RequireEncrypted {
+    /// 唯一判据（别让调用点各写一遍 `== On`）。
+    pub(crate) fn is_on(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+/// 纯解析（单测直打）：`None` = 认不出，调用方按 off 兜底并留一条 warn。
+pub(crate) fn parse_require_encrypted(raw: Option<&str>) -> Option<RequireEncrypted> {
+    match raw.map(str::trim) {
+        None | Some("") => Some(RequireEncrypted::Off),
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "off" | "0" | "false" | "no" => Some(RequireEncrypted::Off),
+            "on" | "1" | "true" | "yes" => Some(RequireEncrypted::On),
+            _ => None,
+        },
+    }
+}
+
+/// env 值 → 开关（认不出 = off）。
+pub(crate) fn require_encrypted_from_env_value(raw: Option<&str>) -> RequireEncrypted {
+    parse_require_encrypted(raw).unwrap_or(RequireEncrypted::Off)
+}
+
+/// 进程开关：每次打开读一次 env。没有 `OnceLock`——生产里没人中途改 env，
+/// 而单测要能注入，读一次字符串比多一颗进程级状态便宜。
+///
+/// on 时落**一条**滚动日志 WARN（运维要能看出「不服务明文」是开关而不是
+/// 故障）；认不出的值同样一条 WARN。两条都只进滚动日志，**不进 stderr**
+/// ——stderr 的固定行只属于 [`StoreOpenError`] 的码面。
+pub(crate) fn require_encrypted() -> RequireEncrypted {
+    let raw = std::env::var(REQUIRE_ENCRYPTED_ENV).ok();
+    let resolved = require_encrypted_from_env_value(raw.as_deref());
+    if resolved.is_on() {
+        require_encrypted_on_warn_once();
+    } else if parse_require_encrypted(raw.as_deref()).is_none() {
+        // 认不出 = off，但要让人在滚动日志里看见「你写的值没人认识」。
+        warn_unrecognised_require_encrypted_once(raw.as_deref());
+    }
+    resolved
+}
+
+/// on 的证据行闸（每进程一条；`swap` 的返回值就是「我是不是第一个」）。
+static REQUIRE_ENCRYPTED_ON_WARNS: AtomicU32 = AtomicU32::new(0);
+
+fn require_encrypted_on_warn_once() {
+    if REQUIRE_ENCRYPTED_ON_WARNS.swap(1, Ordering::SeqCst) == 1 {
+        return;
+    }
+    tracing::warn!(
+        target: "engine.store",
+        stage = "store_open",
+        switch = "require_encrypted",
+        value = "on",
+        "plaintext stores are refused with a terminal class; migrate them before turning this on"
+    );
+}
+
+/// 认不出的值的闸（每进程一条；值本身只进滚动日志，不是密钥）。
+static REQUIRE_ENCRYPTED_INVALID_WARNS: AtomicU32 = AtomicU32::new(0);
+
+fn warn_unrecognised_require_encrypted_once(raw: Option<&str>) {
+    if REQUIRE_ENCRYPTED_INVALID_WARNS.swap(1, Ordering::SeqCst) == 1 {
+        return;
+    }
+    tracing::warn!(
+        target: "engine.store",
+        stage = "store_open",
+        switch = "require_encrypted",
+        value = raw.unwrap_or_default(),
+        "unrecognised value for the require-encrypted switch; staying off"
+    );
+}
+
 /// 打开 store 失败的分类（connector 面）。
 ///
 /// 码是**契约字面量**：connector 侧按 `code=` 后的整词匹配，不做前缀/
@@ -100,12 +199,26 @@ pub(crate) enum StoreOpenError {
     CipherUnavailable,
     /// `KT_SIGNAL_STORE_KEY` 形状非法（fail-closed，不建库）。
     KeyInvalid,
-    /// 加密库 + 没有 key：终态，等 key 补齐，绝不静默新建明文库。
+    /// 没有 key 却必须走密文：终态，等 key 补齐，绝不静默新建明文库。
+    ///
+    /// 两个入口：① `store.db` 已是密文（`Opaque`）——没有 key 就打不开；
+    /// ② C-1 开关 on 且库**不存在**（`Absent`）——开关要求密文，没 key 就建
+    /// 不出密文库，此时放行 `create_if_missing` 等于开关 on 还在生产新的
+    /// 明文库（比存量明文更糟：存量至少是迁移源）。
+    ///
+    /// 第二种入口归本码而不是 `PlaintextRequiresMigration`：盘上没有任何
+    /// 东西要迁移（连账号目录都没建），缺的是 key。
     KeyRequired,
     /// 有 key 但解不开（错 key；或第 1 页损坏，见模块文档的边界说明）。
     KeyRejected,
     /// 库损坏（截断/不可读/malformed）。
     Corrupt(CorruptDetail),
+    /// 明文库 + `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on`（C-1）：**终态**，
+    /// 等迁移器把库转成密文，或由运维显式把开关关回去。判定只看文件头，
+    /// 与有没有 key 无关——无 key 的明文库放过去就等于开关没开（删掉 key
+    /// 就能读明文，闸形同虚设）。拒绝路径不打开、不写盘、**不删明文库**
+    /// （迁移器要拿它当源）。
+    PlaintextRequiresMigration,
     /// 其余可重试失败（权限、句柄耗尽、EIO、只读挂载、路径、连接池、
     /// 迁移等）：保持既有重试语义，**不进**终态停机。
     Failed,
@@ -120,13 +233,15 @@ impl StoreOpenError {
             Self::KeyRequired => "StoreKeyRequired",
             Self::KeyRejected => "StoreKeyRejected",
             Self::Corrupt(_) => "StoreCorrupt",
+            Self::PlaintextRequiresMigration => "StorePlaintextRequiresMigration",
             Self::Failed => "StoreOpenFailed",
         }
     }
 
-    /// 终态 = 不进退避重连。**实际五类**：`CipherUnavailable`（缺能力）、
+    /// 终态 = 不进退避重连。**实际六类**：`CipherUnavailable`（缺能力）、
     /// `KeyInvalid`（形状非法）、`KeyRequired`（缺 key）、`KeyRejected`
-    /// （错 key / 首页损坏）、`Corrupt`（库损坏）。
+    /// （错 key / 首页损坏）、`Corrupt`（库损坏）、
+    /// `PlaintextRequiresMigration`（开关 on + 明文库，与 key 无关）。
     ///
     /// `Failed` 是**唯一**可重试类：权限、句柄耗尽、EIO、只读挂载、路径
     /// 不存在、连接池/迁移失败都在这一类——它们不证明库内容坏了，等外部
@@ -142,16 +257,19 @@ impl StoreOpenError {
             | Self::KeyInvalid
             | Self::KeyRequired
             | Self::KeyRejected
+            | Self::PlaintextRequiresMigration
             | Self::Failed => "-",
         }
     }
 
     /// 固定 stderr 行（connector watchdog 逐行分类的**唯一契约形状**）。
     ///
-    /// 六个码共用同一形状，只有 `code` 与 `retryable` 变化；只含字面量，
-    /// 无路径/号码/密钥。`CipherUnavailable` 的这一行由能力门在首次判定
-    /// 时落（`src/store_cipher.rs` 的 `unavailable_stderr_line`，同一份
-    /// 形状），本函数是两侧形状的唯一断言口径（`store_cipher_tests` 对拍）。
+    /// 七个码共用同一形状，只有 `code` 与 `retryable` 变化；只含字面量，
+    /// 无路径/号码/密钥。C-1 的 `StorePlaintextRequiresMigration` 也在其中
+    /// （`retryable=false`）：connector 的逐行分类不需要为它单开一种形状。
+    /// `CipherUnavailable` 的这一行由能力门在首次判定时落
+    /// （`src/store_cipher.rs` 的 `unavailable_stderr_line`，同一份形状），
+    /// 本函数是两侧形状的唯一断言口径（`store_cipher_tests` 对拍）。
     pub(crate) fn stderr_line(self) -> String {
         format!(
             "kt-signal-engine: ERROR event=store_open_failed code={} retryable={}",
@@ -210,6 +328,7 @@ impl StoreOpenError {
         static KEY_REQUIRED: AtomicU8 = AtomicU8::new(0);
         static KEY_REJECTED: AtomicU8 = AtomicU8::new(0);
         static CORRUPT: AtomicU8 = AtomicU8::new(0);
+        static PLAINTEXT_REQUIRES_MIGRATION: AtomicU8 = AtomicU8::new(0);
         static FAILED: AtomicU8 = AtomicU8::new(0);
         match self {
             Self::CipherUnavailable => &CIPHER,
@@ -217,6 +336,7 @@ impl StoreOpenError {
             Self::KeyRequired => &KEY_REQUIRED,
             Self::KeyRejected => &KEY_REJECTED,
             Self::Corrupt(_) => &CORRUPT,
+            Self::PlaintextRequiresMigration => &PLAINTEXT_REQUIRES_MIGRATION,
             Self::Failed => &FAILED,
         }
     }

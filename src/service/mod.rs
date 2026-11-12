@@ -14851,11 +14851,12 @@ pub(crate) async fn open_store_gated(
 ///
 /// | key | store.db | 行为 |
 /// |---|---|---|
-/// | 无 | 无 | 明文创建（现状兼容，a） |
+/// | 无 | 无 | 明文创建（现状兼容，a）；**C-1 开关 on 时**改判 `StoreKeyRequired` 终态（没 key 建不出密文库，也就不许再造新的明文库） |
 /// | 无 | 明文 | 明文打开（现状兼容） |
 /// | 无 | 密文 | `StoreKeyRequired`（终态，绝不新建明文库） |
 /// | 有 | 无 | 加密创建（b） |
 /// | 有 | 明文 | 按 legacy 打开**不设 key** + warn 一次（c，迁移在 D 阶段） |
+/// | 任意 | 明文 + C-1 开关 on | `StorePlaintextRequiresMigration`（终态，与有没有 key 无关；不打开、不写盘、不删明文库） |
 /// | 有 | 密文 | 先验真再打开；错 key → `StoreKeyRejected`（d） |
 /// | 任意 | 损坏 | `StoreCorrupt`（e） |
 /// | 形状非法 | 任意 | `StoreKeyInvalid`（终态，不建库） |
@@ -14863,6 +14864,20 @@ pub(crate) async fn open_store_with(
     dir: &Path,
     gate: &store_cipher::CipherGate,
     key_state: &StoreKeyState,
+) -> Result<SqliteStore, StoreOpenError> {
+    open_store_with_requirement(dir, gate, key_state, store_open::require_encrypted()).await
+}
+
+/// 打开实现：门、key 三态与 C-1 终态开关都可注入（单测直打真实顺序；
+/// 生产入口 [`open_store_with`] 的开关取进程 env）。
+///
+/// 开关是**逐进程**的：`KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on` 时，明文库
+/// 一律终态；off（缺省）时下面每一行行为与 C 阶段逐字节相同。
+pub(crate) async fn open_store_with_requirement(
+    dir: &Path,
+    gate: &store_cipher::CipherGate,
+    key_state: &StoreKeyState,
+    require_encrypted: store_open::RequireEncrypted,
 ) -> Result<SqliteStore, StoreOpenError> {
     // 1) 能力门：缺能力时磁盘上零文件。固定 stderr 行由门在**首次判定**时
     // 落下（`store_cipher::unavailable_stderr_line`，与
@@ -14880,6 +14895,29 @@ pub(crate) async fn open_store_with(
     // 3) 文件分类（只读元数据 + 16 字节头，不建目录）。
     let path = dir.join("store.db");
     let state = store_open::classify(&path).inspect_err(|error| error.report_once())?;
+    // 3.5) C-1 终态闸（**默认 off**）：开关 on 且库是明文头 → 终态，无论有
+    // 没有 key。位置是契约——分类之后、验真/建目录/打开之前，所以这条路径
+    // 一个字节都不写，也不删明文库（迁移器要拿它当源）。无 key 也拦的理由：
+    // 放它过去等于「删掉 key 就能读明文」，开关形同虚设。
+    //
+    // off 时这段不成立，向下走的仍是 C 阶段那条 `match (key, state)`：行为
+    // 与加开关前逐字节相同（既有矩阵 a–e 断言原样全绿）。
+    if require_encrypted.is_on() && state == StoreFileState::Plaintext {
+        return refuse(StoreOpenError::PlaintextRequiresMigration);
+    }
+    // 3.6) C-1 的新建闸（**补漏**：开关 on + 无 key + 库不存在）：终态
+    // `StoreKeyRequired`，位置与 3.5 同为「分类之后、一切写动作之前」。
+    //
+    // 这一格原来的落点是矩阵 a 的 `(None, _) => false`：开关 on 时它会走到
+    // 第 6 步的 `create_if_missing`，现造一个**新的明文库**——正是开关要拦的
+    // 事，而且比「存量明文库」更糟：存量至少是迁移源，这一格是开关打开之后
+    // 才开始的明文生产。语义选 `StoreKeyRequired` 而不是
+    // `PlaintextRequiresMigration`：盘上没有任何东西要迁移（连目录都没有），
+    // 缺的是 key——没有 key 建不出密文库，而开关不许降级建明文库。与
+    // `(None, Opaque)` 那一格同码同理由（同一个一次性闸，不新开码面）。
+    if require_encrypted.is_on() && key.is_none() && state == StoreFileState::Absent {
+        return refuse(StoreOpenError::KeyRequired);
+    }
     // 4) 决策：这次是否带 key 打开（矩阵 a–d）。
     let keyed = match (key, state) {
         (None, StoreFileState::Opaque) => return refuse(StoreOpenError::KeyRequired),
@@ -27700,6 +27738,7 @@ mod tests {
             StoreOpenError::Corrupt(store_open::CorruptDetail::Unreadable),
             StoreOpenError::Corrupt(store_open::CorruptDetail::Truncated),
             StoreOpenError::Corrupt(store_open::CorruptDetail::Malformed),
+            StoreOpenError::PlaintextRequiresMigration,
         ] {
             assert_eq!(
                 note_cert_store_open_failure(&mut maintenance, terminal),

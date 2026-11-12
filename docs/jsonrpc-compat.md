@@ -46,6 +46,18 @@ fixture 同款）：
   64 个十六进制字符（大小写均可）或该 32 字节的 base64（标准/url-safe、带不带 `=` 补位均可）。
   形状非法 = fail-closed（`StoreKeyInvalid`，不建库）；缺席 = 明文兼容路径。key 不进日志/argv/指标。
   语义与失败码见 `docs/plan/engine-store-encryption.md` §7「C 阶段」。
+- `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED`（M6 C-1，可选）：明文库的终态开关，**默认 off**
+  （= C 阶段原样：明文库照旧可服务——有 key 时按 legacy 打开并 warn 一次，不迁移、
+  不改一个字节）。取值表（三档，去空白、大小写不敏感）：`on`/`1`/`true`/`yes` → on；
+  `off`/`0`/`false`/`no`/空串/缺席 → off；**其它值 = off + 一条滚动日志 WARN**
+  （只进 `<data-dir>/logs/engine-stderr.log`，不进 stderr——stderr 的固定行只属于
+  下面的码面；认不出**不**回落到 on：默认 off 是硬约束，笔误不该把一批账号打成终态）。
+  on 时：明文头的库（**与有没有 key 无关**）→ 该账号接收管线停环，落
+  `code=StorePlaintextRequiresMigration retryable=false`，**不是进程退出**（引擎退出码
+  仍只有 0/1/2）；库不存在且**无 key** → `StoreKeyRequired`（没 key 建不出密文库，
+  也不许再造新的明文库）；库不存在且有 key 照常建密文库。开关是**逐进程**的，
+  开与不开是发布/运维决策（按批打开），语义见 `docs/plan/engine-store-encryption.md`
+  §7 C.12。
 - JVM 相关环境（`JAVA_OPTS`/`JAVA_HOME`）：引擎非 JVM，**必须忽略**，
   不得因此失败（connector 现行启动器会设置它们）。
 - stdio：stdin 逐行请求，stdout 逐行响应/通知，stderr 除三处启动期/故障输出外
@@ -58,9 +70,12 @@ fixture 同款）：
   event=startup_failed code=…`，仅在启动失败路径出现；M6 C 阶段的 store 打开
   行固定 `kt-signal-engine: ERROR event=store_open_failed code=… retryable=…`，
   code ∈ `StoreCipherUnavailable`/`StoreKeyInvalid`/`StoreKeyRequired`/
-  `StoreKeyRejected`/`StoreCorrupt`/`StoreOpenFailed`，**每进程每码恰一条**；
-  `retryable=false` 的**五类**（缺能力 / 形状非法 / 缺 key / 错 key / 库损坏）
-  不进退避重连，`StoreOpenFailed` 一类 `retryable=true` 保持既有重试语义；语义见
+  `StoreKeyRejected`/`StoreCorrupt`/`StorePlaintextRequiresMigration`（仅
+  `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on` 且库头是明文时出现，见上面的开关条目）/
+  `StoreOpenFailed`，**每进程每码恰一条**；
+  `retryable=false` 的**六类**（缺能力 / 形状非法 / 缺 key / 错 key / 库损坏 /
+  开关 on 的明文库）不进退避重连，`StoreOpenFailed` 一类 `retryable=true`
+  保持既有重试语义；语义见
   `docs/plan/engine-store-encryption.md` §7「C 阶段」）。
   日志纪律：不落消息正文/号码/URI/密钥（代理 host:port 属网络配置，允许）。
   **引擎自身滚动文件日志（2026-10-16 send 链可观测批，§5）**：引擎进程内

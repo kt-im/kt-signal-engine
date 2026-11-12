@@ -25,16 +25,24 @@
 //! | `create_dir_all_failure_reports_store_open_failed_once` | — | **收尾 1**：只读父目录 → `create_dir_all` 失败 = `code=StoreOpenFailed retryable=true` 恰一条，且不建账号目录、不建库 |
 //! | `non_utf8_store_path_reports_store_open_failed_once` | — | **收尾 1（第二条）**：账号目录名非 UTF-8（`path.to_str()` 为 `None`）同样落恰一条可重试固定行 |
 //! | `legacy_warn_is_emitted_by_the_open_not_by_a_manual_gate` | c | **评审 7a**：legacy warn 由 `open_store_with` 触发（不是测试先自打闸），且只打一次 |
+//! | `require_encrypted_switch_parses_only_explicit_words` | — | **C-1**：开关只认显式词（`on/1/true/yes` 与 `off/0/false/no`，去空白、大小写不敏感）；认不出 = off（默认 off 是硬约束） |
+//! | 八格 `switch_off_*` / `switch_on_*` | a–d | **C-1 网格**：2（开关）× 2（明文/密文）× 2（有/无 key）。off 四格与 C 阶段逐字节同行为；on 的明文两格（有/无 key）= `StorePlaintextRequiresMigration` 终态，零写入/零删除/零新建；on 的密文两格不变 |
+//! | 九格 ⑨ `switch_on_absent_*` / `switch_off_absent_*` | a–b | **C-1 补漏**：开关 on + 无 key + **库不存在** = `StoreKeyRequired` 终态（不建目录、不建库、固定行恰一条）——放它过去就等于开关 on 还在造新的明文库；on + 有 key 仍建密文库；off + 无 key 仍建明文库 |
+//! | `switch_on_classifies_plaintext_by_header_before_opening` | e | **C-1 顺序**：开关 on 时「明文头 + 垃圾内容」先报「要迁移」（头是权威，与迁移器同口径），不是 `StoreCorrupt` |
+//! | `switch_on_plaintext_is_terminal_and_reports_once_per_process` | — | **C-1 真进程**：`KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on` 的明文库在新进程里落**恰一条** `code=StorePlaintextRequiresMigration retryable=false` |
 
 use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, SqliteConnection};
 
-use crate::service::open_store_with;
+use crate::service::{open_store_with, open_store_with_requirement};
 use crate::store_cipher::{CipherGate, CipherProbeError};
 use crate::store_key::{StoreKey, StoreKeyState};
-use crate::store_open::{self, CorruptDetail, StoreOpenError, PLAINTEXT_HEADER};
+use crate::store_open::{
+    self, parse_require_encrypted, require_encrypted_from_env_value, CorruptDetail,
+    RequireEncrypted, StoreOpenError, PLAINTEXT_HEADER, REQUIRE_ENCRYPTED_ENV,
+};
 
 /// 两把形状合法的测试 key（32B；A/B 的第一字节就不同，错 key 一定解不开）。
 const KEY_A_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
@@ -819,7 +827,7 @@ async fn probe_keyed_store_requires_write_access() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// 评审阻塞项 3：固定 stderr 码面补齐——六个码**共用同一形状**
+/// 评审阻塞项 3 + C-1：固定 stderr 码面补齐——七个码**共用同一形状**
 /// （`event=store_open_failed code=<Code> retryable=<bool>`），可重试类
 /// （`StoreOpenFailed`）与缺能力（`StoreCipherUnavailable`）都在内；每进程
 /// 每码一条（闸幂等），各码的闸互不压制。
@@ -847,6 +855,11 @@ fn every_store_open_code_emits_the_fixed_line_once() {
     assert_eq!(
         StoreOpenError::Corrupt(CorruptDetail::Truncated).stderr_line(),
         line("StoreCorrupt", false)
+    );
+    assert_eq!(
+        StoreOpenError::PlaintextRequiresMigration.stderr_line(),
+        line("StorePlaintextRequiresMigration", false),
+        "C-1 的终态码用同一形状（connector 不必为它单开一种分类）"
     );
     assert_eq!(
         StoreOpenError::Failed.stderr_line(),
@@ -995,12 +1008,14 @@ fn create_dir_all_failure_reports_store_open_failed_once() {
     );
 }
 
-/// 收尾 2 的子用例：**同一个进程**里两个不同的码各触发一次（顺序可由
-/// `KT_STORE_GATE_ORDER` 反转），并各重复触发一轮证明闸幂等。
+/// 收尾 2 + C-1 的子用例：**同一个进程**里三个不同的码各触发一次（前两个
+/// 的顺序可由 `KT_STORE_GATE_ORDER` 反转），并各重复触发一轮证明闸幂等。
 ///
-/// 两个 fixture 都只靠文件内容造（不依赖权限位，root 下同样成立）：
+/// 三个 fixture 都只靠文件内容造（不依赖权限位，root 下同样成立）：
 /// - 非明文头（密文/垃圾）+ 无 key → `StoreKeyRequired`；
-/// - 短于一页 → `StoreCorrupt(Truncated)`。
+/// - 短于一页 → `StoreCorrupt(Truncated)`；
+/// - 明文头 + 开关 on（父用例透传 `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on`）→
+///   `StorePlaintextRequiresMigration`。
 #[ignore = "由 each_store_open_code_emits_its_own_line 以新进程拉起"]
 #[tokio::test]
 async fn child_two_codes_emit_two_lines() {
@@ -1019,13 +1034,27 @@ async fn child_two_codes_emit_two_lines() {
     let truncated = root.join("lk-truncated");
     std::fs::create_dir_all(&truncated).expect("truncated dir");
     std::fs::write(truncated.join("store.db"), [0_u8; 100]).expect("truncated store");
+    let plaintext = root.join("lk-plaintext");
+    std::fs::create_dir_all(&plaintext).expect("plaintext dir");
+    let mut junk = PLAINTEXT_HEADER.to_vec();
+    junk.extend(std::iter::repeat_n(0_u8, 4096));
+    std::fs::write(plaintext.join("store.db"), &junk).expect("plaintext store");
 
     let required = StoreOpenError::KeyRequired;
     let corrupt = StoreOpenError::Corrupt(CorruptDetail::Truncated);
+    let migration = StoreOpenError::PlaintextRequiresMigration;
     let order = if std::env::var("KT_STORE_GATE_ORDER").as_deref() == Ok("corrupt_first") {
-        [(&truncated, corrupt), (&opaque, required)]
+        [
+            (&truncated, corrupt),
+            (&opaque, required),
+            (&plaintext, migration),
+        ]
     } else {
-        [(&opaque, required), (&truncated, corrupt)]
+        [
+            (&opaque, required),
+            (&truncated, corrupt),
+            (&plaintext, migration),
+        ]
     };
     for (dir, expected) in order {
         trigger(dir, expected).await;
@@ -1037,6 +1066,11 @@ async fn child_two_codes_emit_two_lines() {
     assert_eq!(required.report_count(), 1, "KeyRequired 的闸只落一次");
     assert_eq!(corrupt.report_count(), 1, "StoreCorrupt 的闸只落一次");
     assert_eq!(
+        migration.report_count(),
+        1,
+        "PlaintextRequiresMigration 的闸只落一次"
+    );
+    assert_eq!(
         StoreOpenError::Failed.report_count(),
         0,
         "没触发的码不该被别的码顺带点亮（共用槽会串）"
@@ -1044,25 +1078,32 @@ async fn child_two_codes_emit_two_lines() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// **收尾 2**：旧断言（`every_store_open_code_emits_the_fixed_line_once` 的
+/// **收尾 2 + C-1**：旧断言（`every_store_open_code_emits_the_fixed_line_once` 的
 /// 循环）在同一次循环里边打边读——闸已被消费，`report_count() == 1` 无论
 /// 共不共用槽都成立，**把两码合并成同一闸也不会红**。
 ///
-/// 这里改成独立用例 + 真进程 + 真 stderr：两个不同码各触发一次，断言两行
-/// 都在、各恰一条、与顺序无关。`StoreOpenError::slot()` 一旦把两个码映射到
-/// 同一个 `AtomicU8`，第二个码的 `report_once` 会被闸吃掉 → 只剩一行 → 本
-/// 用例红（变异验证记录见 `docs/plan/engine-store-encryption.md` §7 收尾表）。
+/// 这里改成独立用例 + 真进程 + 真 stderr：三个不同码各触发一次，断言三行
+/// 都在、各恰一条、前两个与顺序无关。`StoreOpenError::slot()` 一旦把两个码
+/// 映射到同一个 `AtomicU8`，后一个码的 `report_once` 会被闸吃掉 → 少一行
+/// → 本用例红（变异验证记录见 `docs/plan/engine-store-encryption.md` 的
+/// C.12）。
 #[test]
 fn each_store_open_code_emits_its_own_line() {
     let case = "child_two_codes_emit_two_lines";
     for order in ["required_first", "corrupt_first"] {
-        let child = run_child_case(case, &[("KT_STORE_GATE_ORDER", order)]);
+        let child = run_child_case(
+            case,
+            &[
+                ("KT_STORE_GATE_ORDER", order),
+                (REQUIRE_ENCRYPTED_ENV, "on"),
+            ],
+        );
         assert_child_ran(&child, case);
         let lines = fixed_lines(&child.stderr);
         assert_eq!(
             lines.len(),
-            2,
-            "两个不同码必须各落一行（合并闸/共用槽会只剩一行）order={order}\n--- stderr ---\n{}",
+            3,
+            "三个不同码必须各落一行（合并闸/共用槽会少一行）order={order}\n--- stderr ---\n{}",
             child.stderr
         );
         assert_eq!(
@@ -1081,6 +1122,15 @@ fn each_store_open_code_emits_its_own_line() {
                 .count(),
             1,
             "order={order}：StoreCorrupt 恰一条（被前一个码压掉就是共用闸）\n--- stderr ---\n{}",
+            child.stderr
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("code=StorePlaintextRequiresMigration"))
+                .count(),
+            1,
+            "order={order}：StorePlaintextRequiresMigration 恰一条（C-1 新槽不得被别的码压掉）\n--- stderr ---\n{}",
             child.stderr
         );
     }
@@ -1155,5 +1205,677 @@ fn non_utf8_store_path_reports_store_open_failed_once() {
         lines[0],
         "kt-signal-engine: ERROR event=store_open_failed code=StoreOpenFailed retryable=true",
         "可重试类固定行形状逐字"
+    );
+}
+
+// ——————————————————— C-1 终态开关（`KT_SIGNAL_STORE_REQUIRE_ENCRYPTED`） ———————————————————
+
+/// 目录里的全部条目名（排序）：终态拒绝路径必须**不新建、不删除**任何文件。
+fn entry_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    names
+}
+
+/// C-1 网格的明文库格：先按 **off** 建库（种子的行为不该被调用方 shell 里的
+/// 开关影响），再落一张探针表 + 一行数据；返回 `store.db` 路径。
+async fn seed_plaintext_store(dir: &Path) -> PathBuf {
+    drop(
+        open_store_with_requirement(
+            dir,
+            &CipherGate::new(),
+            &StoreKeyState::Absent,
+            RequireEncrypted::Off,
+        )
+        .await
+        .expect("plaintext seed"),
+    );
+    let db = dir.join("store.db");
+    execute(
+        &db,
+        "CREATE TABLE c1_probe (k TEXT PRIMARY KEY, v TEXT NOT NULL)",
+    )
+    .await;
+    execute(&db, "INSERT INTO c1_probe (k, v) VALUES ('probe', 'value')").await;
+    quiesce_store_teardown().await;
+    db
+}
+
+/// C-1 网格的密文库格：按 **off** + key 建加密库，返回 `store.db` 路径。
+async fn seed_encrypted_store(dir: &Path) -> PathBuf {
+    drop(
+        open_store_with_requirement(
+            dir,
+            &CipherGate::new(),
+            &present(KEY_A_HEX),
+            RequireEncrypted::Off,
+        )
+        .await
+        .expect("keyed seed"),
+    );
+    quiesce_store_teardown().await;
+    dir.join("store.db")
+}
+
+/// 「开关 on + 明文库 → 终态」两格的公共断言：码 / 终态 / 固定行 / 零写入 /
+/// 零新建与零删除（含 sidecar）/ 明文库本身还在。
+async fn assert_plaintext_refused(
+    dir: &Path,
+    key_state: &StoreKeyState,
+    label: &str,
+) -> StoreOpenError {
+    let db = dir.join("store.db");
+    let before = std::fs::read(&db).expect("store.db");
+    let entries = entry_names(dir);
+    let error =
+        match open_store_with_requirement(dir, &CipherGate::new(), key_state, RequireEncrypted::On)
+            .await
+        {
+            Ok(_) => panic!("{label}：开关 on 必须拒绝明文库"),
+            Err(error) => error,
+        };
+    assert_eq!(error, StoreOpenError::PlaintextRequiresMigration, "{label}");
+    assert_eq!(error.code(), "StorePlaintextRequiresMigration", "{label}");
+    assert!(error.is_terminal(), "{label}：终态不得退化成退避/网络重试");
+    assert_eq!(
+        error.stderr_line(),
+        "kt-signal-engine: ERROR event=store_open_failed code=StorePlaintextRequiresMigration retryable=false",
+        "{label}：固定行与既有六码同形"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("store.db after refusal"),
+        before,
+        "{label}：终态拒绝不得写库"
+    );
+    assert_eq!(
+        entry_names(dir),
+        entries,
+        "{label}：终态拒绝不得新建/删除任何文件（含 -wal/-shm）"
+    );
+    assert!(
+        unexpected_entries(dir).is_empty(),
+        "{label}：拒绝路径不得凭空造文件"
+    );
+    assert!(
+        db.is_file(),
+        "{label}：明文库必须原样留着（迁移器要拿它当源）"
+    );
+    error
+}
+
+/// C-1 开关只认显式词：`on` / `1` / `true` / `yes` 才开；`off` / `0` /
+/// `false` / `no` / 空 / 缺席是 off；认不出的值**不**回落到 on（默认 off 是硬
+/// 约束——笔误不该把一批账号全打成终态）。
+#[test]
+fn require_encrypted_switch_parses_only_explicit_words() {
+    for raw in [
+        None,
+        Some(""),
+        Some("   "),
+        Some("off"),
+        Some("OFF"),
+        Some(" 0 "),
+        Some("false"),
+        Some("No"),
+    ] {
+        assert_eq!(
+            require_encrypted_from_env_value(raw),
+            RequireEncrypted::Off,
+            "raw={raw:?} 必须被认成 off"
+        );
+        assert!(
+            parse_require_encrypted(raw).is_some(),
+            "raw={raw:?} 是合法取值（不是「认不出」）"
+        );
+    }
+    for raw in ["on", "ON", " On ", "1", "true", "Yes"] {
+        assert_eq!(
+            require_encrypted_from_env_value(Some(raw)),
+            RequireEncrypted::On,
+            "raw={raw:?} 必须开启严格路径"
+        );
+        assert!(RequireEncrypted::On.is_on());
+    }
+    for raw in ["enable", "2", "on!", "flase", "yes please"] {
+        assert_eq!(
+            parse_require_encrypted(Some(raw)),
+            None,
+            "raw={raw:?} 是认不出的值"
+        );
+        assert_eq!(
+            require_encrypted_from_env_value(Some(raw)),
+            RequireEncrypted::Off,
+            "raw={raw:?}：认不出 = off（绝不回落到 on）"
+        );
+    }
+}
+
+/// C-1 网格 ①：开关 off × 明文 × 无 key —— 现状逐字节不变（明文照旧打开、
+/// 存量行可读、头仍是明文）。
+#[tokio::test]
+async fn switch_off_plaintext_without_key_still_opens() {
+    let root = sandbox("c1-off-plain-keyless");
+    let dir = root.join("accounts/lk-c1");
+    let db = seed_plaintext_store(&dir).await;
+
+    drop(
+        open_store_with_requirement(
+            &dir,
+            &CipherGate::new(),
+            &StoreKeyState::Absent,
+            RequireEncrypted::Off,
+        )
+        .await
+        .expect("off 必须保持兼容路径"),
+    );
+    assert_eq!(
+        &std::fs::read(&db).expect("store.db")[..16],
+        PLAINTEXT_HEADER,
+        "off 不得改变明文库的形态"
+    );
+    assert_eq!(
+        query_text(&db, None, "SELECT v FROM c1_probe WHERE k = 'probe'")
+            .await
+            .expect("legacy rows readable"),
+        "value"
+    );
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// C-1 网格 ②：开关 off × 明文 × 有 key —— 现状逐字节不变（legacy 打开 +
+/// warn 恰一次），与矩阵 c 同口径。
+#[tokio::test]
+async fn switch_off_plaintext_with_key_still_opens_legacy() {
+    let _serial = legacy_warn_serial().await;
+    store_open::reset_legacy_plaintext_warn();
+    let root = sandbox("c1-off-plain-keyed");
+    let dir = root.join("accounts/lk-c1-keyed");
+    let db = seed_plaintext_store(&dir).await;
+
+    drop(
+        open_store_with_requirement(
+            &dir,
+            &CipherGate::new(),
+            &present(KEY_A_HEX),
+            RequireEncrypted::Off,
+        )
+        .await
+        .expect("off + 有 key 必须仍按 legacy 打开"),
+    );
+    assert_eq!(
+        store_open::legacy_plaintext_warn_count(),
+        1,
+        "off 路径的 legacy 证据行照旧恰一条"
+    );
+    assert_eq!(
+        &std::fs::read(&db).expect("store.db")[..16],
+        PLAINTEXT_HEADER
+    );
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// C-1 网格 ③：开关 off × 密文 × 无 key —— 现状不变（`StoreKeyRequired` 终态）。
+#[tokio::test]
+async fn switch_off_encrypted_without_key_still_reports_key_required() {
+    let root = sandbox("c1-off-cipher-keyless");
+    let dir = root.join("accounts/lk-c1-cipher");
+    let db = seed_encrypted_store(&dir).await;
+    let before = std::fs::read(&db).expect("store.db");
+
+    let error = open_store_with_requirement(
+        &dir,
+        &CipherGate::new(),
+        &StoreKeyState::Absent,
+        RequireEncrypted::Off,
+    )
+    .await
+    .expect_err("密文 + 无 key 照旧终态");
+    assert_eq!(error, StoreOpenError::KeyRequired, "off 不得改变这一格");
+    assert_eq!(std::fs::read(&db).expect("store.db"), before);
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// C-1 网格 ④：开关 off × 密文 × 有 key —— 现状不变（验真后正常打开）。
+#[tokio::test]
+async fn switch_off_encrypted_with_key_still_opens() {
+    let root = sandbox("c1-off-cipher-keyed");
+    let dir = root.join("accounts/lk-c1-cipher-keyed");
+    let db = seed_encrypted_store(&dir).await;
+
+    drop(
+        open_store_with_requirement(
+            &dir,
+            &CipherGate::new(),
+            &present(KEY_A_HEX),
+            RequireEncrypted::Off,
+        )
+        .await
+        .expect("off + 有 key 的密文库照常打开"),
+    );
+    assert!(
+        query_i64(
+            &db,
+            Some(&key(KEY_A_HEX)),
+            "SELECT count(*) FROM _sqlx_migrations"
+        )
+        .await
+        .expect("keyed read")
+            > 0
+    );
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// C-1 网格 ⑤：开关 on × 明文 × **无 key** —— 终态。这一格是开关的意义所在：
+/// 放它过去等于「删掉 key 就能读明文」。
+#[tokio::test]
+async fn switch_on_plaintext_without_key_is_plaintext_requires_migration() {
+    let root = sandbox("c1-on-plain-keyless");
+    let dir = root.join("accounts/lk-c1-on-keyless");
+    seed_plaintext_store(&dir).await;
+
+    assert_plaintext_refused(&dir, &StoreKeyState::Absent, "on/明文/无 key").await;
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// C-1 网格 ⑥：开关 on × 明文 × **有 key** —— 同一终态，且**先于**任何
+/// `probe` / legacy warn（终态闸在「决策是否带 key 打开」之前）。
+#[tokio::test]
+async fn switch_on_plaintext_with_key_is_plaintext_requires_migration() {
+    let _serial = legacy_warn_serial().await;
+    store_open::reset_legacy_plaintext_warn();
+    let root = sandbox("c1-on-plain-keyed");
+    let dir = root.join("accounts/lk-c1-on-keyed");
+    seed_plaintext_store(&dir).await;
+
+    assert_plaintext_refused(&dir, &present(KEY_A_HEX), "on/明文/有 key").await;
+    assert_eq!(
+        store_open::legacy_plaintext_warn_count(),
+        0,
+        "终态闸先于 legacy 打开，不该先打「按明文打开」的证据行"
+    );
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// C-1 网格 ⑦：开关 on × 密文 × 无 key —— 与 off 同判（`StoreKeyRequired`），
+/// 开关只改变了明文那一格。
+#[tokio::test]
+async fn switch_on_encrypted_without_key_still_reports_key_required() {
+    let root = sandbox("c1-on-cipher-keyless");
+    let dir = root.join("accounts/lk-c1-on-cipher");
+    let db = seed_encrypted_store(&dir).await;
+    let before = std::fs::read(&db).expect("store.db");
+
+    let error = open_store_with_requirement(
+        &dir,
+        &CipherGate::new(),
+        &StoreKeyState::Absent,
+        RequireEncrypted::On,
+    )
+    .await
+    .expect_err("密文 + 无 key 与开关无关，仍是终态");
+    assert_eq!(error, StoreOpenError::KeyRequired);
+    assert_eq!(std::fs::read(&db).expect("store.db"), before);
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// C-1 网格 ⑧：开关 on × 密文 × 有 key —— 正常打开（Orchestration apply 之后
+/// 的现实形态：库已是密文，开关可以安全打开）。
+#[tokio::test]
+async fn switch_on_encrypted_with_key_still_opens() {
+    let root = sandbox("c1-on-cipher-keyed");
+    let dir = root.join("accounts/lk-c1-on-cipher-keyed");
+    let db = seed_encrypted_store(&dir).await;
+
+    drop(
+        open_store_with_requirement(
+            &dir,
+            &CipherGate::new(),
+            &present(KEY_A_HEX),
+            RequireEncrypted::On,
+        )
+        .await
+        .expect("迁移完成后开关 on 不得挡住正常的加密库"),
+    );
+    assert_ne!(
+        &std::fs::read(&db).expect("store.db")[..16],
+        PLAINTEXT_HEADER
+    );
+    assert!(
+        query_i64(
+            &db,
+            Some(&key(KEY_A_HEX)),
+            "SELECT count(*) FROM _sqlx_migrations"
+        )
+        .await
+        .expect("keyed read")
+            > 0
+    );
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **C-1 网格 ⑨（补漏，2026-11-12）**：开关 on × **库不存在** × 无 key —— 终态
+/// `StoreKeyRequired`，不建目录、不建库、不写一个字节。
+///
+/// 这一格原来的落点是矩阵 a 的 `(None, Absent)` → 明文创建：开关 on 时它会在
+/// `create_if_missing` 里现造一个**新的明文库**。它比 ⑤（存量明文库）更糟：
+/// 存量至少是迁移源，这一格是开关打开之后才开始的明文生产。语义上也不是
+/// 「要迁移」（盘上连目录都没有），而是「缺 key 就建不出密文库」。
+#[tokio::test]
+async fn switch_on_absent_without_key_refuses_before_creating_plaintext() {
+    let root = sandbox("c1-on-absent-keyless");
+    let dir = root.join("accounts/lk-c1-on-absent");
+
+    let error = open_store_with_requirement(
+        &dir,
+        &CipherGate::new(),
+        &StoreKeyState::Absent,
+        RequireEncrypted::On,
+    )
+    .await
+    .expect_err("开关 on + 无 key + 库不存在必须终态，不得新建明文库");
+    assert_eq!(error, StoreOpenError::KeyRequired);
+    assert_eq!(error.code(), "StoreKeyRequired");
+    assert!(error.is_terminal(), "缺 key 是终态：重试一万次还是缺 key");
+    assert_eq!(
+        error.stderr_line(),
+        "kt-signal-engine: ERROR event=store_open_failed code=StoreKeyRequired retryable=false",
+        "缺 key 的固定行与既有码逐字同形"
+    );
+    assert_ne!(
+        error.code(),
+        StoreOpenError::PlaintextRequiresMigration.code(),
+        "盘上没有明文库可迁移：这一格是「缺 key」，不是「要迁移」"
+    );
+
+    // 零落盘：连账号目录都不建，更不建 store.db（矩阵 a 的产物一个都不许出现）。
+    assert!(!dir.exists(), "拒绝路径不得创建账号目录");
+    assert_eq!(entry_count(&root), 0, "拒绝路径不得落任何文件");
+
+    // 再拒一次仍同码（闸幂等；「每进程恰一条」由真进程用例断言）。
+    let again = open_store_with_requirement(
+        &dir,
+        &CipherGate::new(),
+        &StoreKeyState::Absent,
+        RequireEncrypted::On,
+    )
+    .await
+    .expect_err("第二次仍是终态");
+    assert_eq!(again, error);
+    assert!(
+        !dir.join("store.db").exists(),
+        "两次拒绝都不得建出 store.db"
+    );
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **C-1 网格 ⑨ 的另一半**：开关 on × 库不存在 × **有 key** —— 照常建加密库。
+/// 新闸必须只拦「无 key」，否则开关一开新账号就永远建不出来。
+#[tokio::test]
+async fn switch_on_absent_with_key_still_creates_encrypted_store() {
+    let root = sandbox("c1-on-absent-keyed");
+    let dir = root.join("accounts/lk-c1-on-absent-keyed");
+    let db = dir.join("store.db");
+    let key = key(KEY_A_HEX);
+
+    drop(
+        open_store_with_requirement(
+            &dir,
+            &CipherGate::new(),
+            &StoreKeyState::Present(key.clone()),
+            RequireEncrypted::On,
+        )
+        .await
+        .expect("开关 on + 有 key 的首次创建必须成功"),
+    );
+
+    let bytes = std::fs::read(&db).expect("store.db");
+    assert!(bytes.len() >= 512, "密钥库至少一页");
+    assert_ne!(
+        &bytes[..16],
+        PLAINTEXT_HEADER,
+        "开关 on 下建出来的必须是密文库"
+    );
+    assert!(
+        query_i64(&db, None, "SELECT count(*) FROM _sqlx_migrations")
+            .await
+            .is_err(),
+        "新库无 key 打不开"
+    );
+    assert!(
+        query_i64(&db, Some(&key), "SELECT count(*) FROM _sqlx_migrations")
+            .await
+            .expect("keyed read")
+            > 0,
+        "带 key 读得到迁移账本（库真的被打开了）"
+    );
+
+    // 重开走「密文 + 有 key」那一格（⑧），不被新闸误伤。
+    drop(
+        open_store_with_requirement(
+            &dir,
+            &CipherGate::new(),
+            &StoreKeyState::Present(key.clone()),
+            RequireEncrypted::On,
+        )
+        .await
+        .expect("开关 on 下重开同一份密文库"),
+    );
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **C-1 网格 ⑨ 的 off 对照**：开关 off × 库不存在 × 无 key —— 明文创建照旧
+/// （矩阵 a 逐字节不变）。新闸只在 on 时成立，off 一格都不能动。
+#[tokio::test]
+async fn switch_off_absent_without_key_still_creates_plaintext_store() {
+    let root = sandbox("c1-off-absent-keyless");
+    let dir = root.join("accounts/lk-c1-off-absent");
+    let db = dir.join("store.db");
+
+    drop(
+        open_store_with_requirement(
+            &dir,
+            &CipherGate::new(),
+            &StoreKeyState::Absent,
+            RequireEncrypted::Off,
+        )
+        .await
+        .expect("off + 无 key + 无库仍是兼容的明文创建（矩阵 a）"),
+    );
+
+    let bytes = std::fs::read(&db).expect("store.db");
+    assert_eq!(
+        &bytes[..16],
+        PLAINTEXT_HEADER,
+        "off 造出来的仍是明文库（逐字节与矩阵 a 同形）"
+    );
+    assert!(
+        query_i64(&db, None, "SELECT count(*) FROM _sqlx_migrations")
+            .await
+            .expect("plaintext read")
+            > 0,
+        "无 key 能读到迁移账本（真·明文库）"
+    );
+    assert!(
+        unexpected_entries(&dir).is_empty(),
+        "明文创建不额外造文件：{:?}",
+        unexpected_entries(&dir)
+    );
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// C-1 的顺序契约：开关 on 时**文件头是权威**——「明文头 + 垃圾内容」报
+/// 「要迁移」而不是 `StoreCorrupt`（与迁移器同口径：先看头再谈内容）。
+/// 两条都是终态，区别只在运维读到的码。
+#[tokio::test]
+async fn switch_on_classifies_plaintext_by_header_before_opening() {
+    let root = sandbox("c1-on-plain-junk");
+    let dir = root.join("accounts/lk-c1-junk");
+    let db = dir.join("store.db");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut junk = PLAINTEXT_HEADER.to_vec();
+    junk.extend(std::iter::repeat_n(0_u8, 4096));
+    std::fs::write(&db, &junk).expect("write junk store");
+
+    let error = open_store_with_requirement(
+        &dir,
+        &CipherGate::new(),
+        &present(KEY_A_HEX),
+        RequireEncrypted::On,
+    )
+    .await
+    .expect_err("明文头 = 先要迁移");
+    assert_eq!(error, StoreOpenError::PlaintextRequiresMigration);
+    assert_ne!(
+        error.code(),
+        StoreOpenError::Corrupt(CorruptDetail::Malformed).code(),
+        "头优先，不与「内容坏了」混码"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("junk store preserved"),
+        junk,
+        "拒绝路径不得改动明文库"
+    );
+
+    quiesce_store_teardown().await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// C-1 子用例（新进程）：`KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on` 由 env 进
+/// 进程，明文库 + 无 key → 终态；两次调用只落一条固定行；文件不动。
+#[ignore = "由 switch_on_plaintext_is_terminal_and_reports_once_per_process 以新进程拉起"]
+#[tokio::test]
+async fn child_switch_on_plaintext_requires_migration() {
+    let root = sandbox("child-c1-switch-on");
+    let dir = root.join("accounts/lk-c1-switch");
+    let db = seed_plaintext_store(&dir).await;
+    let before = std::fs::read(&db).expect("store.db");
+    let entries = entry_names(&dir);
+
+    let first = open_store_with(&dir, &CipherGate::new(), &StoreKeyState::Absent)
+        .await
+        .expect_err("env 开关 on + 明文库必须终态");
+    assert_eq!(first, StoreOpenError::PlaintextRequiresMigration);
+    assert!(first.is_terminal());
+    // 第二次：闸幂等（父用例仍只该看到一行）。
+    let second = open_store_with(&dir, &CipherGate::new(), &StoreKeyState::Absent)
+        .await
+        .expect_err("仍然终态");
+    assert_eq!(second, first);
+    assert_eq!(first.report_count(), 1, "每进程每码恰一条");
+    assert_eq!(
+        StoreOpenError::Failed.report_count(),
+        0,
+        "新码不得与可重试类共用闸（共用会互相压制）"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("store.db"),
+        before,
+        "终态拒绝不得写库"
+    );
+    assert_eq!(entry_names(&dir), entries, "终态拒绝不得新建/删除文件");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **C-1 真进程**：开关由 **env** 进入（不是测试注入的枚举），明文库 +
+/// 无 key 在新进程里恰落一条
+/// `code=StorePlaintextRequiresMigration retryable=false`。
+///
+/// 换进程的理由与收尾 2 相同：`report_once` 的闸是进程级一次性槽，
+/// 同进程里前面的用例早把它消费掉了（边打边读永远绿）。
+#[test]
+fn switch_on_plaintext_is_terminal_and_reports_once_per_process() {
+    let case = "child_switch_on_plaintext_requires_migration";
+    let child = run_child_case(case, &[(REQUIRE_ENCRYPTED_ENV, "on")]);
+    assert_child_ran(&child, case);
+    let lines = fixed_lines(&child.stderr);
+    assert_eq!(
+        lines.len(),
+        1,
+        "开关 on 的明文库必须恰落一条固定行（零行 = watchdog 分类不到；多行 = 闸漏）\n--- stderr ---\n{}",
+        child.stderr
+    );
+    assert_eq!(
+        lines[0],
+        "kt-signal-engine: ERROR event=store_open_failed code=StorePlaintextRequiresMigration retryable=false",
+        "C-1 固定行与既有六码逐字同形"
+    );
+}
+
+/// C-1 ⑨ 的子用例（**新进程**）：env 开关 on + 无 key + 库不存在 → 终态
+/// `StoreKeyRequired`；两次调用只落一条固定行；账号目录始终不存在。
+#[ignore = "由 switch_on_absent_without_key_reports_once_per_process 以新进程拉起"]
+#[tokio::test]
+async fn child_switch_on_absent_keyless_emits_key_required_once() {
+    let root = sandbox("child-c1-absent");
+    let dir = root.join("accounts/lk-c1-absent");
+
+    let first = open_store_with(&dir, &CipherGate::new(), &StoreKeyState::Absent)
+        .await
+        .expect_err("env 开关 on + 无 key + 无库必须终态");
+    assert_eq!(first, StoreOpenError::KeyRequired);
+    assert!(first.is_terminal(), "缺 key 不得退化成退避/网络重试");
+    // 第二次：闸幂等（父用例仍只该看到一行）。
+    let second = open_store_with(&dir, &CipherGate::new(), &StoreKeyState::Absent)
+        .await
+        .expect_err("仍然终态");
+    assert_eq!(second, first);
+    assert_eq!(first.report_count(), 1, "每进程每码恰一条");
+    assert_eq!(
+        StoreOpenError::PlaintextRequiresMigration.report_count(),
+        0,
+        "这一格不走「要迁移」的闸（盘上无库可迁）"
+    );
+    assert!(!dir.exists(), "终态路径不得建账号目录");
+    assert!(!dir.join("store.db").exists(), "终态路径不得建库");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// **C-1 ⑨ 真进程**：开关由 **env** 进入（不是测试注入的枚举），
+/// `code=StoreKeyRequired retryable=false` 恰一条；这一格的「终态 + 零文件 +
+/// 固定行一条」三条要求一次钉死。
+#[test]
+fn switch_on_absent_without_key_reports_once_per_process() {
+    let case = "child_switch_on_absent_keyless_emits_key_required_once";
+    let child = run_child_case(case, &[(REQUIRE_ENCRYPTED_ENV, "on")]);
+    assert_child_ran(&child, case);
+    let lines = fixed_lines(&child.stderr);
+    assert_eq!(
+        lines.len(),
+        1,
+        "开关 on + 无 key + 无库必须**恰**落一条固定行（零行 = watchdog 看不到；多行 = 闸漏）\n--- stderr ---\n{}",
+        child.stderr
+    );
+    assert_eq!(
+        lines[0],
+        "kt-signal-engine: ERROR event=store_open_failed code=StoreKeyRequired retryable=false",
+        "缺 key 的固定行与既有码逐字同形"
     );
 }

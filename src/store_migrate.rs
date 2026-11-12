@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! M6 D1：engine 明文 `accounts/lk-*/store.db` → **加密库**的正向迁移器
-//! （设计：`docs/plan/engine-store-migration-design.md` §2–§5、§9、§10）。
+//! M6 D：engine `accounts/lk-*/store.db` 的**双向**迁移器——正向明文 → 加密库
+//! （D1），反向加密库 → 明文（D2）（设计：`docs/plan/engine-store-migration-design.md`
+//! §2–§6、§9、§10）。
 //!
 //! 位置（设计 §2.2）：**同一二进制的新 argv 模式**
-//! `kt-signal-engine --data-dir <DIR> storeMigrate [--account <lk-hex>] [--dry-run] [--json]`，
+//! `kt-signal-engine --data-dir <DIR> storeMigrate [--account <lk-hex>]
+//! [--direction to-encrypted|to-plaintext] [--dry-run] [--json]`，
 //! 与 `jsonRpc` 互斥、未知参数仍 exit 2（`src/main.rs` 的严格口径不变）。不放
 //! 进 `open_store`（72 处调用点 + 接收路径 90s 超时会把迁移判成卡死），也不做
 //! 启动内联迁移（连接器 15s 请求 / 30s watchdog 会在导出中途杀掉引擎）。
@@ -27,13 +29,19 @@
 //! 5. **每账号独立、串行、崩溃可续**：枚举 `accounts/lk-*`（不是注册表），
 //!    按目录名排序逐个迁；单账号失败不阻断其余；`store-migrate.lock`
 //!    非阻塞 flock 保证同一 data-dir 只有一次迁移在跑。
-//! 6. **只做正向**：`--direction to-plaintext` 在本批是用法错误（exit 2），
-//!    反向迁移（含往返一致性）属 D2。
+//! 6. **两个方向共用一套收敛规则**：正向（`--direction to-encrypted`，默认）
+//!    明文 → 加密，反向（`--direction to-plaintext`）加密 → 明文。方向只改
+//!    「目标态」与「导出用的 KEY」，五步名、退出码（0/2/10/11）与 `--json`
+//!    形状完全一致（设计 §2.2/§10.2）——连接器不需要认第三套契约。
+//! 7. **失败不碰原库、不留第三态**：反向只读源库（checkpoint / integrity /
+//!    事实快照 / 字节拷贝 / 导出全在 rename 之前），失败路径逐字节保留原
+//!    加密库；staging（`.decrypting`）是唯一可抛弃物，绝不接管半成品。
 //!
 //! 正向五步（设计 §3）：
 //!
 //! ```text
 //! 0) 残留清理     staging(+sidecar)、marker tmp、明文主库上的旧备份
+//!                 ——**收在源库校验之后**（终态 11 的现场必须逐文件不变）
 //! 1) 一致性快照   wal_checkpoint(TRUNCATE) 断言 busy=0 → integrity_check=ok
 //!                 → VACUUM INTO store.db.plaintext-backup → fsync
 //! 2) 导出加密库   ATTACH … AS encrypted KEY ?（绑定参数）→ sqlcipher_export
@@ -44,6 +52,29 @@
 //! 5) 保留窗口     .plaintext-backup 保留 7 天；**只在主库已加密且可打开时**
 //!                 才按 mtime 清理（主库状态不明 → 永不删备份）
 //! ```
+//!
+//! 反向五步（设计 §6.3，步骤名与正向逐项对齐，便于连接器对账）：
+//!
+//! ```text
+//! 0) 残留清理     staging(.decrypting)(+sidecar)、marker tmp、旧加密备份
+//!                 ——**收在 key/marker/integrity 校验之后**（同上）
+//! 1) 一致性快照   带 key 打开 → wal_checkpoint(TRUNCATE) 断言 busy=0
+//!                 → integrity_check=ok + cipher_integrity_check 空
+//!                 → 源库事实快照（schema/行数/账本/序列/头字段/注册事实）
+//! 2) 备份         收口 WAL → **字节拷贝** store.db → .encrypted-backup
+//!                 → fsync → 用同一把 key 验真（回滚物必须打得开）
+//! 3) 导出明文     ATTACH … AS plain KEY '' → sqlcipher_export
+//!                 → 补 user_version/application_id → DETACH → fsync
+//! 4) 校验矩阵     §4 的镜像：头 == SQLite format 3、**无 key** 能打开且
+//!                 integrity/foreign_key 全绿、逐表行数/账本/序列/头字段相等、
+//!                 presage load_registration_data 与源侧事实一致
+//! 5) 替换         keyed checkpoint 收口 → remove_sidecars(store.db)
+//!                 → rename(staging → store.db) → fsync(目录)
+//!                 → store.format 置 state=plaintext
+//! ```
+//!
+//! 反向**不解决「key 丢了」**：没有 key 就没有反向（设计 §6.2）。`.encrypted-backup`
+//! 保留 7 天，且这 7 天内 key 也不能删——否则备份等于废纸。
 //!
 //! 崩溃断点（设计 §5.4，B0–B5）全部靠「头分类 + 先删 staging 再重做」收敛，
 //! 绝不接管半成品 staging（没有提交标记就无法证明它完整）。debug 构建另有
@@ -85,10 +116,22 @@ pub(crate) const EXIT_RETRY: u8 = 10;
 /// 终态：key 缺失/不匹配、源库损坏、校验不过、权限拒绝、账号目录消失（等人）。
 pub(crate) const EXIT_TERMINAL: u8 = 11;
 
-/// 明文备份后缀（与 connector 同源 `src/store.rs:62`）。
+/// 正向的明文备份后缀（与 connector 同源 `src/store.rs:62`）。
 pub(crate) const BACKUP_SUFFIX: &str = ".plaintext-backup";
-/// 加密 staging 后缀（connector 同源 `:64`）。
+/// 正向的加密 staging 后缀（connector 同源 `:64`）。
 pub(crate) const STAGING_SUFFIX: &str = ".encrypting";
+/// 反向的明文 staging 后缀。**刻意不复用 `.encrypting`**：两个方向的半成品
+/// 落在同一个路径上时，崩溃后无法从文件名判断它是「导出到一半的密文」还是
+/// 「导出到一半的明文」——那种歧义正是「不留第三态」要排除的东西。
+pub(crate) const DECRYPTING_SUFFIX: &str = ".decrypting";
+/// 反向的加密备份后缀。备份是**字节拷贝**（设计 §6.3 第 3 步）：加密文件的
+/// 字节拷贝与源文件逐字节等价，不依赖 `VACUUM INTO` 是否继承加密参数。
+pub(crate) const ENCRYPTED_BACKUP_SUFFIX: &str = ".encrypted-backup";
+/// `store.format` 的 `state=` 取值：主库已加密（正向完成）。
+pub(crate) const STATE_SQLCIPHER_V1: &str = "sqlcipher-v1";
+/// `store.format` 的 `state=` 取值：主库已回到明文（反向完成）。
+/// 只作审计——正确性判断永远读文件头（设计 §5.2）。
+pub(crate) const STATE_PLAINTEXT: &str = "plaintext";
 /// 审计 marker（**不参与正确性判断**，设计 §5.2）。
 pub(crate) const MARKER_FILE: &str = "store.format";
 /// data-dir 级迁移锁（0600，非阻塞 flock；设计 §5.1）。
@@ -108,8 +151,11 @@ const CHECKPOINT_RETRIES: usize = 3;
 
 /// 证据码字面量（连接器与运维 grep 的唯一判据；不做前缀匹配）。
 pub(crate) mod codes {
-    /// 迁移成功。
+    /// 正向迁移成功（明文 → 加密）。
     pub const MIGRATED: &str = "store_migrated";
+    /// 反向迁移成功（加密 → 明文）。与 `MIGRATED` 对称：`action` 仍是
+    /// `migrate`（确实发生了一次替换），靠 code 区分方向。
+    pub const PLAINTEXT_RESTORED: &str = "store_plaintext_restored";
     /// 已经是加密库 → 幂等跳过。
     pub const NOOP: &str = "store_migration_noop";
     /// 没有库 / 0 字节 → 新建是 C 的事。
@@ -147,9 +193,15 @@ pub(crate) mod codes {
     /// 主库状态违规（设计 §5.5：头与内容自相矛盾——加密库
     /// `integrity_check` 或 `cipher_integrity_check` 不过）。
     pub const STATE_INVALID: &str = "store_state_invalid";
+    /// 明文库 + 引擎的 C-1 开关 on（复用 C 的码面）。迁移器自己按文件头分流，
+    /// 走不到这一格；留着是为了让「分类结果 → 失败码」的映射保持全量，不靠
+    /// 通配吞掉新码。
+    pub const PLAINTEXT_REQUIRES_MIGRATION: &str = "StorePlaintextRequiresMigration";
 }
 
-/// 正向五步的计划标签（`--json` 的 `plan[]`/`did[]` 逐项对账用）。
+/// 两个方向共用的五步计划标签（`--json` 的 `plan[]`/`did[]` 逐项对账用）。
+/// 方向只改步骤的实现（导出到密文 / 导出到明文），**不改步骤名与顺序**——
+/// 连接器按字面量逐项对账，多一套名字等于多一条会漂移的契约。
 const STEPS: [&str; 5] = ["checkpoint", "backup", "export", "verify", "swap"];
 
 /// `accounts[].action` 的封闭取值（设计 §2.2；连接器按字面量分桶）。
@@ -165,15 +217,11 @@ const ACTION_FAILED: &str = "failed";
 /// `--data-dir storeMigrate`：那个 `storeMigrate` 是目录名，不是子命令）。
 const VALUE_OPTIONS: [&str; 4] = ["--data-dir", "--receive-mode", "--account", "--direction"];
 
-/// 反向迁移在本构建里的用法错误行（D2 待做）。
-const DIRECTION_UNSUPPORTED_LINE: &str =
-    "usage: --direction to-plaintext is not implemented in this build (phase D2)";
-
 // —————————————————————————————— argv（严格模式） ——————————————————————————————
 
-/// 迁移方向。D1 只落 `ToEncrypted`；`ToPlaintext` 保留在解析面（否则
-/// `--direction to-plaintext` 会被当成未知参数，与「D2 待做」的语义混在一起），
-/// 但由 `entry` 以 exit 2 明确拒绝。
+/// 迁移方向：`ToEncrypted`（默认，设计 §3）与 `ToPlaintext`（设计 §6）。
+/// 两个方向都是**本二进制的一等能力**：反向是二进制回退与 kill switch 的
+/// 唯一可执行路径，不是调试开关。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Direction {
     ToEncrypted,
@@ -306,11 +354,6 @@ fn is_account_name(name: &str) -> bool {
 /// 迁移命令入口（`src/main.rs` 在**任何磁盘动作之前**调用：能力门是本入口
 /// 的第一个动作，见模块头不变量 1）。
 pub(crate) async fn entry(args: MigrateArgs) -> ExitCode {
-    if args.direction == Direction::ToPlaintext {
-        // D1 只做正向；反向迁移（含往返一致性）属 D2。
-        eprintln!("kt-signal-engine: {DIRECTION_UNSUPPORTED_LINE}");
-        return ExitCode::from(EXIT_USAGE);
-    }
     // 1) 能力门：硬门，且**早于任何磁盘动作**（含 logs/ 的创建）。
     if store_cipher::ensure_cipher_capable().await.is_err() {
         let report = MigrateReport {
@@ -457,13 +500,17 @@ struct AccountOutcome {
 }
 
 impl AccountOutcome {
-    fn new(lk: &str, started: Instant) -> Self {
+    /// `elapsed_ms` 在构造时一律 0：真正的耗时只能由 [`migrate_account`] 在
+    /// **整个迁移返回之前**回填。旧实现这里取 `started.elapsed()`，于是
+    /// `--json` 的 `accounts[].elapsedMs` 恒 0（构造那一刻当然还没耗时）——
+    /// 连接器/验收拿它当性能证据时等于读到一条假数据。
+    fn new(lk: &str) -> Self {
         Self {
             lk: lk.to_owned(),
             action: "noop",
             code: codes::ABSENT,
             bytes: None,
-            elapsed_ms: started.elapsed().as_millis(),
+            elapsed_ms: 0,
             keyid: None,
             backup: None,
             terminal: false,
@@ -684,9 +731,31 @@ fn enumerate_accounts(accounts_dir: &Path, only: Option<&str>) -> Result<Vec<Str
 }
 
 /// 单账号迁移（三种输入 → 三种结局，设计 §5.3）。
+///
+/// 计时刻意放在**这一层**：`migrate_account_inner` 有十几个提前返回点，任何
+/// 一个漏填都会让 `elapsedMs` 变成 0；包装层只在 return 前统一回填一次。
 async fn migrate_account(context: &Context<'_>, lk: &str) -> AccountOutcome {
     let started = Instant::now();
-    let mut outcome = AccountOutcome::new(lk, started);
+    let mut outcome = migrate_account_guarded(context, lk).await;
+    outcome.elapsed_ms = started.elapsed().as_millis();
+    outcome
+}
+
+/// 场景守卫：任何失败都在返回前把**本次探针新建的空 sidecar** 收回，让
+/// 「失败 = 现场逐文件不变」在目录快照层面成立（见 [`SidecarBaseline`]）。
+async fn migrate_account_guarded(context: &Context<'_>, lk: &str) -> AccountOutcome {
+    let store = context.accounts_dir.join(lk).join(STORE_DB_FILE);
+    let baseline = SidecarBaseline::capture(&store);
+    let outcome = migrate_account_inner(context, lk).await;
+    if outcome.action == ACTION_FAILED {
+        baseline.restore(&store);
+    }
+    outcome
+}
+
+/// [`migrate_account`] 的主体（不含计时；返回值由包装层补 `elapsed_ms`）。
+async fn migrate_account_inner(context: &Context<'_>, lk: &str) -> AccountOutcome {
+    let mut outcome = AccountOutcome::new(lk);
     outcome.keyid = Some(context.keyid.clone());
     let dir = context.accounts_dir.join(lk);
     let store = dir.join(STORE_DB_FILE);
@@ -695,31 +764,35 @@ async fn migrate_account(context: &Context<'_>, lk: &str) -> AccountOutcome {
         Ok(state) => state,
         Err(error) => return fail_outcome(outcome, classify_open_error(error)),
     };
-    match state {
-        StoreFileState::Absent => {
+    let dry_run = context.args.dry_run;
+    match (context.args.direction, state) {
+        // 没有库 / 0 字节：新建是 C 的事，两个方向都无事可做。
+        (_, StoreFileState::Absent) => {
             outcome.action = ACTION_ABSENT;
             outcome.code = codes::ABSENT;
             outcome
         }
-        // 干跑对已加密库只做分类（不做 key 验真：验真会开连接、落 sidecar，
-        // 与「不写一个字节」冲突；干跑是计划工具，不是诊断工具）。
-        StoreFileState::Opaque if context.args.dry_run => {
+        // 干跑对「已处在目标态」的库只做分类（不做 key 验真：验真会开连接、
+        // 落 sidecar，与「不写一个字节」冲突；干跑是计划工具，不是诊断工具）。
+        (Direction::ToEncrypted, StoreFileState::Opaque) if dry_run => {
             outcome.action = ACTION_NOOP;
             outcome.code = codes::NOOP;
             outcome
         }
-        StoreFileState::Opaque => settle_encrypted(context, outcome, &dir, &store).await,
-        StoreFileState::Plaintext => {
-            let dry_run = context.args.dry_run;
+        (Direction::ToPlaintext, StoreFileState::Plaintext) if dry_run => {
+            outcome.action = ACTION_NOOP;
+            outcome.code = codes::NOOP;
+            outcome
+        }
+        (Direction::ToEncrypted, StoreFileState::Opaque) => {
+            settle_encrypted(context, outcome, &dir, &store).await
+        }
+        (Direction::ToPlaintext, StoreFileState::Plaintext) => {
+            settle_plaintext(context, outcome, &dir, &store).await
+        }
+        (Direction::ToEncrypted, StoreFileState::Plaintext) => {
             match migrate_plaintext(context, &mut outcome, &dir, &store).await {
-                Ok(()) if dry_run => {
-                    // 干跑：只有计划。action/code/backup 一个都不许报成「已迁移」
-                    // ——连接器按 action 分桶，谎报 backup 会让它以为手里有回滚物。
-                    outcome.action = ACTION_DRY_RUN;
-                    outcome.code = codes::PLANNED;
-                    outcome.backup = None;
-                    outcome
-                }
+                Ok(()) if dry_run => dry_run_outcome(outcome),
                 Ok(()) => {
                     outcome.action = ACTION_MIGRATE;
                     outcome.code = codes::MIGRATED;
@@ -730,7 +803,29 @@ async fn migrate_account(context: &Context<'_>, lk: &str) -> AccountOutcome {
                 Err(failure) => fail_outcome(outcome, failure),
             }
         }
+        (Direction::ToPlaintext, StoreFileState::Opaque) => {
+            match migrate_to_plaintext(context, &mut outcome, &dir, &store).await {
+                Ok(()) if dry_run => dry_run_outcome(outcome),
+                Ok(()) => {
+                    outcome.action = ACTION_MIGRATE;
+                    outcome.code = codes::PLAINTEXT_RESTORED;
+                    outcome.bytes = fs::metadata(&store).ok().map(|meta| meta.len());
+                    outcome.backup = Some(format!("{STORE_DB_FILE}{ENCRYPTED_BACKUP_SUFFIX}"));
+                    outcome
+                }
+                Err(failure) => fail_outcome(outcome, failure),
+            }
+        }
     }
+}
+
+/// 干跑结局：只有计划。`action`/`code`/`backup` 一个都不许报成「已迁移」
+/// ——连接器按 action 分桶，谎报 backup 会让它以为手里有回滚物。
+fn dry_run_outcome(mut outcome: AccountOutcome) -> AccountOutcome {
+    outcome.action = ACTION_DRY_RUN;
+    outcome.code = codes::PLANNED;
+    outcome.backup = None;
+    outcome
 }
 
 /// 已加密（或垃圾）库的收敛分支：key 打得开 → 幂等 no-op（补 marker、
@@ -744,8 +839,6 @@ async fn settle_encrypted(
 ) -> AccountOutcome {
     outcome.action = ACTION_NOOP;
     outcome.code = codes::NOOP;
-    // B5：marker 的 tmp 残留一律可抛弃。
-    remove_marker_tmp(dir);
     if let Err(failure) = store_open::probe_keyed_store(store, context.key).await {
         return fail_outcome(outcome, classify_open_error(failure));
     }
@@ -759,13 +852,9 @@ async fn settle_encrypted(
     outcome
         .checks
         .extend(["store_integrity_check", "store_cipher_integrity_check"]);
-    // 验真连接是读写连接（WAL 下会建 -wal/-shm），且 sqlx 的关闭是异步的：
-    // 等一小段静默把空 sidecar 回收掉，别让一次「零字节改动」的幂等跳过多出
-    // 两个文件（非空 WAL 绝不动——那里面有已提交帧）。
-    tokio::time::sleep(STORE_TEARDOWN_QUIET).await;
-    remove_empty_sidecars(store);
     // 指纹比对（marker 只作证据：缺 marker 只是少一条诊断；存在且不符 =
-    // 有人换过 key，绝不打开/重建）。
+    // 有人换过 key，绝不打开/重建）。**排在清 sidecar 之前**：终态 11 一个文件
+    // 都不许动（清空 sidecar 也是改动现场）。
     if let Some(recorded) = read_marker_fingerprint(dir) {
         if recorded != context.fingerprint {
             return fail_outcome(
@@ -777,15 +866,85 @@ async fn settle_encrypted(
             );
         }
     }
+    // B5：marker 的 tmp 残留一律可抛弃。**收在闸之后**：终态 11（错 key /
+    // 指纹不符 / 完整性不过）的要求是现场逐文件不变，删 tmp 也是改动现场。
+    remove_marker_tmp(dir);
+    // 验真连接是读写连接（WAL 下会建 -wal/-shm），且 sqlx 的关闭是异步的：
+    // 等一小段静默把空 sidecar 回收掉，别让一次「零字节改动」的幂等跳过多出
+    // 两个文件（非空 WAL 绝不动——那里面有已提交帧）。
+    tokio::time::sleep(STORE_TEARDOWN_QUIET).await;
+    remove_empty_sidecars(store);
     // B4：rename 与 marker 之间的窗口——库已加密可打开，补写 marker（审计）。
     if !dir.join(MARKER_FILE).is_file() {
-        if let Err(failure) = write_marker(dir, &context.keyid, &context.fingerprint) {
+        if let Err(failure) = write_marker(
+            dir,
+            STATE_SQLCIPHER_V1,
+            &context.keyid,
+            &context.fingerprint,
+        ) {
             return fail_outcome(outcome, failure);
         }
         outcome.did.push("marker");
     }
     // 保留窗口：**只有主库被判为加密且可打开**时才允许按 mtime 清理备份。
-    if prune_expired_backup(dir).is_some() {
+    if prune_expired_backup(dir, BACKUP_SUFFIX).is_some() {
+        outcome.did.push("prune_backup");
+    }
+    outcome
+}
+
+/// 明文库的收敛分支（反向方向的目标态）：已经是明文 → 幂等 no-op。
+///
+/// 与 [`settle_encrypted`] 镜像：
+///
+/// - 设计 §5.5 的谓词在明文侧同样成立：头=明文 ⇒ 必须能**无 key** 打开且
+///   `integrity_check=ok`。一个"头是明文但打不开"的库就是第三态，必须终态
+///   报出来，而不是报 noop/exit 0；
+/// - `.decrypting` 半成品一律可抛弃（B0–B3 的收敛入口）；
+/// - `.encrypted-backup` 的 7 天保留窗口同样只在「主库已是明文且可打开」时
+///   才允许清理（主库状态不明 → 永不删备份）。
+async fn settle_plaintext(
+    context: &Context<'_>,
+    mut outcome: AccountOutcome,
+    dir: &Path,
+    store: &Path,
+) -> AccountOutcome {
+    outcome.action = ACTION_NOOP;
+    outcome.code = codes::NOOP;
+    // 先判「头=明文 ⇒ 必须能无 key 打开且 integrity ok」，**再**清可抛弃物：
+    // 终态 11 的现场要逐文件不变（旧顺序会在报错前先把 staging / marker tmp
+    // 删掉，取证材料没了，目录快照也不可能是空的）。
+    if let Err(failure) = verify_plaintext_integrity(store).await {
+        return fail_outcome(outcome, failure);
+    }
+    outcome.checks.push("store_integrity_check");
+    // staging 是我们自己的可抛弃物：正常路径上 rename 之后不可能再留着它，
+    // 这里清的是「被 kill 在 rename 之前、之后又有人把主库手工换回明文」这类
+    // 人工操作留下的孤儿。
+    let staging = dir.join(format!("{STORE_DB_FILE}{DECRYPTING_SUFFIX}"));
+    if staging.exists() {
+        if let Err(failure) = remove_staging(&staging) {
+            return fail_outcome(outcome, failure);
+        }
+        outcome.did.push("cleanup");
+    }
+    remove_marker_tmp(dir);
+    // 与 [`settle_encrypted`] 同款收口：验真连接是读写连接，sqlx 关闭是
+    // 异步的，等一小段静默把空 sidecar 回收掉（非空 WAL 绝不动）。
+    tokio::time::sleep(STORE_TEARDOWN_QUIET).await;
+    remove_empty_sidecars(store);
+    // marker 只是审计：头是明文而 marker 还写着 sqlcipher-v1（反向的
+    // 「rename 后 / marker 前」窗口）→ 补写成 plaintext。**marker 不存在时
+    // 不写**：一个从没迁移过的老明文库不该因为跑了一次反向干跑就多出文件。
+    if dir.join(MARKER_FILE).is_file() && marker_state(dir).as_deref() != Some(STATE_PLAINTEXT) {
+        if let Err(failure) =
+            write_marker(dir, STATE_PLAINTEXT, &context.keyid, &context.fingerprint)
+        {
+            return fail_outcome(outcome, failure);
+        }
+        outcome.did.push("marker");
+    }
+    if prune_expired_backup(dir, ENCRYPTED_BACKUP_SUFFIX).is_some() {
         outcome.did.push("prune_backup");
     }
     outcome
@@ -818,13 +977,10 @@ async fn migrate_plaintext(
         return Ok(());
     }
 
-    // 0) 残留清理（B0/B1/B2/B3 的收敛入口）：staging + 其 sidecar、marker
-    //    tmp。明文主库 = 上一次迁移没完成，那种备份不可能是任何「完整迁移」
-    //    的回滚物（真正回滚物是明文主库本身），所以它占着 VACUUM INTO 的目标
-    //    路径时必须先删（设计 §5.4 B1）。
-    remove_staging(&staging)?;
-    remove_marker_tmp(dir);
-    remove_file_if_exists(&backup)?;
+    // 0) 残留清理与 1) 一致性快照的顺序是刻意的：**先验证源库、再动残留**。
+    //    staging/marker tmp/旧备份都是可抛弃物，但「源库损坏 → 终态 11」的
+    //    要求是现场逐文件不变；在校验之前删文件等于把取证材料先吃掉（正向
+    //    旧实现就是先删 `.plaintext-backup`）。清理统一收在 VACUUM INTO 之前。
 
     // 1) 一致性快照：无 key 打开（create_if_missing=false，偏离 D-1）。
     let mut source = connect_plain(store).await?;
@@ -848,6 +1004,14 @@ async fn migrate_plaintext(
     // 注册事实也要在**源侧**取真值（设计 §4 的语义行是「Some 且 ACI/设备名
     // 与迁移前一致」——只验证 staging 自己能读出 Some 是空转）。
     let source_registration = read_registration_facts(&mut source).await?;
+
+    // 0) 残留清理（B0/B1/B2/B3 的收敛入口）：staging + 其 sidecar、marker
+    //    tmp、上一次的明文备份。收在这里的理由见上面——任何一条终态失败都
+    //    不许先删东西。备份占着 VACUUM INTO 的目标路径时**必须先删**（设计
+    //    §5.4 B1），但只在这条即将真正写盘的路上删。
+    remove_staging(&staging)?;
+    remove_marker_tmp(dir);
+    remove_file_if_exists(&backup)?;
 
     // 2) 明文备份：VACUUM INTO（目标已存在会失败，第 0 步已删）。
     let backup_path = backup
@@ -888,14 +1052,14 @@ async fn migrate_plaintext(
     fsync_dir(dir).map_err(|error| Failure::io(&error, codes::IO_FAILED))?;
     outcome.did.push("export");
     fault_point("after_export");
-    fault_mutate_staging(&staging, context.key).await;
+    fault_mutate_staging(&staging, Some(context.key)).await;
 
     // 4) 校验矩阵（fail → 删 staging，保留原库与备份；设计 §4/D-19）。
     outcome.checks = verify_staging(context, &staging, &source_stats, &source_registration).await?;
     outcome.did.push("verify");
     // 语义 probe 会以引擎真实打开路径跑一次 schema 迁移，因此排在结构比对
     // **之后**；跑完必须把 WAL 收口再删 sidecar，否则可能丢最后几页。
-    checkpoint_staging(&staging, context.key).await?;
+    checkpoint_staging(&staging, Some(context.key)).await?;
     remove_sidecars(&staging);
 
     // 5) 替换（顺序写死，任何时刻 store.db 要么完整明文、要么完整密文）。
@@ -912,7 +1076,172 @@ async fn migrate_plaintext(
     outcome.did.push("swap");
     fault_point("after_rename");
     fault_point("before_marker");
-    write_marker(dir, &context.keyid, &context.fingerprint)?;
+    write_marker(
+        dir,
+        STATE_SQLCIPHER_V1,
+        &context.keyid,
+        &context.fingerprint,
+    )?;
+    outcome.did.push("marker");
+    Ok(())
+}
+
+/// 反向五步（加密 → 明文，设计 §6.3）。
+///
+/// 与正向严格镜像，但有四处刻意的不同：
+///
+/// 1. **备份是字节拷贝**（不是 `VACUUM INTO`）：加密文件的字节拷贝与源文件
+///    逐字节等价，不依赖「`VACUUM INTO` 是否继承加密参数」这种实现细节；
+/// 2. **源库全程只读**：checkpoint / integrity / 事实快照 / 拷贝 / 导出都在
+///    rename 之前完成，任一失败都逐字节保留原加密库；
+/// 3. **staging 用 `.decrypting`**、备份用 `.encrypted-backup`：不复用正向的
+///    名字，否则崩溃后同一个路径上的半成品无法判断方向；
+/// 4. 校验是 §4 矩阵的**镜像**：头必须是明文、**无 key** 能打开、行数/账本/
+///    序列/头字段相等、`load_registration_data` 与源侧事实一致。
+async fn migrate_to_plaintext(
+    context: &Context<'_>,
+    outcome: &mut AccountOutcome,
+    dir: &Path,
+    store: &Path,
+) -> Result<(), Failure> {
+    let backup = dir.join(format!("{STORE_DB_FILE}{ENCRYPTED_BACKUP_SUFFIX}"));
+    let staging = dir.join(format!("{STORE_DB_FILE}{DECRYPTING_SUFFIX}"));
+    outcome.plan = STEPS.to_vec();
+    outcome.bytes = fs::metadata(store).ok().map(|meta| meta.len());
+    // 前置（干跑也做）：空闲 ≥ L×2.1 + 32 MiB（与正向同口径——一次反向要同时
+    // 放下「加密备份」与「明文 staging」两份临时文件）。
+    let need = space_need(store_sizes(store));
+    let free = free_bytes(dir, context.hooks)?;
+    outcome.free_bytes = Some(free);
+    outcome.need_bytes = Some(need);
+    if free < need {
+        return Err(Failure::retryable(
+            codes::NO_SPACE,
+            format!("free={free} need={need}"),
+        ));
+    }
+    if context.args.dry_run {
+        // 干跑：只读元数据 + 头分类 + 空间读数，不打开库、不写一个字节。
+        return Ok(());
+    }
+
+    // 0) 残留清理（B0–B3 的收敛入口）：明文 staging + 其 sidecar、marker
+    //    tmp、上一次留下的加密备份。**必须排在 key/marker/integrity 全部
+    //    通过之后**（见下面第 2 步之前）：终态 11 的要求是「现场逐文件不
+    //    变」，这里每删一个文件都等于先吃掉回滚物或取证材料。
+    //
+    // 1) 一致性快照：先验真 key（与打开路径同一个函数），再 checkpoint。
+    //    少了验真这一步，错 key 会在第一条 PRAGMA 上以「SQLite says not a
+    //    database」冒出来，被 IO 分类吞成可重试 10——错 key 重试一万次还是
+    //    错 key，必须终态（设计 D-10）。
+    if let Err(failure) = store_open::probe_keyed_store(store, context.key).await {
+        return Err(classify_open_error(failure));
+    }
+    // marker 只作证据：存在且指纹不符 = 换过 key（设计 D-09：既不迁移也不重建）。
+    if let Some(recorded) = read_marker_fingerprint(dir) {
+        if recorded != context.fingerprint {
+            return Err(Failure::terminal(
+                codes::KEY_MISMATCH,
+                "store key does not match the fingerprint recorded in store.format",
+            ));
+        }
+    }
+    let mut source = connect_keyed(store, context.key).await?;
+    let checkpoint = checkpoint_truncate(&mut source).await?;
+    if checkpoint.busy != 0 {
+        return Err(Failure::retryable(
+            codes::BUSY,
+            format!("wal_checkpoint busy={}", checkpoint.busy),
+        ));
+    }
+    outcome.did.push("checkpoint");
+    if !integrity_ok(&mut source).await? {
+        return Err(Failure::terminal(
+            codes::CORRUPT,
+            "encrypted source PRAGMA integrity_check is not ok",
+        ));
+    }
+    // 页 HMAC 也要过：把一页撕裂的密文导成明文，等于把损坏固化进新库。
+    let cipher_rows: Vec<String> = sqlx::query_scalar("PRAGMA cipher_integrity_check")
+        .fetch_all(&mut source)
+        .await
+        .map_err(|error| sql_failure(error, codes::STATE_INVALID))?;
+    if !cipher_rows.is_empty() {
+        return Err(Failure::terminal(
+            codes::STATE_INVALID,
+            "encrypted source PRAGMA cipher_integrity_check is not empty",
+        ));
+    }
+    outcome
+        .checks
+        .extend(["source_integrity_check", "source_cipher_integrity_check"]);
+    // 源库事实快照 + 注册事实（与正向同款：源侧取真值，staging 只做比对）。
+    let source_stats = collect_stats(&mut source).await?;
+    let source_registration = read_registration_facts(&mut source).await?;
+    close(source).await?;
+    // 拷贝之前必须确认 WAL 已空：字节拷贝只复制主库文件，WAL 里还有已提交帧
+    // 时拷出来的备份就是缺数据的（折不进去 → 可重试 10，现场不动）。
+    checkpoint_keyed_quiet(store, context.key).await?;
+    remove_empty_sidecars(store);
+
+    // 0) 残留清理（收口到这里才做）：上面 key/marker/打开/checkpoint/
+    //    integrity/cipher_integrity 任何一步失败都是终态 11，那时必须**一个
+    //    文件都不动**——旧实现把这三行放在校验之前，一次错 key 就把上一次的
+    //    `.encrypted-backup` 删了，直接毁掉唯一的回滚物。
+    //    备份仍然在**拷贝之前**删：字节拷贝会覆盖同名文件，但「失败路径里留
+    //    着一个上一次的备份」会被误读成本次的回滚物（确定性）。
+    remove_staging(&staging)?;
+    remove_marker_tmp(dir);
+    remove_file_if_exists(&backup)?;
+
+    // 2) 加密备份：字节拷贝 + fsync（设计 §6.3 第 3 步）。
+    fs::copy(store, &backup).map_err(|error| Failure::io(&error, codes::IO_FAILED))?;
+    fsync_file(&backup).map_err(|error| Failure::io(&error, codes::IO_FAILED))?;
+    fsync_dir(dir).map_err(|error| Failure::io(&error, codes::IO_FAILED))?;
+    ensure_encrypted_backup(&backup, context.key).await?;
+    outcome.did.push("backup");
+    fault_point("after_backup");
+
+    // 3) 导出明文 staging：ATTACH … AS plain KEY '' → sqlcipher_export('plain')。
+    let staging_path = staging
+        .to_str()
+        .ok_or_else(|| Failure::terminal(codes::FAILED, "staging path is not valid UTF-8"))?;
+    // 与正向同一条理由：ATTACH 的建文件权限跟随主库连接（源库连接是
+    // create_if_missing(false)），所以先建一个**空文件**再交给 ATTACH。
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .map_err(|error| Failure::io(&error, codes::IO_FAILED))?;
+    let mut source = connect_keyed(store, context.key).await?;
+    attach_export_plain(&mut source, staging_path, &source_stats).await?;
+    close(source).await?;
+    fsync_file(&staging).map_err(|error| Failure::io(&error, codes::IO_FAILED))?;
+    fsync_dir(dir).map_err(|error| Failure::io(&error, codes::IO_FAILED))?;
+    outcome.did.push("export");
+    fault_point("after_export");
+    fault_mutate_staging(&staging, None).await;
+
+    // 4) 校验矩阵（§4 的镜像）：不过 → 删 staging，保留原密文库与加密备份。
+    outcome.checks.extend(
+        verify_plaintext_staging(context, &staging, &source_stats, &source_registration).await?,
+    );
+    outcome.did.push("verify");
+    // 语义 probe 会以引擎真实打开路径跑一次 schema 迁移（可能留下 WAL）：
+    // 收口并删 sidecar 之后才允许替换。
+    checkpoint_staging(&staging, None).await?;
+    remove_sidecars(&staging);
+
+    // 5) 替换（顺序写死：任何时刻 store.db 要么完整密文、要么完整明文）。
+    checkpoint_keyed_quiet(store, context.key).await?;
+    remove_sidecars(store);
+    fault_point("after_sidecar");
+    fs::rename(&staging, store).map_err(|error| Failure::io(&error, codes::BUSY))?;
+    fsync_dir(dir).map_err(|error| Failure::io(&error, codes::IO_FAILED))?;
+    outcome.did.push("swap");
+    fault_point("after_rename");
+    fault_point("before_marker");
+    write_marker(dir, STATE_PLAINTEXT, &context.keyid, &context.fingerprint)?;
     outcome.did.push("marker");
     Ok(())
 }
@@ -959,7 +1288,25 @@ async fn connect_plain(path: &Path) -> Result<SqliteConnection, Failure> {
         .pragma("cache_size", "-1024");
     SqliteConnection::connect_with(&options)
         .await
-        .map_err(|error| classify_connect_error(&error))
+        .map_err(|error| classify_plaintext_connect_error(&error))
+}
+
+/// 明文库打不开：这里**没有 key 参与**，`not a database` / `malformed` 只可能
+/// 是内容坏（设计 §5.5 的第三态）→ 终态 `store_state_invalid` 并留现场。
+///
+/// 旧实现套的是 [`classify_connect_error`]，把 `not a database` 归成
+/// `store_key_rejected`——明文库没有 key 可拒，那条码会把运维引到「换 key /
+/// 重试」的死路（一个头正常、内容坏掉的明文库换一万把 key 也打不开）。
+/// 磁盘满 / 被占用 / 权限仍按 [`classify_connect_error`] 的可重试分桶。
+fn classify_plaintext_connect_error(error: &sqlx::Error) -> Failure {
+    let text = error.to_string().to_ascii_lowercase();
+    if text.contains("not a database") || text.contains("code 26") || text.contains("malformed") {
+        return Failure::terminal(
+            codes::STATE_INVALID,
+            "plaintext store header is intact but the database cannot be opened",
+        );
+    }
+    classify_connect_error(error)
 }
 
 /// 带 key 打开（staging 校验 / WAL 收口用）。
@@ -973,6 +1320,17 @@ async fn connect_keyed(path: &Path, key: &StoreKey) -> Result<SqliteConnection, 
     SqliteConnection::connect_with(&options)
         .await
         .map_err(|error| classify_connect_error(&error))
+}
+
+/// 按目标态选连接形态：`Some(key)` = 加密库，`None` = 明文库。
+///
+/// 两个方向共用同一条「谁打开、带不带 key」的分支，避免出现「反向校验恰好
+/// 用了带 key 的连接」这类只有在损坏现场才暴露的错配。
+async fn connect_target(path: &Path, key: Option<&StoreKey>) -> Result<SqliteConnection, Failure> {
+    match key {
+        Some(key) => connect_keyed(path, key).await,
+        None => connect_plain(path).await,
+    }
 }
 
 async fn close(connection: SqliteConnection) -> Result<(), Failure> {
@@ -1020,6 +1378,46 @@ async fn attach_export(
             .map_err(|error| sql_failure(error, codes::IO_FAILED))?;
     }
     sqlx::query("DETACH DATABASE encrypted")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| sql_failure(error, codes::IO_FAILED))?;
+    Ok(())
+}
+
+/// 反向的 ATTACH + `sqlcipher_export` + 头字段补齐 + DETACH（设计 §6.3 第 4 步）。
+///
+/// `KEY ''` 是 SQLCipher 官方反向 recipe 里**显式禁用加密**的写法；不靠
+/// 「省略 KEY 子句」这种实现相关行为（省略在建过的库上是「沿用连接已设的
+/// key」，不保证等于明文）。
+async fn attach_export_plain(
+    connection: &mut SqliteConnection,
+    staging_path: &str,
+    source: &StoreStats,
+) -> Result<(), Failure> {
+    sqlx::query("ATTACH DATABASE ? AS plaintext KEY ''")
+        .bind(staging_path)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| sql_failure(error, codes::IO_FAILED))?;
+    sqlx::query("SELECT sqlcipher_export('plaintext')")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| sql_failure(error, codes::IO_FAILED))?;
+    // user_version / application_id 是文件头字段，不在 sqlcipher_export 的
+    // 覆盖面里（与正向同一条理由）：必须显式补齐，否则往返后这两个字段归零。
+    for (pragma, value) in [
+        ("user_version", source.user_version),
+        ("application_id", source.application_id),
+    ] {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new("PRAGMA plaintext.");
+        builder.push(pragma).push(" = ").push(value);
+        builder
+            .build()
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| sql_failure(error, codes::IO_FAILED))?;
+    }
+    sqlx::query("DETACH DATABASE plaintext")
         .execute(&mut *connection)
         .await
         .map_err(|error| sql_failure(error, codes::IO_FAILED))?;
@@ -1258,7 +1656,7 @@ async fn verify_staging(
     ]);
     // 语义 probe：引擎真实打开路径（schema 对但 presage 反序列化失败只有这里
     // 能发现）。
-    if let Err(failure) = semantic_probe(staging, context.key, registration).await {
+    if let Err(failure) = semantic_probe(staging, Some(context.key), registration).await {
         return Err(discard(
             checks,
             format!("semantic probe failed: {}", failure.code),
@@ -1268,6 +1666,122 @@ async fn verify_staging(
     Ok(checks)
 }
 
+/// 校验矩阵的**镜像**（反向，设计 §6.3 第 5 步 / §6.4）：staging 必须是
+/// 「无 key 能打开、且内容与源库逐项相等」的明文库。
+///
+/// 与 [`verify_staging`] 的差别只有判定方向：头必须是 `SQLite format 3\0`
+/// （正向要求**不是**它）、连接**不带 key**、再加一条「带 key 打不开」的负例
+/// （证明这次真的导出了明文，而不是把密文改了个头）。结构/数据/账本/序列/
+/// 头字段/注册事实的比对复用同一个 [`diff_stats`]——两个方向不许有各自的判据。
+async fn verify_plaintext_staging(
+    context: &Context<'_>,
+    staging: &Path,
+    source: &StoreStats,
+    registration: &Option<RegistrationFacts>,
+) -> Result<Vec<&'static str>, Failure> {
+    let mut checks = Vec::new();
+    let discard = |checks: Vec<&'static str>, detail: String| {
+        remove_staging(staging).ok();
+        Failure::terminal(codes::VERIFY_FAILED, format!("{detail}; passed={checks:?}"))
+    };
+    // 头：staging 前 16 字节必须是明文头（否则「无 key 能打开」只是运气）。
+    match store_open::classify(staging) {
+        Ok(StoreFileState::Plaintext) => checks.push("staging_header_plaintext"),
+        other => {
+            return Err(discard(
+                checks,
+                format!("plaintext staging header check failed: {other:?}"),
+            ))
+        }
+    }
+    let mut plaintext = match connect_plain(staging).await {
+        Ok(connection) => connection,
+        Err(failure) => {
+            return Err(discard(
+                checks,
+                format!("staging open without key failed: {}", failure.code),
+            ))
+        }
+    };
+    checks.push("staging_opens_without_key");
+    if !integrity_ok(&mut plaintext).await.unwrap_or(false) {
+        return Err(discard(
+            checks,
+            "staging PRAGMA integrity_check is not ok".to_owned(),
+        ));
+    }
+    checks.push("staging_integrity_check");
+    let foreign_keys: Vec<(i64, i64, String, i64)> = match sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut plaintext)
+        .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get(0).unwrap_or_default(),
+                    row.try_get(1).unwrap_or_default(),
+                    row.try_get::<String, _>(2).unwrap_or_default(),
+                    row.try_get(3).unwrap_or_default(),
+                )
+            })
+            .collect(),
+        Err(error) => {
+            return Err(discard(
+                checks,
+                format!("foreign_key_check failed: {error}"),
+            ))
+        }
+    };
+    if !foreign_keys.is_empty() {
+        return Err(discard(
+            checks,
+            "staging PRAGMA foreign_key_check is not empty".to_owned(),
+        ));
+    }
+    checks.push("staging_foreign_key_check");
+    let staging_stats = match collect_stats(&mut plaintext).await {
+        Ok(stats) => stats,
+        Err(failure) => {
+            return Err(discard(
+                checks,
+                format!("staging stats failed: {}", failure.code),
+            ))
+        }
+    };
+    close(plaintext).await?;
+    if let Err(detail) = diff_stats(source, &staging_stats) {
+        return Err(discard(checks, detail));
+    }
+    checks.extend([
+        "schema_set_equal",
+        "row_counts_equal",
+        "thread_messages_sample_equal",
+        "migration_ledger_equal",
+        "sqlite_sequence_equal",
+        "user_version_equal",
+        "application_id_equal",
+    ]);
+    // 语义 probe：引擎真实打开路径（**无 key**）读 `load_registration_data`。
+    if let Err(failure) = semantic_probe(staging, None, registration).await {
+        return Err(discard(
+            checks,
+            format!("semantic probe failed: {}", failure.code),
+        ));
+    }
+    checks.push("semantic_registration_readable");
+    // 负例：带 key 打开必须失败。一个「头是明文、其实还带着 SQLCipher 页」的
+    // 文件会在这里红——不然连接器会拿一个「看起来明文、旧二进制却读不了」的
+    // 库当成回退成功。
+    if !key_open_fails(staging, context.key).await {
+        return Err(discard(
+            checks,
+            "staging opens with a key (not plaintext)".to_owned(),
+        ));
+    }
+    checks.push("staging_rejects_key_open");
+    Ok(checks)
+}
 /// 迁移前的注册事实（**源库侧**真值：`kv` 里那行官方落库 JSON 的 ACI 与设备名）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RegistrationFacts {
@@ -1341,15 +1855,19 @@ async fn read_registration_facts(
 /// 判成通过（`registration.map(|_| ())`）。
 async fn semantic_probe(
     path: &Path,
-    key: &StoreKey,
+    key: Option<&StoreKey>,
     expected: &Option<RegistrationFacts>,
 ) -> Result<(), Failure> {
-    let options = SqliteConnectOptions::new()
+    // `key = None` 是反向：staging 已经是明文，带 key 打开会把「导出成功」
+    // 变成一次假失败（SQLCipher 读明文库报 not a database）。
+    let mut options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
         .foreign_keys(true)
-        .pragma("cache_size", "-1024")
-        .pragma("key", key.pragma_literal());
+        .pragma("cache_size", "-1024");
+    if let Some(key) = key {
+        options = options.pragma("key", key.pragma_literal());
+    }
     let store = presage_store_sqlite::SqliteStore::open_with_options(
         options,
         presage_store_sqlite::OnNewIdentity::Trust,
@@ -1400,9 +1918,9 @@ async fn semantic_probe(
 
 /// staging 上把 WAL 收口（语义 probe 以 WAL 打开过它），失败按可重试处理
 /// ——绝不在 WAL 还有内容时删 sidecar。
-async fn checkpoint_staging(staging: &Path, key: &StoreKey) -> Result<(), Failure> {
+async fn checkpoint_staging(staging: &Path, key: Option<&StoreKey>) -> Result<(), Failure> {
     for attempt in 0..CHECKPOINT_RETRIES {
-        let mut connection = connect_keyed(staging, key).await?;
+        let mut connection = connect_target(staging, key).await?;
         let checkpoint = checkpoint_truncate(&mut connection).await?;
         close(connection).await?;
         if checkpoint.busy == 0 {
@@ -1463,13 +1981,49 @@ async fn verify_encrypted_integrity(path: &Path, key: &StoreKey) -> Result<(), F
     Ok(())
 }
 
+/// 明文侧的完整性闸（反向的 §5.5 谓词）：头=明文 ⇒ 必须能以**无 key** 连接
+/// 打开且 `integrity_check=ok`。
+///
+/// 打不开是「第三态」：既不是完整密文、也不是完整明文。终态报
+/// `store_state_invalid` 并保留现场——绝不猜一个方向去修。
+async fn verify_plaintext_integrity(path: &Path) -> Result<(), Failure> {
+    let mut connection = connect_plain(path).await?;
+    let integrity: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_all(&mut connection)
+        .await;
+    close(connection).await?;
+    let integrity = integrity.map_err(|error| {
+        Failure::terminal(
+            codes::STATE_INVALID,
+            format!("integrity_check failed: {error}"),
+        )
+    })?;
+    if integrity.is_empty() || !integrity.iter().all(|row| row == "ok") {
+        return Err(Failure::terminal(
+            codes::STATE_INVALID,
+            format!("integrity_check is not ok: {integrity:?}"),
+        ));
+    }
+    Ok(())
+}
+
 /// swap 前的源库静默闸：WAL 必须能被 TRUNCATE，且事后确实为空。
 ///
 /// `remove_sidecars` 是「不可逆地丢弃 WAL 里的一切」：有长读事务或外部写者
 /// 时做这件事等于丢已提交帧。这里把「折不进去」变成可重试错误（10）而不是
 /// 删掉它——现场一个字节都不动，等占用方退出去重试。
 async fn checkpoint_source_quiet(store: &Path) -> Result<(), Failure> {
-    let mut connection = connect_plain(store).await?;
+    checkpoint_quiet(store, None).await
+}
+
+/// 同上，加密源（反向）：WAL 里还有已提交帧时既不能字节拷贝也不能删 sidecar。
+async fn checkpoint_keyed_quiet(store: &Path, key: &StoreKey) -> Result<(), Failure> {
+    checkpoint_quiet(store, Some(key)).await
+}
+
+/// 收口 + 断言 WAL 为空（两个方向共用；`key` 决定源的形态）。
+async fn checkpoint_quiet(store: &Path, key: Option<&StoreKey>) -> Result<(), Failure> {
+    let mut connection = connect_target(store, key).await?;
     let checkpoint = checkpoint_truncate(&mut connection).await;
     close(connection).await?;
     let checkpoint = checkpoint?;
@@ -1488,11 +2042,32 @@ async fn checkpoint_source_quiet(store: &Path) -> Result<(), Failure> {
         _ => Ok(()),
     }
 }
+
 /// 无 key 打开 staging 必须失败（明文伪装的负例）。
 async fn no_key_open_fails(path: &Path) -> bool {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false);
+    match SqliteConnection::connect_with(&options).await {
+        Ok(mut connection) => {
+            let probe = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_master")
+                .fetch_one(&mut connection)
+                .await;
+            let _ = connection.close().await;
+            probe.is_err()
+        }
+        Err(_) => true,
+    }
+}
+
+/// 带 key 打开 staging 必须失败（反向的负例：导出的确实是没有加密的明文）。
+///
+/// SQLCipher 读到明文头会把它当成盐去校验页 HMAC → `not a database`。
+async fn key_open_fails(path: &Path, key: &StoreKey) -> bool {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .pragma("key", key.pragma_literal());
     match SqliteConnection::connect_with(&options).await {
         Ok(mut connection) => {
             let probe = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_master")
@@ -1648,6 +2223,38 @@ fn sidecar_path(store: &Path, suffix: &str) -> PathBuf {
 }
 
 /// 只回收**空** sidecar（WAL 有内容 = 还有已提交帧，删了就是丢数据）。
+/// 终态/失败收口的 sidecar 基线：验真与完整性闸开的是**读写**连接，SQLite
+/// 在 WAL 模式下会物化空的 `-wal` / `-shm`（一个字节都没写库，但目录里多出
+/// 两个文件）。「11 路径逐文件不变」盯的是目录，所以失败时要能把**本次新建
+/// 的空 sidecar** 收回：非空 WAL（里面有已提交帧）与本来就存在的文件一律不动。
+struct SidecarBaseline {
+    wal: bool,
+    shm: bool,
+}
+
+impl SidecarBaseline {
+    fn capture(store: &Path) -> Self {
+        Self {
+            wal: sidecar_path(store, "-wal").exists(),
+            shm: sidecar_path(store, "-shm").exists(),
+        }
+    }
+
+    fn restore(&self, store: &Path) {
+        let wal = sidecar_path(store, "-wal");
+        let shm = sidecar_path(store, "-shm");
+        let empty_wal = fs::metadata(&wal)
+            .map(|metadata| metadata.len() == 0)
+            .unwrap_or(false);
+        if !self.wal && empty_wal {
+            let _ = fs::remove_file(&wal);
+        }
+        if !self.shm && shm.exists() && (empty_wal || !wal.exists()) {
+            let _ = fs::remove_file(&shm);
+        }
+    }
+}
+
 fn remove_empty_sidecars(store: &Path) {
     let wal = sidecar_path(store, "-wal");
     let Ok(metadata) = fs::metadata(&wal) else {
@@ -1691,6 +2298,21 @@ fn plaintext_backup_usable(path: &Path) -> bool {
         Ok(mut file) => file.read_exact(&mut head).is_ok() && &head == store_open::PLAINTEXT_HEADER,
         Err(_) => false,
     }
+}
+
+/// 加密备份可用性：字节拷贝之后必须**真的能 keyed 打开**（回滚物打不开等于
+/// 没有回滚物）。不过关就删掉并报可重试——半份备份不许留给下一次。
+async fn ensure_encrypted_backup(backup: &Path, key: &StoreKey) -> Result<(), Failure> {
+    let usable = matches!(store_open::classify(backup), Ok(StoreFileState::Opaque))
+        && store_open::probe_keyed_store(backup, key).await.is_ok();
+    if usable {
+        return Ok(());
+    }
+    let _ = fs::remove_file(backup);
+    Err(Failure::retryable(
+        codes::IO_FAILED,
+        "encrypted backup copy is not a readable store (empty, plaintext or wrong key)",
+    ))
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<(), Failure> {
@@ -1761,14 +2383,18 @@ fn key_digest(domain: &[u8], key: &StoreKey) -> String {
 }
 
 /// `store.format`（审计 + 指纹；**永不参与正确性判断**）：
-/// `magic=KTSF ver=1 state=sqlcipher-v1 keyid=<8hex> fp=<8hex> at=<unixms> tool=<ver>`。
-fn write_marker(dir: &Path, keyid: &str, fingerprint: &str) -> Result<(), Failure> {
+/// `magic=KTSF ver=1 state=<sqlcipher-v1|plaintext> keyid=<8hex> fp=<8hex>
+/// at=<unixms> tool=<ver>`。
+///
+/// `state` 只是审计：两个方向的正确性都由**文件头**判定（设计 §5.2/§5.4），
+/// 所以「rename 成功、marker 没来得及写」永远不会变成第三态。
+fn write_marker(dir: &Path, state: &str, keyid: &str, fingerprint: &str) -> Result<(), Failure> {
     let at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
         .unwrap_or_default();
     let content = format!(
-        "magic=KTSF ver=1 state=sqlcipher-v1 keyid={keyid} fp={fingerprint} at={at} tool={}\n",
+        "magic=KTSF ver=1 state={state} keyid={keyid} fp={fingerprint} at={at} tool={}\n",
         env!("CARGO_PKG_VERSION")
     );
     let tmp = dir.join(format!("{MARKER_FILE}.{}.tmp", std::process::id()));
@@ -1781,20 +2407,33 @@ fn write_marker(dir: &Path, keyid: &str, fingerprint: &str) -> Result<(), Failur
 }
 
 fn read_marker_fingerprint(dir: &Path) -> Option<String> {
+    marker_field(dir, "fp=")
+}
+
+/// marker 里的 `state=`（审计读数；**不参与正确性判断**）。
+fn marker_state(dir: &Path) -> Option<String> {
+    marker_field(dir, "state=")
+}
+
+fn marker_field(dir: &Path, prefix: &str) -> Option<String> {
     let text = fs::read_to_string(dir.join(MARKER_FILE)).ok()?;
     text.split_whitespace()
-        .find_map(|field| field.strip_prefix("fp="))
+        .find_map(|field| field.strip_prefix(prefix))
         .map(str::to_owned)
 }
 
-/// 7 天保留窗口：只在「主库已加密且可打开」时才调用（设计 §3.5/§5.4）。
-fn prune_expired_backup(dir: &Path) -> Option<PathBuf> {
-    prune_expired_backup_at(dir, SystemTime::now())
+/// 7 天保留窗口：只在「主库已在目标态且可打开」时才调用（设计 §3.5/§5.4）。
+///
+/// 两个方向各有自己的回滚物（正向保留明文备份、反向保留加密备份），因此
+/// 清理必须**按文件名分桶**：拿正向的清理去扫反向的备份（或反过来）会在
+/// 别人还没确认新库可用的窗口里把唯一的回滚物删掉。
+fn prune_expired_backup(dir: &Path, suffix: &str) -> Option<PathBuf> {
+    prune_expired_backup_at(dir, suffix, SystemTime::now())
 }
 
 /// 保留窗口的可测形状（now 显式传入，单测不必改文件 mtime）。
-fn prune_expired_backup_at(dir: &Path, now: SystemTime) -> Option<PathBuf> {
-    let backup = dir.join(format!("{STORE_DB_FILE}{BACKUP_SUFFIX}"));
+fn prune_expired_backup_at(dir: &Path, suffix: &str, now: SystemTime) -> Option<PathBuf> {
+    let backup = dir.join(format!("{STORE_DB_FILE}{suffix}"));
     let metadata = fs::metadata(&backup).ok()?;
     let modified = metadata.modified().ok()?;
     let age = now.duration_since(modified).ok()?;
@@ -1816,6 +2455,12 @@ fn classify_open_error(error: store_open::StoreOpenError) -> Failure {
         Open::CipherUnavailable => {
             Failure::terminal(codes::CIPHER_UNAVAILABLE, "linked sqlite is not SQLCipher")
         }
+        // C-1 终态（引擎开库闸，与迁移器无关）：迁移器按文件头分流，
+        // 到不了这里；真到了也必须按终态报——明文库不会自己变密文。
+        Open::PlaintextRequiresMigration => Failure::terminal(
+            codes::PLAINTEXT_REQUIRES_MIGRATION,
+            "plaintext store requires migration",
+        ),
         Open::Failed => Failure::retryable(codes::IO_FAILED, "store classification failed"),
     }
 }
@@ -1937,7 +2582,11 @@ fn fault_point(name: &str) {
 /// 测试注入（**只在 debug 构建存在**；release 编译掉）：导出之后人为改
 /// staging 的行数，用来验收 §4/D-19 的失败路径——verify 不过时必须删 staging、
 /// 保留原库与备份、整体 exit 11。
-async fn fault_mutate_staging(staging: &Path, key: &StoreKey) {
+///
+/// 两个方向共用（`key = None` 是反向：staging 已经是明文）。行数不符是**唯一**
+/// 触发点，所以这条注入对「反向失败不碰原加密库」是真证据，而不是换个姿势
+/// 的 happy path。
+async fn fault_mutate_staging(staging: &Path, key: Option<&StoreKey>) {
     #[cfg(debug_assertions)]
     {
         if std::env::var("KT_ENGINE_STORE_MIGRATE_FAULT").as_deref() != Ok("corrupt_staging_rows") {
@@ -1945,10 +2594,12 @@ async fn fault_mutate_staging(staging: &Path, key: &StoreKey) {
         }
         // 故意不带 foreign_keys：从任意表删一行都不该被外键挡住（这里要造的
         // 是「行数对不上」，不是「外键断裂」）。
-        let options = SqliteConnectOptions::new()
+        let mut options = SqliteConnectOptions::new()
             .filename(staging)
-            .create_if_missing(false)
-            .pragma("key", key.pragma_literal());
+            .create_if_missing(false);
+        if let Some(key) = key {
+            options = options.pragma("key", key.pragma_literal());
+        }
         let Ok(mut connection) = SqliteConnection::connect_with(&options).await else {
             return;
         };
@@ -2191,6 +2842,7 @@ mod tests {
         let data = sandbox("migrate-ok");
         let store = seed_plaintext_store(&data).await;
         let dir = account_dir(&data);
+        let started = Instant::now();
         let report = run(
             data.clone(),
             &migrate_args(&data),
@@ -2198,10 +2850,20 @@ mod tests {
             &Hooks::default(),
         )
         .await;
+        let wall_ms = started.elapsed().as_millis();
         assert_eq!(report.exit_code(), EXIT_OK, "{:?}", report.error_code());
         let outcome = &report.accounts[0];
         assert_eq!(outcome.action, "migrate");
         assert_eq!(outcome.code, codes::MIGRATED);
+        // M2：`elapsedMs` 必须在迁移**返回之前**回填。旧实现把它写在
+        // `AccountOutcome::new` 里（构造那一刻），于是 `--json` 里恒 0；
+        // 空转断言（`< 60_000`）抓不到这件事。
+        assert!(outcome.elapsed_ms > 0, "elapsed_ms 不得恒 0");
+        assert!(
+            outcome.elapsed_ms <= wall_ms,
+            "elapsed_ms({}) 不能超过墙钟({wall_ms})",
+            outcome.elapsed_ms
+        );
         for check in [
             "staging_header_not_plaintext",
             "staging_rejects_no_key_open",
@@ -2700,13 +3362,22 @@ mod tests {
             .modified()
             .expect("mtime");
         assert!(
-            prune_expired_backup_at(&dir, modified + Duration::from_secs(24 * 3600)).is_none(),
+            prune_expired_backup_at(
+                &dir,
+                BACKUP_SUFFIX,
+                modified + Duration::from_secs(24 * 3600)
+            )
+            .is_none(),
             "未过期不得删备份"
         );
         assert!(backup.exists());
         assert!(
-            prune_expired_backup_at(&dir, modified + BACKUP_RETENTION + Duration::from_secs(60))
-                .is_some(),
+            prune_expired_backup_at(
+                &dir,
+                BACKUP_SUFFIX,
+                modified + BACKUP_RETENTION + Duration::from_secs(60),
+            )
+            .is_some(),
             "过期必须删备份"
         );
         assert!(!backup.exists());
@@ -2809,7 +3480,7 @@ mod tests {
         // 1) 完全一致：通过（不然这层校验会把正常迁移全判红）。
         let matching = staged_copy("staged-matching.db");
         assert!(
-            semantic_probe(&matching, &key_a, &Some(expected.clone()))
+            semantic_probe(&matching, Some(&key_a), &Some(expected.clone()))
                 .await
                 .is_ok(),
             "一致时必须通过"
@@ -2822,19 +3493,19 @@ mod tests {
         )
         .await;
         assert_eq!(
-            failure_code(semantic_probe(&drifted, &key_a, &Some(expected.clone())).await),
+            failure_code(semantic_probe(&drifted, Some(&key_a), &Some(expected.clone())).await),
             codes::VERIFY_FAILED
         );
         // 3) 注册行整条丢了（`Ok(None)`）：这正是旧实现放过去的那种导出。
         let lost = staged_copy("staged-lost.db");
         rewrite_row(&lost, None).await;
         assert_eq!(
-            failure_code(semantic_probe(&lost, &key_a, &Some(expected.clone())).await),
+            failure_code(semantic_probe(&lost, Some(&key_a), &Some(expected.clone())).await),
             codes::VERIFY_FAILED
         );
         // 4) 源库没注册、staging 却多出一条：同样不许过。
         assert_eq!(
-            failure_code(semantic_probe(&matching, &key_a, &None).await),
+            failure_code(semantic_probe(&matching, Some(&key_a), &None).await),
             codes::VERIFY_FAILED
         );
         let _ = fs::remove_dir_all(&data);
@@ -2859,6 +3530,14 @@ mod tests {
                 "--dry-run",
                 "--direction",
                 "to-encrypted",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/kt",
+                "storeMigrate",
+                "--direction",
+                "to-plaintext",
+                "--json",
             ],
         ] {
             assert!(route_of(&argv).is_ok(), "{argv:?}");
@@ -2907,6 +3586,20 @@ mod tests {
                 assert_eq!(args.data_dir, PathBuf::from("/tmp/kt"));
             }
             _ => panic!("迁移模式解析失败"),
+        }
+        // 反向是合法取值（D2 之前这里是 exit 2，现在是一等方向）。
+        match route_of(&[
+            "--data-dir",
+            "/tmp/kt",
+            "storeMigrate",
+            "--direction",
+            "to-plaintext",
+        ]) {
+            Ok(Route::Migrate(args)) => {
+                assert_eq!(args.direction, Direction::ToPlaintext);
+                assert!(!args.dry_run);
+            }
+            _ => panic!("--direction to-plaintext 必须解析成反向迁移"),
         }
     }
 
@@ -2957,5 +3650,253 @@ mod tests {
             space_need(10 * 1024 * 1024),
             21 * 1024 * 1024 + SPACE_SLACK_BYTES
         );
+    }
+
+    /// 反向参数（`--direction to-plaintext`）；其余字段与正向同一份默认。
+    fn reverse_args(data_dir: &Path) -> MigrateArgs {
+        MigrateArgs {
+            direction: Direction::ToPlaintext,
+            ..migrate_args(data_dir)
+        }
+    }
+
+    /// 反向干跑：加密库只出计划，目录快照（含 sidecar）逐字节不变。
+    #[tokio::test]
+    async fn reverse_dry_run_plans_without_touching_the_store() {
+        let data = sandbox("reverse-dry-run");
+        let store = seed_plaintext_store(&data).await;
+        let report = run(
+            data.clone(),
+            &migrate_args(&data),
+            &present(KEY_A_HEX),
+            &Hooks::default(),
+        )
+        .await;
+        assert_eq!(report.exit_code(), EXIT_OK, "{:?}", report.error_code());
+        let dir = account_dir(&data);
+        let before = snapshot(&dir);
+        let args = MigrateArgs {
+            dry_run: true,
+            ..reverse_args(&data)
+        };
+        let report = run(data.clone(), &args, &present(KEY_A_HEX), &Hooks::default()).await;
+        assert_eq!(report.exit_code(), EXIT_OK, "{:?}", report.error_code());
+        let account = &report.accounts[0];
+        assert_eq!(account.action, ACTION_DRY_RUN);
+        assert_eq!(account.code, codes::PLANNED);
+        assert!(account.backup.is_none(), "干跑不许报备份");
+        assert_eq!(account.plan, STEPS.to_vec());
+        assert!(account.did.is_empty());
+        assert_eq!(snapshot(&dir), before, "干跑必须零字节改动");
+        assert!(!is_plaintext_header(&store));
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    /// 反向对已明文库是幂等 no-op：exit 0、`store_migration_noop`、零字节改动
+    /// （`settle_plaintext` 只在 marker 状态过时时才补写审计）。
+    #[tokio::test]
+    async fn reverse_noop_on_plaintext_store_changes_nothing() {
+        let data = sandbox("reverse-noop");
+        let store = seed_plaintext_store(&data).await;
+        let dir = account_dir(&data);
+        let before = snapshot(&dir);
+        let report = run(
+            data.clone(),
+            &reverse_args(&data),
+            &present(KEY_A_HEX),
+            &Hooks::default(),
+        )
+        .await;
+        assert_eq!(report.exit_code(), EXIT_OK, "{:?}", report.error_code());
+        assert_eq!(report.accounts[0].action, ACTION_NOOP);
+        assert_eq!(report.accounts[0].code, codes::NOOP);
+        assert_eq!(snapshot(&dir), before, "幂等 no-op 必须零字节改动");
+        assert!(is_plaintext_header(&store));
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    /// M1（反向）：终态 11 必须**零改动**。旧实现 step0 在验 key / marker 之前
+    /// 就删 `store.db.encrypted-backup`（连带 staging 与 marker tmp）——一次错
+    /// key 就把唯一的回滚物吃掉。目录快照（不是只比 store.db）才抓得住它。
+    #[tokio::test]
+    async fn reverse_terminal_key_failures_leave_the_account_dir_byte_identical() {
+        for (name, tamper_marker) in [("wrong-key-dir", false), ("fp-mismatch-dir", true)] {
+            let data = sandbox(name);
+            seed_plaintext_store(&data).await;
+            let dir = account_dir(&data);
+            let first = run(
+                data.clone(),
+                &migrate_args(&data),
+                &present(KEY_A_HEX),
+                &Hooks::default(),
+            )
+            .await;
+            assert_eq!(
+                first.exit_code(),
+                EXIT_OK,
+                "{name}: {:?}",
+                first.error_code()
+            );
+            // 上一次留在账号目录里的现场：回滚物 + 半成品 staging + marker tmp。
+            fs::write(
+                dir.join(format!("{STORE_DB_FILE}{ENCRYPTED_BACKUP_SUFFIX}")),
+                b"previous rollback",
+            )
+            .expect("stale encrypted backup");
+            fs::write(
+                dir.join(format!("{STORE_DB_FILE}{DECRYPTING_SUFFIX}")),
+                b"half written staging",
+            )
+            .expect("stale decrypting staging");
+            fs::write(dir.join(format!("{MARKER_FILE}.999.tmp")), b"tmp").expect("marker tmp");
+            if tamper_marker {
+                fs::write(
+                    dir.join(MARKER_FILE),
+                    b"magic=KTSF ver=1 state=sqlcipher-v1 keyid=deadbeef fp=deadbeef at=0 tool=test\n",
+                )
+                .expect("tampered marker");
+            }
+            let before = snapshot(&dir);
+            let key = if tamper_marker {
+                present(KEY_A_HEX)
+            } else {
+                present(KEY_B_HEX)
+            };
+            let report = run(data.clone(), &reverse_args(&data), &key, &Hooks::default()).await;
+            assert_eq!(
+                report.exit_code(),
+                EXIT_TERMINAL,
+                "{name}: {:?}",
+                report.error_code()
+            );
+            let expected = if tamper_marker {
+                codes::KEY_MISMATCH
+            } else {
+                codes::KEY_REJECTED
+            };
+            assert_eq!(report.accounts[0].code, expected, "{name}");
+            // 逐文件比（不用整份 map 的 assert_eq：失败时那会把整个库的字节
+            // 打进日志，真正的差异被淹掉）。
+            let after = snapshot(&dir);
+            assert_eq!(
+                after.keys().collect::<Vec<_>>(),
+                before.keys().collect::<Vec<_>>(),
+                "{name}: 终态 11 改了文件集合（备份 / staging / marker tmp / sidecar 都不许动）"
+            );
+            for (file, bytes) in &before {
+                assert_eq!(
+                    after.get(file),
+                    Some(bytes),
+                    "{name}: 终态 11 改动了 {file}"
+                );
+            }
+            let _ = fs::remove_dir_all(&data);
+        }
+    }
+
+    /// M1（正向）+ M3：明文头正常但内容坏 = §5.5 的第三态 → `store_state_invalid`
+    /// （旧实现套 `classify_connect_error`，报成 `store_key_rejected`：明文库没有
+    /// key 可拒，这个码会把运维引到换 key / 重试的死路），且**现场逐文件不变**
+    /// ——旧实现会在校验之前先删 `.plaintext-backup`。
+    #[tokio::test]
+    async fn corrupt_plaintext_is_state_invalid_and_leaves_the_scene() {
+        let data = sandbox("plaintext-invalid");
+        let store = seed_plaintext_store(&data).await;
+        let dir = account_dir(&data);
+        // 保留 16B 明文头（分类只认头），把第 1 页的布局字段打成垃圾 → sqlite
+        // 一打开就报 `not a database`（实测：这条在 connect 阶段就炸）。
+        let mut bytes = fs::read(&store).expect("store bytes");
+        for byte in &mut bytes[16..64] {
+            *byte = 0xff;
+        }
+        fs::write(&store, &bytes).expect("corrupt plaintext store");
+        // 上一次留下的残留：11 路径一个都不许动。
+        fs::write(
+            dir.join(format!("{STORE_DB_FILE}{BACKUP_SUFFIX}")),
+            b"previous rollback",
+        )
+        .expect("stale plaintext backup");
+        fs::write(
+            dir.join(format!("{STORE_DB_FILE}{STAGING_SUFFIX}")),
+            b"half written staging",
+        )
+        .expect("stale staging");
+        fs::write(dir.join(format!("{MARKER_FILE}.999.tmp")), b"tmp").expect("marker tmp");
+        let before = snapshot(&dir);
+        for (label, args) in [
+            ("forward", migrate_args(&data)),
+            ("reverse", reverse_args(&data)),
+        ] {
+            let report = run(data.clone(), &args, &present(KEY_A_HEX), &Hooks::default()).await;
+            assert_eq!(
+                report.exit_code(),
+                EXIT_TERMINAL,
+                "{label}: {:?}",
+                report.error_code()
+            );
+            assert_eq!(report.accounts[0].code, codes::STATE_INVALID, "{label}");
+            assert_eq!(snapshot(&dir), before, "{label}: 终态 11 必须逐文件不变");
+        }
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    /// marker 是审计面：两个方向各写自己的 `state=`，且都不含 key 材料。
+    #[tokio::test]
+    async fn marker_state_tracks_the_direction() {
+        let data = sandbox("marker-state");
+        let _store = seed_plaintext_store(&data).await;
+        let dir = account_dir(&data);
+        let forward = run(
+            data.clone(),
+            &migrate_args(&data),
+            &present(KEY_A_HEX),
+            &Hooks::default(),
+        )
+        .await;
+        assert_eq!(forward.exit_code(), EXIT_OK, "{:?}", forward.error_code());
+        assert_eq!(
+            marker_state(&dir).as_deref(),
+            Some(STATE_SQLCIPHER_V1),
+            "正向之后 marker 必须是密文态"
+        );
+        let reverse = run(
+            data.clone(),
+            &reverse_args(&data),
+            &present(KEY_A_HEX),
+            &Hooks::default(),
+        )
+        .await;
+        assert_eq!(reverse.exit_code(), EXIT_OK, "{:?}", reverse.error_code());
+        assert_eq!(
+            marker_state(&dir).as_deref(),
+            Some(STATE_PLAINTEXT),
+            "反向之后 marker 必须是明文态"
+        );
+        let marker = fs::read_to_string(dir.join(MARKER_FILE)).expect("marker");
+        assert!(!marker.contains(KEY_A_HEX), "marker 不得含 key：{marker}");
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    /// 保留窗口按**文件名分桶**：正向的清理绝不碰反向的备份（反之亦然）。
+    #[test]
+    fn backup_retention_is_bucketed_by_suffix() {
+        let dir = sandbox("retention-buckets");
+        let plaintext = dir.join(format!("{STORE_DB_FILE}{BACKUP_SUFFIX}"));
+        let encrypted = dir.join(format!("{STORE_DB_FILE}{ENCRYPTED_BACKUP_SUFFIX}"));
+        fs::write(&plaintext, b"plaintext").expect("plaintext backup");
+        fs::write(&encrypted, b"encrypted").expect("encrypted backup");
+        let now = SystemTime::now();
+        let past = now + BACKUP_RETENTION + Duration::from_secs(60);
+        assert!(
+            prune_expired_backup_at(&dir, BACKUP_SUFFIX, past).is_some(),
+            "过期的明文备份必须被正向清理"
+        );
+        assert!(encrypted.exists(), "正向清理不得碰加密备份");
+        assert!(
+            prune_expired_backup_at(&dir, ENCRYPTED_BACKUP_SUFFIX, past).is_some(),
+            "过期的加密备份必须被反向清理"
+        );
+        assert!(!encrypted.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

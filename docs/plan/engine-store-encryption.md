@@ -258,6 +258,11 @@ AAD     "kt-engine-store-v1" || accountDirName
 
 判定"是不是明文"用**读文件头**，不要靠"打得开就算明文"（connector 同款：`db_file_state`，`src/store.rs:11696-11717`）。
 
+> **落地名对齐**（2026-11-12，C-1）：上表「明文 + 有/无 key → 拒绝」这一族在 engine 侧落成
+> **一个**码 `StorePlaintextRequiresMigration`，由默认 off 的开关
+> `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED` 控制（见 §7 C.12）。off 时仍是矩阵 c 的
+> legacy 打开（不拒绝、不迁移）；C-1 没有引入 `PlaintextStoreRequiresKey` 这个码名。
+
 ### 3.5 内存与日志卫生（诚实版）
 
 - **key 会常驻堆**：sqlx 池持有 `Arc<Options>`（`sqlx-core/…/pool/inner.rs:26`），options 里的 key 字符串不 zeroize，
@@ -541,7 +546,7 @@ DoD：三平台产物可启动；`cipher_version` 断言绿；现有测试全绿
 |---|---|---|---|
 | 1 | feature + 按目标依赖 | `Cargo.toml:9-23`（feature）、`Cargo.toml:158-180`（target 依赖） | `default = ["sqlcipher"]`、`sqlcipher = []`——feature **只做门**，不转发依赖特性。SQLCipher 的链接按目标声明：非 Windows `features = ["bundled", "bundled-sqlcipher"]`（macOS 走 CommonCrypto，`build.rs:220-223`，**不引 OpenSSL**）；Windows `features = ["bundled-sqlcipher-vendored-openssl"]`（隐含 `bundled-sqlcipher`→`bundled` 与 `openssl-sys/vendored`，libsqlite3-sys 0.36 `Cargo.toml:46-50`）。非 Windows 产物不变；Windows 新增 `openssl-sys`/`openssl-src`（build-time vendored，见「Windows 依赖报备」）。 |
 | 2 | 编译期门（每个 bin 一份） | `src/main.rs:42-45`、`src/bin/backup5-spike.rs:15-21` | `#[cfg(not(feature = "sqlcipher"))] compile_error!("engine requires the sqlcipher feature: PRAGMA key is a silent no-op on plain SQLite")`。本仓 bin-only（无 `lib.rs`），**bin target 各自独立编译**，所以门要各写一份：主 bin 覆盖 `kt-signal-engine`，开发 bin 覆盖 `backup5-spike`（它也 `SqliteStore::open`，临时目录、无 key）。`cargo build --no-default-features` 与 `cargo build --no-default-features --bin backup5-spike` 都要 101。 |
-| 3 | 运行时门（**前置**） | `src/store_cipher.rs`（`CipherGate` / `NegativeCache`）+ `src/service/mod.rs:14694-14744`（`open_store` → `open_store_gated`） | 顺序钉死为 **门 → 建目录 → 建 `store.db` → 打开并跑迁移**：`open_store_gated` 第一步 `gate.ensure()`，缺能力直接 `Err(())`，**不建目录、不建 `store.db`、不起连接池、不跑 `sqlx::migrate!()`**（这些正是 `open_with_options` 的副作用，vendor `presage-store-sqlite/src/lib.rs:67-92`）。判定结论**正负都缓存**：成功结论 `OnceLock`；失败进 `NegativeCache`（同样 `OnceLock`）→ 后续 open 只回同一错误，不重探 `:memory:`。失败证据行（`error!` + 固定 stderr 行）由 `CipherGate::report_denial_once` 的 `compare_exchange` 闸控，**每进程只落一次**，重试不刷屏。**门失败是终态**：`StoreCipherUnavailable.is_terminal() == true`，接收管线停环、**不进** Fibonacci 退避重连（C 阶段把「store 打不开」从 `Recoverable` 拆成终态/可重试两类）；stderr 行形状与其余五个码一致——`kt-signal-engine: ERROR event=store_open_failed code=StoreCipherUnavailable retryable=false`。**2026-11-12 评审纠正**：本行原文写的「走既有 store 打不开 → 接收管线可重试」是 C 阶段之前的语义；落地后已改为终态，因为缺能力是构建属性、不会自愈，退避重试只会反复碰盘并把「终态」语义在接收层悄悄推翻。 |
+| 3 | 运行时门（**前置**） | `src/store_cipher.rs`（`CipherGate` / `NegativeCache`）+ `src/service/mod.rs:14694-14744`（`open_store` → `open_store_gated`） | 顺序钉死为 **门 → 建目录 → 建 `store.db` → 打开并跑迁移**：`open_store_gated` 第一步 `gate.ensure()`，缺能力直接 `Err(())`，**不建目录、不建 `store.db`、不起连接池、不跑 `sqlx::migrate!()`**（这些正是 `open_with_options` 的副作用，vendor `presage-store-sqlite/src/lib.rs:67-92`）。判定结论**正负都缓存**：成功结论 `OnceLock`；失败进 `NegativeCache`（同样 `OnceLock`）→ 后续 open 只回同一错误，不重探 `:memory:`。失败证据行（`error!` + 固定 stderr 行）由 `CipherGate::report_denial_once` 的 `compare_exchange` 闸控，**每进程只落一次**，重试不刷屏。**门失败是终态**：`StoreCipherUnavailable.is_terminal() == true`，接收管线停环、**不进** Fibonacci 退避重连（C 阶段把「store 打不开」从 `Recoverable` 拆成终态/可重试两类）；stderr 行形状与其余六个码一致——`kt-signal-engine: ERROR event=store_open_failed code=StoreCipherUnavailable retryable=false`。**2026-11-12 评审纠正**：本行原文写的「走既有 store 打不开 → 接收管线可重试」是 C 阶段之前的语义；落地后已改为终态，因为缺能力是构建属性、不会自愈，退避重试只会反复碰盘并把「终态」语义在接收层悄悄推翻。 |
 | 4 | 启动证据 | `src/main.rs`（`logfile::init` 之后、任何 store 打开之前） | 每进程一次：`WARN engine.startup: store encryption capability verified stage="store_cipher" cipher=SQLCipher 4.10.0 community`。级别取 WARN 是**落盘契约**（`src/logfile.rs:57` `MAX_LEVEL = LevelFilter::WARN`，info 不进滚动日志）；行内无密钥/路径/号码，stderr 纪律不变。**失败分支不再由启动路径打第二行**：门已落唯一一条证据行（同一事实只出现一遍）。 |
 | 5 | 断言 | `src/store_cipher_tests.rs`（6 条） | 见「测试」。 |
 
@@ -738,7 +743,7 @@ DoD：F1/F2/F3/F9 四条失败模式有单测；fake 模式（`dir=None`，`src/
 | 2 | 文件状态分类 | `src/store_open.rs`（`classify` / `StoreFileState`） | 只读元数据 + 16 字节头：`SQLite format 3\\0` = 明文；非明文头 = `Opaque`（密文与垃圾不可分）；0 字节 = `Absent`；短于 512B = `StoreCorrupt(Truncated)`；`store.db` 位置被目录占住 = `StoreCorrupt(Unreadable)` |
 | 3 | 决策 + 打开 | `src/service/mod.rs`（`open_store` → `open_store_gated` → `open_store_with`；`store_connect_options_with_key`） | 顺序钉死：**能力门 → key 形状 → 文件分类 →（密文先验真）→ 建目录 → 打开并跑迁移**；前四步**不创建 `store.db` 主体**（能力门 / key 形状 / 文件分类全程零写入；**密文验真是读写连接**，SQLite 在 WAL 模式下会临时创建 `-wal`/`-shm`，连接收口即回收）——早期「前四步零落盘」的措辞已按实测纠正（见 C.5 与 C.6） |
 | 4 | 密文验真 | `src/store_open.rs`（`probe_keyed_store`） | `create_if_missing(false)` + `PRAGMA key` + 强制首页读 `sqlite_master`；`not a database` / code 26 → `StoreKeyRejected`；malformed → `StoreCorrupt`；其余 → `StoreOpenFailed`（可重试） |
-| 5 | 结构化错误码 + 固定 stderr | `StoreOpenError`（`code()` / `is_terminal()` / `report_once()`） | 码表：`StoreCipherUnavailable` / `StoreKeyInvalid` / `StoreKeyRequired` / `StoreKeyRejected` / `StoreCorrupt` / `StoreOpenFailed`；stderr 固定形状 `kt-signal-engine: ERROR event=store_open_failed code=<Code> retryable=<bool>`，**每进程每码一条**，六个码**无一例外**（2026-11-12 评审补齐：`StoreCipherUnavailable` 的固定行由 P0 门落 `store_cipher::unavailable_stderr_line()`（与 `StoreOpenError::stderr_line()` 逐字同形），本侧不重复打；可重试类 `StoreOpenFailed` 也落同形行 `retryable=true`——此前缺能力是自造形状、可重试类是自由文本，watchdog 都分类不到） |
+| 5 | 结构化错误码 + 固定 stderr | `StoreOpenError`（`code()` / `is_terminal()` / `report_once()`） | 码表：`StoreCipherUnavailable` / `StoreKeyInvalid` / `StoreKeyRequired` / `StoreKeyRejected` / `StoreCorrupt` / `StoreOpenFailed` / **`StorePlaintextRequiresMigration`**（C-1，见 C.12）；stderr 固定形状 `kt-signal-engine: ERROR event=store_open_failed code=<Code> retryable=<bool>`，**每进程每码一条**，七个码**无一例外**（2026-11-12 评审补齐：`StoreCipherUnavailable` 的固定行由 P0 门落 `store_cipher::unavailable_stderr_line()`（与 `StoreOpenError::stderr_line()` 逐字同形），本侧不重复打；可重试类 `StoreOpenFailed` 也落同形行 `retryable=true`——此前缺能力是自造形状、可重试类是自由文本，watchdog 都分类不到） |
 | 6 | 不退化成网络重试 | `StreamOutcome::StoreTerminal`（`src/service/mod.rs`，`is_terminal()` 已含）+ 接收建流分支按 `error.is_terminal()` 分流 | 终态停环、不进 Fibonacci 退避；只有 `StoreOpenFailed` 才 `Recoverable`；`ReconnectSchedule::next_delay` 单测钉死返回 `None` |
 | 7 | 启动证据 | `src/main.rs`（`store_open::report_startup_key_state`，紧跟 P0 能力证据） | 有效/缺席 = 滚动日志 WARN（`stage="store_key"`、`key=present` 或 `key=absent`）；非法 = **固定 stderr 行**（不必等第一次开库，connector 启动即能识别） |
 | 8 | 断言 | `src/store_encryption_tests.rs`（17 条：14 条为 2026-11-12 评审批，3 条为同日**收尾**新增——可重试类两条失败路径的固定行 + 每码一个闸的可失败证据）+ `src/service/mod.rs` 既有断言扩面与 3 条证书维护断言 | 见 C.2 / C.4 / C.10 / C.11 |
@@ -747,7 +752,7 @@ DoD：F1/F2/F3/F9 四条失败模式有单测；fake 模式（`dir=None`，`src/
 
 | # | key（`KT_SIGNAL_STORE_KEY`） | store.db | 行为 | 代码落点 | 断言 |
 |---|---|---|---|---|---|
-| a | 无 | 无 | 明文创建（**现状兼容，不变**） | `open_store_with` 的 `(None, Absent)` → `store_connect_options`（无 key pragma） | 既有 `keyless_store_remains_plaintext_readable_and_writable` |
+| a | 无 | 无 | 明文创建（**现状兼容，不变**）；**C-1 开关 on 时改判 `StoreKeyRequired` 终态**（没 key 建不出密文库，也就不许再造新的明文库——见 C.12 ⑨） | `open_store_with` 的 `(None, Absent)` → `store_connect_options`（无 key pragma）；开关 on 时第 3.6 步闸先于它 | 既有 `keyless_store_remains_plaintext_readable_and_writable` + `switch_off_absent_without_key_still_creates_plaintext_store` + `switch_on_absent_without_key_refuses_before_creating_plaintext` |
 | b | 有 | 无 | 建**加密**库（打开时 `PRAGMA key`） | `(Some, Absent)` → `store_connect_options_with_key` | `keyed_fresh_store_is_created_encrypted` |
 | c | 有 | 已是明文库（头 `SQLite format 3`） | **按 legacy 打开、不设 key**，日志 warn 一次说明待迁移（**D 阶段**做）；不重写、不加密 | `(Some, Plaintext)` → `warn_plaintext_legacy_once()` + 无 key 打开 | `plaintext_store_with_key_opens_legacy_and_is_left_intact` |
 | d | 有 | 已是加密库 | 正常打开；**错 key = `StoreKeyRejected`**（终态），先验真再跑迁移 | `(Some, Opaque)` → `probe_keyed_store` → keyed 打开 | `wrong_key_is_rejected_and_never_rewrites_the_store` + `keyed_fresh_store_is_created_encrypted`（同 key 重开） |
@@ -762,9 +767,10 @@ DoD：F1/F2/F3/F9 四条失败模式有单测；fake 模式（`dir=None`，`src/
 |---|---|---|---|---|
 | `StoreCipherUnavailable` | 链接的 sqlite 不是 SQLCipher（P0 门） | 是 | P0 门落**同形固定行** `event=store_open_failed code=StoreCipherUnavailable retryable=false`（每进程一次，与 `StoreOpenError::stderr_line()` 逐字相等） | 既有 P0 d/e + `capability_gate_still_precedes_...` + `every_store_open_code_emits_the_fixed_line_once` |
 | `StoreKeyInvalid` | `KT_SIGNAL_STORE_KEY` 形状非法 | 是 | 启动即落 `event=store_open_failed code=StoreKeyInvalid retryable=false` | `invalid_key_shape_refuses_before_touching_disk` |
-| `StoreKeyRequired` | 加密库 + 无 key | 是 | 同上形状，`code=StoreKeyRequired` | `encrypted_store_without_key_reports_store_key_required` |
+| `StoreKeyRequired` | 无 key 却必须走密文：① 加密库 + 无 key；② **C-1 开关 on + 库不存在 + 无 key**（C.12 ⑨，补漏） | 是 | 同上形状，`code=StoreKeyRequired retryable=false` | `encrypted_store_without_key_reports_store_key_required` + `switch_on_absent_without_key_refuses_before_creating_plaintext` + `switch_on_absent_without_key_reports_once_per_process` |
 | `StoreKeyRejected` | 加密库 + 错 key（或第 1 页损坏） | 是 | 同上，`code=StoreKeyRejected` | `wrong_key_is_rejected_and_never_rewrites_the_store` |
 | `StoreCorrupt` | 截断/不可读/malformed | 是 | 同上，`code=StoreCorrupt` | `corrupt_store_is_classified_apart_from_key_failures` |
+| `StorePlaintextRequiresMigration` | **C-1**：明文库 + `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on`（与有无 key 无关） | 是 | 同上，`code=StorePlaintextRequiresMigration retryable=false` | `switch_on_plaintext_*`（九格 ⑤/⑥）+ `switch_on_classifies_plaintext_by_header_before_opening` + `switch_on_plaintext_is_terminal_and_reports_once_per_process` |
 | `StoreOpenFailed` | 权限/句柄耗尽/EIO/只读挂载/路径/连接池等其余失败 | **否**（保持既有重试语义） | 同上固定行 `code=StoreOpenFailed retryable=true`（2026-11-12 评审补齐：此前这是唯一没落固定行的码，stderr 是自由文本 `sqlite store open failed: …`）。**同日收尾**：该类在 `open_store_with` 内部的所有出口都经 `StoreOpenError::reported()`——路径非 UTF-8、`create_dir_all` 失败（EACCES/EROFS/ENOSPC）、连接串解析失败三处以前是裸 `return`/`?`，stderr **零行** | `failure_text_classification_maps_not_a_database_to_key_rejection` + `every_store_open_code_emits_the_fixed_line_once` + `classify_keeps_io_failures_retryable` + `create_dir_all_failure_reports_store_open_failed_once` + `non_utf8_store_path_reports_store_open_failed_once` |
 
 接收侧：`serve_account_stream` 命中终态 → `StreamOutcome::StoreTerminal` → 接收循环直接
@@ -788,9 +794,9 @@ connector 侧消费（把固定 stderr code 落进 `key_missing` / `data_corrupt
 | 10 | `classify_keeps_io_failures_retryable`（**2026-11-12 评审阻塞项 1**） | EACCES / ELOOP / ENOTDIR 三种真实 IO 失败都归 `StoreOpenFailed`（可重试），**不**判 `StoreCorrupt` 终态；端到端同判 |
 | 11 | `corrupt_unreadable_layout_is_terminal_and_leaves_the_scene`（**评审 7b**） | `store.db` 位置被目录占住 = `Corrupt(Unreadable)` 终态，占位目录与账号目录条目都不被改动 |
 | 12 | `probe_keyed_store_requires_write_access`（**评审 4**） | 验真是读写连接：目录只读 → 验真 `StoreOpenFailed`（可重试）；恢复可写后同一份文件照常打开（证明失败来自挂载/权限，不是内容） |
-| 13 | `every_store_open_code_emits_the_fixed_line_once`（**评审 3**） | 六个码逐字同形 `event=store_open_failed code=<Code> retryable=<bool>`（含缺能力与可重试类）；缺能力行与 `store_cipher::unavailable_stderr_line()` 逐字相等。**闸的证据不在这条里**：它同一次循环里边打边读，`report_once()` 之后 `report_count()` 恒 1，合并闸也是绿（见 #15） |
+| 13 | `every_store_open_code_emits_the_fixed_line_once`（**评审 3**） | 七个码逐字同形（C-1 增 `StorePlaintextRequiresMigration`，同形同值） `event=store_open_failed code=<Code> retryable=<bool>`（含缺能力与可重试类）；缺能力行与 `store_cipher::unavailable_stderr_line()` 逐字相等。**闸的证据不在这条里**：它同一次循环里边打边读，`report_once()` 之后 `report_count()` 恒 1，合并闸也是绿（见 #15） |
 | 14 | `legacy_warn_is_emitted_by_the_open_not_by_a_manual_gate`（**评审 7a**） | legacy warn **由 `open_store_with` 触发**（此前那条用例先手工打闸，等于把待证事实当前提）：无 key 打开不触发、第一次 legacy 打开恰一次、再开不增 |
-| 15 | `each_store_open_code_emits_its_own_line`（**收尾 2**） | **新进程**里两个真实 fixture 各触发一个码（密文头 + 无 key → `StoreKeyRequired`；短于一页 → `StoreCorrupt`），断言 stderr 两行都在、各恰一条、`required_first`/`corrupt_first` 两种顺序都成立；把两码合并到同一个 `AtomicU8` → 只剩一行 → 必红（变异实跑见 C.11） |
+| 15 | `each_store_open_code_emits_its_own_line`（**收尾 2 / C-1**） | **新进程**里三个真实 fixture 各触发一个码（密文头 + 无 key → `StoreKeyRequired`；短于一页 → `StoreCorrupt`；明文头 + 开关 on → `StorePlaintextRequiresMigration`），断言 stderr 三行都在、各恰一条、`required_first`/`corrupt_first` 两种顺序都成立；把两码合并到同一个 `AtomicU8` → 少一行 → 必红（变异实跑见 C.11 / C.12） |
 | 16 | `create_dir_all_failure_reports_store_open_failed_once`（**收尾 1**） | **新进程** + 只读父目录：`create_dir_all` 失败必须落**恰一条** `code=StoreOpenFailed retryable=true`，且账号目录与 `store.db` 都不存在（root 下自动 SKIP，与 #12 同口径） |
 | 17 | `non_utf8_store_path_reports_store_open_failed_once`（**收尾 1**） | **新进程** + 非 UTF-8 账号目录名（`path.to_str()` 为 `None`）同样落恰一条可重试固定行，且不留账号目录 |
 
@@ -977,6 +983,174 @@ cargo test --all-targets -- --test-threads=1                → 0：bin 672 pass
 `path_str` 是合法 UTF-8 却让 sqlx 连接串解析失败，当前受信启动器给的路径走不到；该出口与
 另两处共用 `reported()`，由 `non_utf8_store_path_reports_store_open_failed_once` 覆盖同一条
 统一出口。Windows 上三条 `#[cfg(unix)]` 用例不编译（与 C.10 的既有边界一致）。
+
+#### C.12 C-1 终态（2026-11-12）：明文库 + 开关 on → `StorePlaintextRequiresMigration`
+
+> 触发：C.7 把 C-1 排在迁移器/连接器之后，理由是「连接器还不注入 key，现在拦明文
+> 等于把『静默明文』换成『静默起不来』」。这一批把它做成**默认 off 的显式开关**：
+> 开关缺席时就是 C 阶段原样，开与不开是发布决策而不是代码默认。
+> 改动落在工作区、**未 commit**；门禁同 C.11。
+
+**契约**
+
+| 项 | 值 |
+|---|---|
+| 开关 | `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED`（engine 进程 env） |
+| 取值 | `on` / `1` / `true` / `yes`（去空白、大小写不敏感）→ 严格；`off` / `0` / `false` / `no` / 空串 / 缺席 → 兼容（**默认**）；其它值 → **off** + 一条滚动日志 WARN（认不出**不**回落到 on：默认 off 是硬约束，笔误不该把一批账号全打成终态） |
+| 触发条件 | 开关 on **且** `store.db` 文件头 = `SQLite format 3\0`（`StoreFileState::Plaintext`）。**与有没有 key 无关**——无 key 的明文库放过去，等于「删掉 key 就能读明文」，开关形同虚设 |
+| 新建路径（⑨，2026-11-12 补漏） | 开关 on **且** `store.db` **不存在**（`StoreFileState::Absent`）**且无 key** → `StoreKeyRequired` 终态。这一格原来落到矩阵 a，会在 `create_if_missing` 里现造一个**新的明文库**：比 ⑤（存量明文库）更糟——存量至少是迁移源，这一格是开关打开之后才开始的明文生产。语义取本码而不取 `PlaintextRequiresMigration`：盘上没有任何东西要迁移（连账号目录都没建），缺的是 key；没有 key 就建不出密文库，而开关不许降级建明文库 |
+| 新建路径的对照 | 开关 on + 库不存在 + **有 key** = 照常建密文库（矩阵 b / 九格 ⑩）；开关 off + 库不存在 + 无 key = 明文创建逐字节不变（矩阵 a / 九格 ⑪） |
+| 结局 | `StoreOpenError::PlaintextRequiresMigration`：`is_terminal()==true`，不进退避/网络重连；证书维护任务同判停手（`CertTaskExit::StoreTerminal`） |
+| 固定 stderr 行 | `kt-signal-engine: ERROR event=store_open_failed code=StorePlaintextRequiresMigration retryable=false`（与 C 阶段六码**逐字同形**，每进程每码一条；新码独占一个一次性闸，不与别的码共用槽） |
+| 副作用 | 无：不打开、不验真、不建目录、不建库、不写一个字节、**不删明文库**（迁移器要拿它当源） |
+
+**顺序（`service::open_store_with_requirement`）**：能力门 → key 形状 → 文件分类 →
+**C-1 终态闸（3.5 明文格 + 3.6 新建格）** → 密文验真 → 建目录 → 打开并跑迁移。
+两个闸都卡在分类之后、一切写动作之前；因此「不写盘」是结构事实，不是靠约定。
+
+**九格矩阵**（任务口径写「六格」，按 2（开关）× 2（明文/密文）× 2（有/无 key）
+展开实为 8 格；2026-11-12 **补漏**补上第 ⑨ 格「`store.db` 不存在 + 无 key」——
+八格只覆盖「库已存在」的两种形态，把新建路径整个漏在矩阵 a 里；九格全测，逐格
+用例名即证据。另加 ⑩/⑪ 两格对照，把新建路径的三种「开关 × key」组合钉死）
+
+| # | 开关 | store.db | key | 结局 | 断言 |
+|---|---|---|---|---|---|
+| ① | off | 明文 | 无 | 明文打开、存量可读（C 阶段原样） | `switch_off_plaintext_without_key_still_opens` |
+| ② | off | 明文 | 有 | legacy 打开（不设 key）+ warn 恰一次（矩阵 c 原样） | `switch_off_plaintext_with_key_still_opens_legacy` |
+| ③ | off | 密文 | 无 | `StoreKeyRequired` 终态（原样） | `switch_off_encrypted_without_key_still_reports_key_required` |
+| ④ | off | 密文 | 有 | 正常打开（原样） | `switch_off_encrypted_with_key_still_opens` |
+| ⑤ | **on** | 明文 | **无** | `StorePlaintextRequiresMigration` 终态 | `switch_on_plaintext_without_key_is_plaintext_requires_migration` |
+| ⑥ | **on** | 明文 | 有 | 同一终态，且**先于** legacy warn | `switch_on_plaintext_with_key_is_plaintext_requires_migration` |
+| ⑦ | on | 密文 | 无 | `StoreKeyRequired`（开关只改了明文那一格） | `switch_on_encrypted_without_key_still_reports_key_required` |
+| ⑧ | on | 密文 | 有 | 正常打开（迁移完成后的现实形态） | `switch_on_encrypted_with_key_still_opens` |
+| ⑨ | **on** | **不存在** | **无** | `StoreKeyRequired` 终态：**不建目录、不建库、不写一个字节**（放它过去就是开关 on 还在造新的明文库） | `switch_on_absent_without_key_refuses_before_creating_plaintext` + `switch_on_absent_without_key_reports_once_per_process` |
+| ⑩ | on | 不存在 | 有 | 照常建**密文**库、可打开（新闸只拦无 key，否则开关一开新账号永远建不出来） | `switch_on_absent_with_key_still_creates_encrypted_store` |
+| ⑪ | off | 不存在 | 无 | 明文创建，矩阵 a 逐字节不变 | `switch_off_absent_without_key_still_creates_plaintext_store` |
+
+补充五条：`require_encrypted_switch_parses_only_explicit_words`（解析面）、
+`switch_on_classifies_plaintext_by_header_before_opening`（顺序面：明文头 + 垃圾内容
+先报「要迁移」而不是 `StoreCorrupt`——头是权威，与迁移器同口径）、
+`switch_on_plaintext_is_terminal_and_reports_once_per_process`（**真进程**：env 进
+进程，stderr 恰一条固定行）、`switch_on_absent_without_key_refuses_before_creating_plaintext`
+（⑨：终态码 + 零落盘 + 固定行形状 + 与 `PlaintextRequiresMigration` 不混码）、
+`switch_on_absent_without_key_reports_once_per_process`（⑨ 的**真进程**：env 开关，`code=StoreKeyRequired retryable=false` 恰一条，两次调用闸不增）。
+
+**off 的「逐字节不变」怎么证明**
+
+1. **代码面**：off 时 `require_encrypted.is_on()` 为假，函数余下部分与 C 阶段一致——
+   `match (key, state)` 的四个分支没改写、没多一次 stat/打开，也没把开关塞进决策表；
+2. **行为面**：九格里 off 的四格（①②③④）与矩阵 a–e 同值——含新建路径的 ⑪
+   （off + 无库 + 无 key 仍造明文库，新闸未生效的那一面）；C.4 的既有 17 条断言（含
+   `legacy_warn_is_emitted_by_the_open_not_by_a_manual_gate`）原样全绿——它们跑的是
+   `open_store_with`（进程 env 未设置 = off）；
+3. **磁盘面**：on 的两格**逐字节比对**整份 `store.db` + 目录条目集合
+   （`assert_plaintext_refused`）：拒绝路径零写入、零新建（含 `-wal`/`-shm`）、零删除。
+   off 格不断言字节相等——它真的会打开库（WAL/迁移会动头），这正是「off = 老行为」的反面证据。
+
+**与 storeMigrate（D3 orchestration）的关系**
+
+- **互不替换**：`storeMigrate` 自己按文件头分流，不做「能不能打开明文」的判断；
+  引擎的开关只决定「服务不服务明文」，**不迁移任何东西**。
+- **推荐顺序**：① connector `KT_ENGINE_STORE_MIGRATE=dry-run` 出计划 → ② `apply`
+  逐槽「停槽 → 迁移 → 起引擎」（D3）→ ③ 该账号 `storeMigrate --json` 报
+  `code=store_migrated`（或幂等 `store_migration_noop`）、文件头已非明文 →
+  ④ 再对这批账号打开 `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on`。apply 成功的直接后果
+  就是「库已是密文」，所以开关对已迁移账号无感（九格 ⑧）；新账号只要带 key 也照常
+  建密文库（九格 ⑩），开关不会把「新号入网」这条路堵死。
+- **开关 on 期间被拒的账号怎么恢复**：跑一次正向迁移（拒绝路径**绝不删明文库**，正是
+  为了留这个源），迁移成功、重启引擎即恢复。把开关关回去也能恢复，但那等于显式
+  回退到「服务明文」，发版口径要写清。
+- **默认 off 的当时理由（这条前提已被段尾 supersede 注推翻，原文保留作记录）**：connector 当时仍
+  `env_remove` 掉 `KT_SIGNAL_STORE_KEY`（C.7-2）。此时开开关 = 把所有明文账号打成终态（九格 ⑤），**且新账号建不出来**
+  （九格 ⑨：开关 on + 无 key + 库不存在 = `StoreKeyRequired` 终态）——所以开关是
+  **按批打开**的运维动作，不是发行版默认。
+- **与反向迁移（D2 `--direction to-plaintext`）的组合**：某账号被反向成明文后，若
+  所在引擎开着开关，它会立即终态。反向迁移的用途是「撤出加密」，配套动作是把开关
+  一起关掉；两个方向别混着开。
+
+**变异验证（本机实跑，全部回滚，文件 sha256 与变异前逐字节一致）**
+
+```text
+变异 A：删掉 open_store_with_requirement 里的 C-1 闸（三行）
+        → 3 failed（709 filtered）：
+          switch_on_plaintext_without_key_is_plaintext_requires_migration
+          switch_on_plaintext_with_key_is_plaintext_requires_migration
+          switch_on_plaintext_is_terminal_and_reports_once_per_process
+          （前两条：明文照旧打开，"开关 on 必须拒绝明文库"；
+            第三条：子进程里 expect_err 直接 panic）
+变异 B：is_terminal() 改成 !matches!(self, Self::Failed | Self::PlaintextRequiresMigration)
+        → switch_on_plaintext 三条 FAILED（"终态不得退化成退避/网络重试" + 固定行
+          retryable 变 true）；certificate_tick_terminal_store_open_stops_the_task FAILED
+变异 C：slot() 的 Self::PlaintextRequiresMigration => &PLAINTEXT_REQUIRES_MIGRATION
+        改成 => &KEY_REQUIRED
+        → each_store_open_code_emits_its_own_line FAILED（stderr 只剩两行；left 2 / right 3）
+变异 D（**C-1 补漏**，2026-11-12）：删掉 open_store_with_requirement 的 3.6 段（C-1 新建闸，13 行）
+        → 2 failed / 1 passed（-- switch_on_absent 筛选）：
+          switch_on_absent_without_key_refuses_before_creating_plaintext
+            （"开关 on + 无 key + 库不存在必须终态"：新库照旧被 create_if_missing 造出来，
+               Ok(SqliteStore { … }) 直接 panic）
+          switch_on_absent_without_key_reports_once_per_process
+            （子进程里 expect_err panic → 父用例一条固定行都收不到）
+          passed：switch_on_absent_with_key_still_creates_encrypted_store（⑩ 不该被删闸影响）
+变异 E：3.6 段的返回码 KeyRequired 改成 PlaintextRequiresMigration
+        → 2 failed（同两条）：left: KeyRequired / right: PlaintextRequiresMigration；
+          真进程那条 stderr 里的 code 也跟着变——「⑨ 选 KeyRequired 而不是
+          PlaintextRequiresMigration」是断言钉死的语义选择，不是随手写的
+变异 F：3.6 段的条件去掉 require_encrypted.is_on()（变成恒拦）
+        → switch_off_absent_without_key_still_creates_plaintext_store FAILED
+          （"off + 无 key + 无库仍是兼容的明文创建（矩阵 a）"：拿到 KeyRequired）
+        ——off 的兼容面同样被 ⑪ 钉住，闸不能悄悄扩大
+```
+
+三次变异（D/E/F）都在 `src/service/mod.rs` 上做、用 `cp` 备份 + `trap` 还原，
+复原后 sha256 与变异前**逐字节一致**（`e7868703…a21cd974`）。
+
+**门禁实跑（本机 macOS aarch64 / rustc 1.99.0）**
+
+```text
+cargo fmt --all -- --check                       → 本人文件域 0 diff
+                                                   （rustfmt --check src/service/mod.rs src/store_open.rs
+                                                    src/store_encryption_tests.rs → MINE_CLEAN）；
+                                                   仓库级 --check 的剩余 diff 全在 src/store_migrate.rs
+                                                   与 tests/store_migrate.rs（d2-fixer 的文件域，本批未触碰）
+cargo clippy --all-targets -- -D warnings        → 0（零 warning）
+cargo test --bin kt-signal-engine -- store_encryption_tests --test-threads=1
+                                                 → 32 passed / 5 ignored（C-1 初版是 28/4：+3 九格、+1 child；
+                                                   C.4 的 17 条是 C 批清单，本批新增的 4 条见上面的矩阵）
+cargo test --all-targets -- --test-threads=1     → 0：bin 714 passed / 6 ignored、
+                                                   tests/contract.rs 95 passed、tests/store_migrate.rs 22 passed、
+                                                   backup5-spike 0 条
+```
+
+> 补漏期间的一次异域红：`store_migrate::tests::reverse_terminal_key_failures_leave_the_account_dir_byte_identical`
+> 在 23:32 前失败过（reverse 终态路径多出 `store.db-wal`），那是 d2-fixer 正在改
+> `src/store_migrate.rs` 的中间态；其文件 23:32:18 更新后同一条用例复跑通过（本批代码未动）。
+> 归属证据：`src/store_migrate.rs` 里 `open_store_with` / `require_encrypted` 只在注释里出现
+> 一次，迁移器不走本批改动的开关路径。
+
+**已知缺口与边界（诚实登记）**
+
+1. 开关是**逐进程 env**，引擎不落「已迁移」事实；库的状态永远以文件头为准（与迁移器
+   共用同一权威）。
+2. 开关 on 时「明文头 + 内容垃圾」先报 `StorePlaintextRequiresMigration` 而不是
+   `StoreCorrupt`（头优先，与迁移器同序）。两条都是终态；运维跑一次迁移器就会拿到
+   真正的损坏码（`store_corrupt` / exit 11）。
+3. `docs/jsonrpc-compat.md` §1 的「五类终态」在开关打开时已是**六类**；本批文件域
+   不含该文件，**未改**，登记给下一批连同码表一起对齐。→ **已对齐**（2026-11-11 doc 纠偏批：
+   §1 的 store 打开码表补上 `StorePlaintextRequiresMigration`、终态五类改六类，并新增
+   `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED` 条目）。
+4. connector 侧还没有独立消费这个新码（目前按 `retryable=false` 的通用终态桶处理）；
+   给它单开修复桶属 connector 的批次。
+5. Windows 面同 C.10 的既有边界：本批新增用例不依赖权限位/符号环，`#[cfg(unix)]`
+   之外同样编译与运行。
+
+**supersede（2026-11-11 跨仓事实；只覆盖本节里被推翻的那一条前提，不改本批记录）**：下面「与 storeMigrate 的关系」里
+"今天为什么必须默认 off"的前提——connector 仍 `env_remove` 掉 `KT_SIGNAL_STORE_KEY`——**已经不成立**：
+connector 侧已按账号把该账号派生的 store key 注入每个池槽的引擎子进程（`kt-signal-connector` 分支
+`fix/signal-runtime-state-authority`：`d87ff46` 按账号注入、`963cee6` 接上 store 迁移编排与槽锁存），
+并显式剔除继承来的 dev/test 覆盖值。因此**「开关默认 off」现在是发布决策，不是技术阻塞**：引擎已有能力
+服务密文库，`off` 只表示"还没按批打开"。⑨/⑤ 两格的风险（对未迁移账号打开开关 = 该账号停接收）不变，
+所以"先 apply 迁移、再按批开开关"的顺序要求也不变。
 
 ### P2 — 明文迁移器 + 校验 + 回滚（5–8 人日）
 

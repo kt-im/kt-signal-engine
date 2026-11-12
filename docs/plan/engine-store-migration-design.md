@@ -1,6 +1,7 @@
 # M6 D 阶段：engine 明文 `store.db` → 加密库迁移器设计（只读）
 
-> **状态**：设计稿 v1（**只读**：未改任何源码、未改 Cargo.toml、未跑构建、未迁移任何真实库、未 commit）
+> **状态**：设计稿 v1。**D1（正向）与 D2（反向）已按本文落地**（工作区未 commit，落点与契约增量见 §15）；
+> 正文保持设计口径，§13.5/§13.8 已标注 D2 的实测结论。
 > **日期**：2026-11-11
 > **本文所在仓库**：kt-signal-engine（HEAD `c4a96f4`，工作区含未提交的 `docs/plan/*`；本文 `file:line`
 > 以**本机当前工作区**为准）
@@ -21,8 +22,8 @@
 | 2 | 迁移器放哪 | **独立 argv 模式 `storeMigrate`（同一二进制）**，由 connector 在该槽引擎**停机之后、spawn 之前**调用。**不放进 `open_store`**（72 处调用点、接收路径 90s 超时，`src/service/mod.rs:9122`），**也不做引擎启动内联迁移**（连接器请求 15s / watchdog 30s 会把它当卡死并重启，正好制造"迁移中被杀"）。 |
 | 3 | 幂等与崩溃恢复靠什么 | **靠文件头分类，不靠状态文件**：`store.db` 前 16 字节是否 `SQLite format 3\0` 是唯一权威（connector 同款判定 `src/store.rs:11698-11717`）。`store.format` 只做审计/指纹，**永不参与正确性判断**——这样"rename 成功、marker 未写"这个窗口直接消失（本文对 C 文档 §4.6 的明确修正）。 |
 | 4 | 反向迁移为什么必须有 | ① **二进制回退**：旧引擎无 key 能力，加密库读不了，回退不能要求用户重扫；② **kill switch**：加密上线出问题时需要"回到明文"的可执行路径，而不是现场写代码；③ 口径/合规变化时把数据迁回明文登记；④ 正向迁移自身的最后退路（备份已过期时）。**它不解决"key 丢了"**——没有 key 就没有反向，这条必须写进文案。 |
-| 5 | 与 C 阶段 env key | C 已落地（工作区未 commit）：env **`KT_SIGNAL_STORE_KEY`**、`StoreKey`/`StoreKeyState`、`store_open::classify`、`store_connect_options_with_key`。D **不产生、不派生、不落任何 key**，只复用这四个面，并给出**一进程一把 key**的两条边界（同一 data-dir 多账号共用 key；隔离靠进程边界）。硬不变量：**加密用的 key 必须就是之后打开用的 key**，靠 marker 指纹（域分离哈希前 8 字节）在启动时比对，不一致终态拒绝、不重建。D 只要求 C 改一处：明文+有 key 从"warn 后无 key 打开"改成终态 `StorePlaintextRequiresMigration`（§7.4 C-1）。 |
-| 6 | 与 per-account 引擎进程 | 池化后一个 data-dir 恰好一个账号（池设计 §3.2 I3），D 的"每账号独立"**由结构保证**；时序是"停槽 → 迁移 → 起引擎"，迁移并发上限 1（I/O 放大 2×）。引擎启动**只检测不迁移**：见到明文库直接终态退出，避免两条迁移路径。 |
+| 5 | 与 C 阶段 env key | C 已落地（工作区未 commit）：env **`KT_SIGNAL_STORE_KEY`**、`StoreKey`/`StoreKeyState`、`store_open::classify`、`store_connect_options_with_key`。D **不产生、不派生、不落任何 key**，只复用这四个面，并给出**一进程一把 key**的两条边界（同一 data-dir 多账号共用 key；隔离靠进程边界）。硬不变量：**加密用的 key 必须就是之后打开用的 key**，靠 marker 指纹（域分离哈希前 8 字节）在启动时比对，不一致终态拒绝、不重建。D 只要求 C 改一处（**已落地**）：明文库的「warn 后无 key 打开」改成**默认 off 的开关**——`KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on` 时明文库（与有无 key 无关）走终态 `StorePlaintextRequiresMigration`，off 时维持 legacy 打开（§7.4 C-1）。 |
+| 6 | 与 per-account 引擎进程 | 池化后一个 data-dir 恰好一个账号（池设计 §3.2 I3），D 的"每账号独立"**由结构保证**；时序是"停槽 → 迁移 → 起引擎"，迁移并发上限 1（I/O 放大 2×）。引擎启动**只检测不迁移**：开关 off（默认）时明文库按 legacy 打开（有 key 时 warn 一次），开关 on 时**该账号**终态停环——两条都不会在启动段迁移，避免两条迁移路径。 |
 | 7 | 工作量 | **engine 侧 7.5–9.0 人日 + connector 编排 1.0–1.5 + 灰度演练 1.0 ≈ 9.5–11.5 人日**（C 文档 P2 的 5–8 人日没含反向、崩溃矩阵、跨仓编排，见 §11）。 |
 | 8 | 磁盘峰值 | 需要 **约 3.0× 库体积**（原库 + 明文备份 + 加密 staging），不是 C 文档 M9 写的 2.2×。预检按 `2.1×L + 32 MiB` 的**新增**空间判（§9 D-01）。 |
 
@@ -50,7 +51,7 @@
 | 引擎 store 里有身份私钥/会话/棘轮/prekey/群 sender key/联系人/消息 | `vendor/presage/presage-store-sqlite/migrations/20250112201436_init.sql:1,4,12,20,27,34,42,52,74,110,116` |
 | 库内 schema 迁移是 `_sqlx_migrations` + `sqlx::migrate!`（加密不改变这套） | `vendor/presage/presage-store-sqlite/src/lib.rs:86` |
 | **C 阶段已并发落地（工作区未 commit）**：key 三态 + 文件分类 + 错误码 + 打开矩阵 | `src/store_key.rs:37,70-81,95-105,121-150`、`src/store_open.rs:56-66,91-125,207-268`、`src/service/mod.rs:14750-14755,14788-14850` |
-| 现状：明文 + 有 key = **warn 一次后按无 key 打开**（D 要求改终态） | `src/service/mod.rs:14813-14819`、`src/store_open.rs:186-200` |
+| 现状：明文 + 有 key = **warn 一次后按无 key 打开**（C-1 已落成默认 off 的开关：on 才终态，见 §7.4） | `src/service/mod.rs:14926-14931`、`src/store_open.rs:186-200`、`:94-158`（开关解析） |
 
 ### 1.2 参考实现（connector @ `d491396`）
 
@@ -111,9 +112,18 @@ kt-signal-engine --data-dir <DIR> storeMigrate [--account <lk-hex>] [--direction
 | 字段 | 类型 | 含义 |
 |---|---|---|
 | `ok` | bool | 全部账号成功才 true |
+| `dryRun` | bool | 本次是不是干跑（顶层镜像，与 `accounts[].action=dry-run` 同一事实；连接器不必逐账号推断） |
 | `accounts[]` | array | 每个账号一条：`lk`（目录名）、`action`（`migrate`/`dry-run`/`noop`/`absent`/`failed`）、`code`、`bytes`、`elapsedMs`、`keyid`、`backup`（文件名或 null；**干跑恒 null**）、`checks`（本次实际通过的校验项名） |
 | `freeBytes` / `needBytes` | number | 预检读数（失败时是证据，不是猜测） |
 | `plan[]` / `did[]` | array | **步骤名数组**（`checkpoint`/`backup`/`export`/`verify`/`swap` 的规范顺序）。多账号取并集；`--dry-run` 只有 `plan`（且 `action=dry-run`、`code=store_migration_planned`、`backup=null`），实跑两者都有，便于对账 |
+| `error` | object（**仅跑不起来时在场**） | `{code, retryable}`：data-dir 不存在、迁移锁被占等**账号级之前**的整体失败。`retryable=false` ↔ 终态 11，`retryable=true` ↔ 可重试 10；成功路径整键缺席（不投 `null`） |
+
+> **`plan[]`/`did[]` 的口径（别把它读成「每账号恒五步」）**：顶层两个数组只从五个规范步骤名里取
+> （实现里按 `STEPS` 过滤后对多账号求并集），连接器按字面量逐项对账不会看到第六个名字。
+> **逐账号的 `did` 已经不是纯五步**：幂等/收敛路径另记 `cleanup`（清孤儿 staging）、
+> `marker`（补/改审计 marker）、`prune_backup`（过期备份清理）——这些标签只留在实现的
+> 账号结果里（干跑用例断言 `did` 为空就是靠它），**既不进顶层数组也不进 `accounts[]`**，
+> `--json` 里读不到它们。
 
 为什么单独一个模式而不是启动内联：迁移器要能被**连接器按槽单独计时/单独失败/单独重试**，也要能被支持人员拿同一个二进制在副本上演练（`--dry-run`）。它不该继承引擎的请求超时、watchdog 与重启预算。
 
@@ -122,30 +132,66 @@ kt-signal-engine --data-dir <DIR> storeMigrate [--account <lk-hex>] [--direction
 ~~~text
 connector.supervisor.start_slot(account)
   1) 取 DataDirLock(engines/<accountId>)              # 池设计 §6.5：datalock.rs:9-27
-  2) 确认槽内引擎已退出（stdin EOF → exit 0；必要时 SIGKILL 兜底）
-  3) spawn: kt-signal-engine --data-dir <dir> storeMigrate --account <lk-hex> --json
-       env: KT_SIGNAL_STORE_KEY=<与随后引擎完全相同的值>
-       budget: 迁移预算（建议 120s/账号，独立于 15s 请求超时）
-  4) 解析退出码：0 继续；10 退避重试（≤3 次）；11 标 migration_blocked，**不重启引擎**
+  2) 槽内引擎已在跑 → 直接起（`already_running`，不迁移）；否则先停槽再迁：
+     stdin EOF → exit 0；停不下来 = **可重试 10**（`store_busy`，不锁存），必要时 SIGKILL 兜底
+  3) 开关 off（默认）→ 跳过；dry-run / apply → 跑迁移器：
+       spawn: kt-signal-engine --data-dir <dir> storeMigrate [--dry-run] --json
+       env: KT_SIGNAL_STORE_KEY=<该账号派生、与随后引擎完全相同的值>
+       budget: 迁移预算（缺省 120s/账号，独立于 15s 请求超时）
+       # `--account` 是**可选**参数（只迁一个目录，人工演练 / repro 用）；
+       # 连接器**不使用**它：池化后一个 data-dir 恰好一个账号，枚举整个目录
+       # 就是那个账号；传错 lk 只会把「迁了这个、漏了那个」变成静默成功。
+  4) 解析退出码（唯一可编程判据，§2.4）：0 继续；10 → 本次不起引擎、下次起槽重试；
+     11 → **锁存** `StoreMigrationBlock`，该槽永不再起，对外一律
+     `CAPABILITY_UNAVAILABLE(retryable=false)` + 可执行文案；2 → 集成 bug
+     （不锁存、本轮不重试）
   5) spawn: kt-signal-engine --data-dir <dir> jsonRpc ...
 ~~~
 
-两条模式，一个开关（`KT_ENGINE_STORE_MIGRATE`）：
+**三档，一个开关（`KT_ENGINE_STORE_MIGRATE`，连接器侧 env，引擎不读它）**：
 
 | 值 | 行为 | 用在哪 |
 |---|---|---|
-| `startup`（D 上车版本默认） | 每次起槽前主动跑一次迁移器（快路径：一次进程 spawn ≈10.6ms + `readdir` + 16 字节读） | 存量明文库收敛期 |
-| `lazy` | 不主动跑；引擎启动见明文 → 终态退出（`PlaintextStoreRequiresMigration`），连接器收到该码后跑一次迁移器再重起 | 收敛完成后 |
-| `off` | 不迁移；引擎见明文 → 终态退出并提示 | 事故熔断（注意：加密库在 `off` 下也打不开，见 §7.4） |
+| `off`（**默认**，也是**认不出的值的归宿**） | 完全不动：不 spawn 迁移器、不读 store 一个字节、账号状态零变化；引擎照旧启动 | 未上车的部署；事故熔断 |
+| `dry-run`（别名 `dry_run`/`dryrun`） | 起槽前（引擎没在跑时）跑一次迁移器 `--dry-run --json`（只出计划、零字节写入），**无论它答什么都照常起引擎**（观察模式；计划失败只改日志标签，绝不用它拦服务） | 灰度前出计划、迁移前对账 |
+| `apply` | 槽内引擎**没在跑**时才迁移：用该账号派生的 key 跑一次迁移器，成功（exit 0）再起引擎 | 存量明文库收敛期 |
+
+- 取值解析严格：`off` / `dry-run` / `apply`（去空白、大小写不敏感）；**拼错 = off + 一条 WARN**
+  （"什么都不做"是唯一安全的失效方向——这条路径有破坏能力，笔误不该把连接器带下线，
+  也不该把一批账号打成终态）。
+- `apply` 的三种成功结局：`migrate`（真发生了一次替换）/ `noop`（已是密文）/ `absent`（无库）。
+  只有 `migrate`/`noop` 记「本进程内该槽已迁移」，后续起槽跳过整库校验收口（那是迁移里最贵的一半）；
+  `absent` **不记**——新库由引擎首起时自己建。
+- `apply` 的两条跳过（不是失败）：账号目录还不存在（新账号，别让 `data_dir_missing` 把它一上来就锁死）；
+  以及拿不到**该账号派生**的 key（遗留多账号进程 / 无 root key）——用别人的派生去开这个库正是 key 模型禁止的跨账号解锁。
+- 闸的顺序固定，别随便重排：**off 早退**（一个文件都不读）→ 引擎已在跑（`already_running`）→
+  本进程已迁移（`already_migrated`）→ 锁存（`blocked`，直接拒、不 spawn）→ 目录还没有 / 没有该账号的
+  派生 key（`skipped`）→ **停槽 → 迁移 → 起引擎**。"没有引擎持库"与"没有引擎打开迁移器还在写的库"
+  是这条顺序要同时保证的两件事。
+- 迁移预算独立：`KT_ENGINE_STORE_MIGRATE_BUDGET_MS`（缺省 120s，下限 200ms，非法值回缺省 + WARN），
+  刻意不继承 15s 请求超时（§8.2）。
+
+**「lazy」不是本开关的档位，是一套独立编排**：开关里没有"收敛完成后切成 lazy"这一档。若要让引擎先起、
+由引擎自己报「明文库要迁移」来触发迁移，那是另一条路径——它要求引擎侧
+`KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on`（默认 off，见 `engine-store-encryption.md` C.12），连接器见
+`code=StorePlaintextRequiresMigration` 后跑迁移器再重起。这条路径今天**没有落地**，写在这里只是把旧稿的
+`lazy` 归位：它是"引擎先起 + 另开一个开关"的组合，不是 `KT_ENGINE_STORE_MIGRATE` 的第四个值。
 
 ### 2.4 退出码（连接器唯一可编程判据）
 
 | 码 | 含义 | 连接器动作 |
 |---|---|---|
-| 0 | 成功 / 无事可做（`noop`），或干跑（`action=dry-run`） | 继续起引擎 |
-| 2 | 用法错误 | 不重试（属集成 bug） |
-| 10 | **可重试**：空间不足、库被占用（含 swap 前 WAL 折不进去）、瞬时 I/O 失败、**权限/只读 IO 读失败**（D-15 口径，与 C 一致） | 退避重试 ≤3 次；仍失败 → 上报 |
-| 11 | **终态**：key 缺失/不匹配、源库损坏、校验不过、主库状态违规（`store_state_invalid`：加密库完整性/页 HMAC 不过）、data-dir 不存在、账号目录消失 | 标 `migration_blocked`，不重启，桌面可提示 |
+| 0 | 成功 / 无事可做（`migrate`/`noop`/`absent`），或干跑（`action=dry-run`） | 继续起引擎；`apply` 的 `migrate`/`noop` 还记「本进程内该槽已迁移」，后续起槽跳过整库校验收口 |
+| 2 | 用法错误（引擎不认 `storeMigrate` 或参数形状不对 = 连接器与引擎版本不齐） | 不锁存、本轮不重试；对外 `CAPABILITY_UNAVAILABLE(retryable=false)` + 版本不齐文案（属集成 bug） |
+| 10 | **可重试**：空间不足、库被占用（含 swap 前 WAL 折不进去、**引擎停不下来**）、瞬时 I/O 失败、**权限/只读 IO 读失败**（D-15 口径，与 C 一致） | 本次**不起引擎**，下一次起槽重试（同一次起槽内至多 3 次、200ms/400ms 递增退避；超预算不重试）；对外 `CAPABILITY_UNAVAILABLE(retryable=true)` + 「not ready yet」文案 |
+| 11 | **终态**：缺 SQLCipher 能力（`StoreCipherUnavailable`）、key 缺失/不匹配（`StoreKeyRequired`/`StoreKeyInvalid`/`store_key_mismatch`/`store_key_rejected`）、源库损坏、校验不过、主库状态违规（`store_state_invalid`：加密库完整性/页 HMAC 不过）、data-dir 不存在、账号目录消失 | **锁存** `StoreMigrationBlock{code, exit, message}`（进程内永不清，清理 = 换进程），该槽不再起引擎；对外一律 `CAPABILITY_UNAVAILABLE(retryable=false)` + 可执行文案（`StoreCipherUnavailable` 的文案**不**建议重链——那是构建/版本问题，数据没坏） |
+
+> 干跑不看终态语义：`dry-run` 无论答 exit 0 / 2 / 10 / 11 都照常起引擎，结论只进日志标签
+> （`planned` / `planned_failed`）。"观察模式绝不拦服务"是刻意的：拦服务的判据只能是实跑。
+>
+> 锁存的边界：`StoreMigrationBlock` 是**进程内**的锁存（换进程重来一遍），不是落盘状态；
+> 磁盘上的事实仍只有文件头（§5.2）。清锁存的唯一动作是修好人要修的东西（补齐/恢复 key、
+> 换正确构建、重链），重启连接器不会让它自己消失。
 
 ---
 
@@ -170,7 +216,7 @@ connector.supervisor.start_slot(account)
 -- 连接：无 key（明文库直接读）；create_if_missing=false；synchronous=FULL
 PRAGMA wal_checkpoint(TRUNCATE);          -- 必须读回 (busy, log, checkpointed)，busy≠0 → 中止
 PRAGMA integrity_check;                    -- 必须 'ok'
-VACUUM INTO '<acct>/store.db.plaintext-backup';   -- 目标已存在会失败：先删
+VACUUM INTO '<acct>/store.db.plaintext-backup';   -- 目标已存在会失败：先删（但只在本步之前的校验全过之后才删）
 ~~~
 
 对应参考实现 `src/store.rs:11766`（checkpoint）、`:11769`（`VACUUM INTO ?1`）。
@@ -343,6 +389,7 @@ magic=KTSF ver=1 state=sqlcipher-v1 keyid=<8hex> fp=<8hex> at=<unixms> tool=<eng
 | 加密、key 打得开且§5.5 谓词成立 | **no-op**，exit 0，零字节改动 | `code=store_migration_noop` |
 | 加密但 key 打不开 | 终态 exit 11，**不**重建、**不**迁移 | `code=store_key_rejected` |
 | 加密、打得开但完整性不过（`integrity_check`≠ok 或 `cipher_integrity_check` 非空） | 终态 exit 11，保留全部现场（不 prune 备份） | `code=store_state_invalid` |
+| 明文头正常但**内容坏**（无 key 打不开） | 终态 exit 11，保留全部现场（零改名、零删除） | `code=store_state_invalid` |
 | 不存在/长度 0 | no-op（新建是 C 的事） | `code=store_migration_absent` |
 
 "零字节改动"要能被验收断言（§10.2 的 `snap` 前后 diff 为空），否则"幂等"只是口号。
@@ -422,6 +469,12 @@ magic=KTSF ver=1 state=sqlcipher-v1 keyid=<8hex> fp=<8hex> at=<unixms> tool=<eng
 崩溃收敛与正向同构（§5.4）：头判明文 → 幂等完成；头判加密 → 重做。反向的"B4 等价断点"是
 "rename 后、marker 置 plaintext 前"，同样靠头吸收。
 
+**残留清理的位置**：反向的 step 0（staging / marker tmp / 上一次的 `.encrypted-backup`）与正向同款，
+**必须排在 key / marker / integrity 全部通过之后、拷贝之前**。理由不是洁癖：终态 11 的验收面是「账号
+目录逐文件不变」，`.encrypted-backup` 是反向唯一的回滚物——在校验之前删它，等于一次错 key 就毁掉回滚能力。
+同理，验真/完整性闸开的是读写连接，WAL 模式下 SQLite 会物化空的 `-wal`/`-shm`；失败收口时只回收
+**本次新建的空 sidecar**（非空 WAL 与本来存在的文件一律不动）。
+
 ### 6.4 往返一致性（验收必测）
 
 `明文 → 加密 → 明文` 之后，§4 的矩阵必须**再次全绿**（行数、账本、序列、user_version 全等）。
@@ -472,16 +525,22 @@ magic=KTSF ver=1 state=sqlcipher-v1 keyid=<8hex> fp=<8hex> at=<unixms> tool=<eng
 
 | # | 变更 | 现状 | 为什么必须 |
 |---|---|---|---|
-| C-1（硬依赖） | 明文 + 有 key：从"warn 后**无 key 打开**"改成**终态** `StorePlaintextRequiresMigration` | `src/service/mod.rs:14813-14819`：`warn_plaintext_legacy_once()` 后 `keyed=false`（有意停留，注释写明"迁移在 D 阶段"） | 不改的话，引擎会**照常服务明文库**，D 的 `startup` 模式成了唯一触发点；一旦连接器没接上迁移器，就是"文档说加密、磁盘还是明文"（C 文档 §0 明确禁止的半实施）。改成终态后，任何漏迁移都是**可见的启动失败**，不是静默明文 |
+| C-1（硬依赖，**已落地为默认 off 的开关**） | 明文库（**与有没有 key 无关**）：开关 `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED` **on** → 终态 `StorePlaintextRequiresMigration`；**off（默认）= C 阶段原样**（`warn_plaintext_legacy_once()` 后按无 key legacy 打开） | `src/service/mod.rs:14905-14919`（开关 on 的两道闸）、`src/store_open.rs:94-158`（解析：on/1/true/yes，off 族与认不出的值都归 off + 一条滚动日志 WARN）；off 路径仍是 `:14926-14931` 的 `keyed=false` + legacy warn | 落地形态改了这条请求的"无条件终态"口径：C-1 落地时连接器还不注入 key，无条件终态等于把存量账号一次性打成"起不来"。做成**默认 off** 的开关后，"改终态"变成**按批打开的发布决策**；on 之后任何漏迁移仍是可见的启动失败，不是静默明文 |
 | C-2（纯新增） | `StoreKey::fingerprint()`：域分离哈希（如 `SHA-256("kt-store-fp" ‖ key)` 前 8 字节） | 无 | marker 指纹（§5.2）；缺省只是少一条诊断，不阻塞 D |
 
-C-1 是唯一会改变 C 已落地行为的请求，必须由 C 的 owner 确认；C-2 可后置。
+C-1 是唯一会改变 C 已落地行为的请求（已按上表落地为默认 off 的开关，见 `engine-store-encryption.md` §7 C.12）；C-2 可后置。
 
-### 7.5 `off` 模式的真实代价
+### 7.5 `off` 模式的真实代价（按落地语义）
 
-`KT_ENGINE_STORE_MIGRATE=off` 不能"让明文库照旧服务"：一旦库已加密，关掉加密等于关掉打开能力。
-所以 `off` 的正确定义是"**不迁移，且引擎对明文库终态拒绝**"；真正要回到明文服务，必须先跑 §6 的反向迁移。
-把这句话写进 runbook，避免事故时有人以为改个 env 就能回退。
+`KT_ENGINE_STORE_MIGRATE=off`（默认）的定义是"**连接器不跑迁移器**"，**不是**"引擎不服务明文"——
+后者归引擎侧另一个开关：`KT_SIGNAL_STORE_REQUIRE_ENCRYPTED` **默认 off**，明文库照旧按 legacy 打开
+（有 key 时 warn 一次，不迁移、不改字节，矩阵 c）；只有把它显式开成 on，明文库才是
+`StorePlaintextRequiresMigration` 终态（停**该账号**接收管线，不是进程退出）。
+
+两个开关都不能让加密库回到可用明文：一旦库已加密，没有 key 就打不开（`StoreKeyRequired`），要回到
+明文服务必须先跑 §6 的反向迁移（`--direction to-plaintext`）。所以事故 runbook 要写两条，别只写一条：
+① `KT_ENGINE_STORE_MIGRATE=off` 只停"自动迁移"，加密库仍需 key；② 真要退回明文，走反向迁移，并让
+`KT_SIGNAL_STORE_REQUIRE_ENCRYPTED` 保持 off。
 
 ---
 
@@ -494,7 +553,7 @@ C-1 是唯一会改变 C 已落地行为的请求，必须由 C 的 owner 确认
 
 - D 的迭代集合在池化布局下**恒为 1 个账号** → 爆炸半径 = 1 个账号，与池的 I1/I2 同构；
 - 迁移的"停引擎"窗口 = 该槽的停槽窗口，不影响其他账号的收发；
-- 迁移失败只会让**一个**账号进 `migration_blocked`，不会连坐。
+- 迁移失败只会让**一个**账号进锁存块（`StoreMigrationBlock`），不会连坐。
 
 **多账号遗留布局**（`proxy-groups/<groupId>`，迁移期仍在）里，一个 data-dir 有 N 个账号：D 串行逐个迁，
 **允许部分成功**（账号 A 迁完、B 失败），因为每个库的合法性彼此独立；连接器只需按"整体退出码"决定是否放行
@@ -511,23 +570,36 @@ C-1 是唯一会改变 C 已落地行为的请求，必须由 C 的 owner 确认
 ### 8.3 三个必须一起改的冲突点
 
 1. **启动清扫依赖"能打开 store"**：`cleanup_abandoned_link_stores` 要 `open_store` 才能判"未注册"
-   （`src/service/mod.rs:14796-14831`、`:14744`）。C 之后明文库打不开 → 清扫会把明文孤儿库**永久保留**。
+   （`src/service/mod.rs:14796-14831`、`:14744`）。引擎开关 on 之后明文库打不开 → 清扫会把明文孤儿库**永久保留**
+   （开关 off（默认）时明文库照旧能打开，这条只在「已经逐批打开终态开关」的 data-dir 上成立）。
    所以"先迁移、后清扫"是硬顺序：迁移器在 spawn 前跑（§2.3），引擎启动时的清扫面对的就都是加密库。
-2. **重启风暴**：明文库让引擎终态退出；若连接器把它当"崩溃"无限重启，就是一个 1 秒级重启循环。所以 D 的
-   exit 11 必须被连接器识别为**不可重启**（跨仓依赖，写进 §11 的依赖清单）。
+2. **重启风暴（只在引擎开关 on 时存在）**：开关 on 的明文库让**该账号**接收管线停环（进程不退、退出码仍只有
+   0/1/2）；连接器若把这个终态当成"崩溃"重启整条引擎，就变成 1 秒级重启循环。所以
+   `code=StorePlaintextRequiresMigration retryable=false` 必须被连接器识别为**不可重启**（跨仓依赖，写进 §11
+   的依赖清单）。开关 off（默认）时明文库按 legacy 打开，没有这条。
 3. **并发迁移**：池化启动是"并发 2 + 间隔 200ms"（池设计 §6.1 ④），而迁移是 I/O 放大 2× 的重活。
    迁移必须**串行**，且与引擎启动的并发池分开调度。
 
-### 8.4 D 之后引擎启动只做三件事
+### 8.4 D 之后引擎启动：明文库按开关分流，**没有 exit 11**
 
 ~~~text
-① 能力门（已有，src/main.rs:489）
-② 每个 accounts/lk-*：读 16 字节头
-     明文 → 终态 exit 11（code=PlaintextStoreRequiresMigration），**不迁移**
-     加密 → 交给 open_store（C 的 key 路径）
-     缺失 → 交给 open_store 新建（C 的路径）
+① 能力门（已有，src/main.rs:517）+ key 形状证据（:522）
+② 每个 accounts/lk-*：读 16 字节头（open_store_with_requirement）
+     明文 + 开关 off（默认） → **按 legacy 打开**（不设 key；**有 key 时**每进程一条 warn），
+                               不迁移、不改一个字节（矩阵 a/c；**今天生产就是这条**）
+     明文 + 开关 on          → **该账号**终态 StorePlaintextRequiresMigration：
+                               接收管线停环（StreamOutcome::StoreTerminal），
+                               进程不退、其余账号不受影响
+     加密 → 交给 open_store（C 的 key 路径；错 key = StoreKeyRejected 终态）
+     缺失 → 交给 open_store 新建（C 的路径；开关 on + 无 key = StoreKeyRequired）
 ③ 其余启动动作不变
 ~~~
+
+**进程退出码只有 0/1/2**：0 = stdin EOF 干净退出，1 = 致命启动/运行态（注册表加载失败、
+清扫失败、S5 单账号护栏、stdout writer 死亡），2 = 用法错误/非法代理 env。**11 是迁移器的码，
+不是引擎的码**——引擎遇到打不开的库不会 `exit 11`，它要么按矩阵打开、要么把**那个账号**的接收
+管线停掉（开关 on 时），进程继续服务其余账号。旧稿「明文 → 终态 exit 11」是设计期口径，
+落地为「逐账号终态 + 可重试/不可重试码面」，见 §2.4 与 `engine-store-encryption.md` C.12。
 
 ---
 
@@ -549,7 +621,7 @@ C-1 是唯一会改变 C 已落地行为的请求，必须由 C 的 owner 确认
 | D-12 | staging/备份残留 | 每次运行第一步 | 删 staging + sidecar；备份按"主库已加密"才删 | 收敛 | 0 |
 | D-13 | sidecar 残留（`-wal/-shm`） | 替换前 | 与 rename 同一步删除 | 加密库可打开 | 0 |
 | D-14 | 跨文件系统 rename（EXDEV） | P7 断言同目录 | 拒绝 | 原样 | 11 |
-| D-15 | 权限/只读文件系统 | 打开或写失败 EACCES/EROFS | 零写入 | 原样 | **10**（裁决 #14：与 C 的 `StoreOpenFailed` 同口径；这类失败多为槽还没 chown/挂载未就位，退避重试能自愈，归终态会把槽误标成 `migration_blocked`） |
+| D-15 | 权限/只读文件系统 | 打开或写失败 EACCES/EROFS | 零写入 | 原样 | **10**（裁决 #14：与 C 的 `StoreOpenFailed` 同口径；这类失败多为槽还没 chown/挂载未就位，退避重试能自愈，归终态会把槽误标成锁存终态） |
 | D-16 | Windows 句柄未释放（sharing violation） | rename 失败 | 保留明文，等下次 | 原样 | 10 |
 | D-17 | 两个迁移器并发 | flock 非阻塞失败 | 立即退出 | 由先到者收敛 | 10 |
 | D-18 | 迁移中账号目录被删（并发 deleteAccount） | ENOENT | **不重建目录**，报 `account_vanished` | 无（已删） | 11 |
@@ -618,7 +690,7 @@ env -u KT_SIGNAL_STORE_KEY [BIN] --data-dir "[DIR]" storeMigrate --json         
 KT_SIGNAL_STORE_KEY=[另一把 key] [BIN] --data-dir "[DIR]" storeMigrate --json   # 期望 exit 11、零写入
 ~~~
 
-### 10.4 崩溃注入（确定性 + 随机）
+### 10.4 崩溃注入（确定性断点 + 固定种子的崩溃点）
 
 ~~~bash
 # 确定性断点（仅 debug 构建存在；release 里必须编译掉——评审项）
@@ -630,7 +702,9 @@ for p in after_backup after_export after_sidecar after_rename before_marker; do
   # 期望：exit 0，且 §5.5 谓词成立
 done
 
-# 随机杀（属性测试）：50 轮，每轮随机 0–200ms 后 SIGKILL，再跑一次，断言谓词
+# 崩溃注入（属性测试）：**固定种子的 50 个 kill 点**（0–200ms 伪随机延迟），
+# 每个点 SIGKILL 后重启一次，断言 §5.5 谓词。实现里每轮还要断言子进程**真的**被
+# SIGKILL 收走（signal=9）；延迟比迁移还长的轮次不算数，恢复起点后重杀。
 for i in $(seq 50); do
   KT_SIGNAL_STORE_KEY=[KEK] [BIN] --data-dir "[DIR_COPY]" storeMigrate --account [LK] --json &
   pid=$!; sleep 0.0$((RANDOM % 9))$((RANDOM % 9)); kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null
@@ -671,11 +745,12 @@ grep -c 'event=store_migrate' "[DIR]/logs/engine-stderr.log"   # 每账号恰好
 
 1. pilot 账号（建议 1 → 3 → 全量三档）迁移后：§4 矩阵**全绿**，且 `_sqlx_migrations` 逐行相等。
 2. 幂等：第二次运行 exit 0 + `noop` + 目录 `snap` 前后 **diff 为空**。
-3. 崩溃：5 个确定性断点 + 50 轮随机 kill，**每次**都能收敛，且 §5.5 谓词恒真（不存在第三态）。
+3. 崩溃：5 个确定性断点 + **固定种子的 50 个 kill 点**，**每次**都能收敛，且 §5.5 谓词恒真（不存在第三态）。
 4. 失败三类（空间/占用/错 key）**零写入**（snap diff 为空）且退出码分别是 10/10/11。
 5. 反向：往返后 §4 矩阵再次全绿；旧版二进制能启动并收一条。
-6. 引擎启动：已迁移库正常 open（`store_open` 计时出现）；未迁移库终态 `PlaintextStoreRequiresMigration`
-   且**不重启**（连接器侧观察 5 分钟无重启循环）。
+6. 引擎启动：已迁移库正常 open（`store_open` 计时出现）；未迁移库 **+ 引擎开关 off（默认）** 按 legacy 打开
+   + 恰一条 warn、**零字节改动**；未迁移库 **+ 开关 on** 则该账号终态 `StorePlaintextRequiresMigration`
+   （接收管线停环、进程不退）且连接器侧观察 5 分钟无重启循环。
 7. 证据行：每账号一行 WARN，字段只有 `code/stage/account_tag/bytes/elapsed_ms/keyid`，无 key、无号码。
 8. 磁盘：迁移期峰值 ≤ **3.0×L**；迁移后库体积 ≤ L×1.03（C 文档 M4）。
 9. `cargo fmt` / `cargo clippy --all-targets -- -D warnings` / `cargo test --all-targets` 全绿；
@@ -731,11 +806,14 @@ grep -c 'event=store_migrate' "[DIR]/logs/engine-stderr.log"   # 每账号恰好
 4. **`sqlcipher_export` 对 `WITHOUT ROWID` 表/生成列的行为**：本仓 schema 目前没有这类表，但上游迁移可能引入；
    §4 的 schema 集合比对能发现"表没了"，不能发现"约束变了"——需要在上游迁移引入新特性时补检查。
 5. **sqlx 对 `ATTACH … KEY ?2` 的绑定**：connector 用 rusqlite 验证过；sqlx 侧只推理过（`VACUUM INTO ?1` 同理），
-   落地要先写一条探针测试。
+   落地要先写一条探针测试。**D2 已实测**：正向 `ATTACH … AS encrypted KEY ?` 与反向 `ATTACH … AS plaintext KEY ''`
+   在 sqlx 0.9 上均按预期工作（`src/store_migrate.rs:1325`、`tests/store_migrate.rs` 的往返用例）。
 6. **连接器 15s/30s 预算的当前值**来自池设计文档转引 `kt-signal-connector/src/engine.rs:158-159,2777-2812`，
    本文没有在 connector HEAD 上复核这两处。
 7. **C 的落地形状可能还会动**：§7 写的是本机工作区当前代码（未 commit）。若 C 改成"KEK→每账号 DEK + 包裹文件"，D 只需把 P2 换成「解包 DEK」，其余步骤不变（key 来源是唯一耦合点）。
 8. **`ATTACH … KEY ''` 的明文语义**：这是 SQLCipher 文档的反向 recipe，本文没有在本机构建上实测；§4 的头检查与「无 key 能打开」负例会把它变成硬失败（而不是静默产出加密库），所以风险是"反向迁移当场失败"而不是"错数据"。等价退路见 §6.3。
+   **D2 已实测**：本机构建上 `KEY ''` 产出的是真明文（头 = `SQLite format 3\0`、无 key 能打开、
+   带 key 打开报 `not a database`），因此等价退路（§6.3 的 `sqlcipher_export('main','enc')`）没有启用。
 
 ---
 
@@ -768,4 +846,72 @@ grep -c 'event=store_migrate' "[DIR]/logs/engine-stderr.log"   # 每账号恰好
 
 - `sqlcipher/sqlite3.c:112014-112170`（`sqlcipher_export`：schema `:112072` / 数据 `:112103` / 序列 `:112113-112117`）
 - `:111124-111134`（`cipher_plaintext_header_size`）、`:111453-111457`（`cipher_integrity_check`）
+
+---
+
+## 15. 落地记录：D2 反向迁移（2026-11-11）
+
+> 本节是**实现记录**，不是新设计：上文的契约（五步、`--json` 形状、退出码 0/2/10/11）一条都没改，
+> 只把 §6 的反向迁移落到 `src/store_migrate.rs` 并补上它需要的两个落盘名字。
+> 行号以本机当前工作区为准（未 commit）。
+
+### 15.1 契约增量（连接器只需要认这几条）
+
+| # | 项 | 值 | 落点 |
+|---|---|---|---|
+| 1 | 方向开关 | `--direction to-plaintext`（合法取值，默认 `to-encrypted`） | `src/main.rs:128-129`（USAGE）、`src/store_migrate.rs:220-232`（`Direction::parse`） |
+| 2 | 成功码 | `store_plaintext_restored`（`action=migrate`：确实发生了一次替换） | `src/store_migrate.rs:156`（码面）、`:779`（回填点） |
+| 3 | 回滚物 | `store.db.encrypted-backup`（**字节拷贝**，保留 7 天；这 7 天内 key 也不能删） | `src/store_migrate.rs:2206`、`:2331` |
+| 4 | staging | `store.db.decrypting`（与正向的 `.encrypting` **刻意分开**：同一路径上的半成品无法判断方向） | `src/store_migrate.rs:1059` 起 |
+| 5 | `plan[]`/`did[]` | 仍是 `checkpoint/backup/export/verify/swap`（反向不改步骤名，只改导出目标） | `src/store_migrate.rs:199` |
+| 6 | `store.format` | `state=plaintext`（只作审计；正确性仍只读文件头） | `src/store_migrate.rs:2292`、`:2315` |
+| 7 | 退出码 | 不变：错 key → **11** `store_key_rejected`；marker 指纹不符 → **11** `store_key_mismatch`；占用/空间/瞬时 IO → **10** | `src/store_migrate.rs:1059-1100` |
+| 8 | 干跑 | `action=dry-run` / `code=store_migration_planned` / `backup=null`（与正向同一形状） | `src/store_migrate.rs:792` |
+
+### 15.2 五步落点与「不碰原库」的证明方式
+
+| 步 | 实现 | 对原加密库的动作 |
+|---|---|---|
+| checkpoint | `probe_keyed_store` 验真 → 带 key `wal_checkpoint(TRUNCATE)` 断言 busy=0 → `integrity_check` + `cipher_integrity_check` | 只读（WAL 折入是 SQLite 的既有语义，不改内容） |
+| backup | 收口 WAL（断言 `-wal` 为空）→ `fs::copy` → fsync → `probe_keyed_store` 验真 | 只读 |
+| export | `ATTACH … AS plaintext KEY ''` → `sqlcipher_export('plaintext')` → 补 `user_version`/`application_id` → `DETACH` | 只读 |
+| verify | 头 == `SQLite format 3\0` + 无 key 能打开 + `integrity_check`/`foreign_key_check` + 逐表行数/账本/序列/头字段 + `load_registration_data` 与源侧一致 + **带 key 打不开** | 只读 |
+| swap | keyed checkpoint 收口 → `remove_sidecars(store.db)` → `rename` → fsync 目录 → 写 marker | 唯一的写动作是 `rename`（原子） |
+
+失败路径的可执行判据（与 §5.5 同一条）：导出/校验失败只删 `store.db.decrypting`（+sidecar）；
+**终态 11**（错 key / 指纹不符 / 完整性不过 / 明文头但内容坏）一个文件都不动——原库、备份、staging、marker tmp
+全部保留取证，`store.db` 逐字节不变；因此「第三态」不可能出现——主库要么是完整密文、要么是完整明文。
+
+### 15.3 测试覆盖（本机已执行）
+
+**单测（`src/store_migrate.rs::tests`）**：
+
+- `reverse_dry_run_plans_without_touching_the_store`（目录快照逐字节不变）
+- `reverse_noop_on_plaintext_store_changes_nothing`（幂等 no-op 零字节改动）
+- `marker_state_tracks_the_direction`（`sqlcipher-v1` ↔ `plaintext`，marker 不含 key）
+- `backup_retention_is_bucketed_by_suffix`（正向清理不碰反向备份，反之亦然）
+
+**真进程（`tests/store_migrate.rs`）**：
+
+- `cli_unmigrates_encrypted_store_to_plaintext`（`--json` 契约 + 五步 plan/did + 回滚物可用）
+- `cli_round_trip_preserves_rows_ledger_and_registration`（明文→加密→明文，事实逐项相等，含注册行）
+- `cli_reverse_dry_run_plans_without_writing`
+- `cli_reverse_on_plaintext_store_is_a_noop`
+- `cli_reverse_verify_failure_leaves_encrypted_source_untouched`（注入行数不符：原库逐字节不变 + 下次可收敛）
+- `cli_reverse_fault_points_converge`（`after_backup/after_export/after_sidecar/after_rename/before_marker`）
+- `cli_reverse_wrong_key_leaves_the_store`（11 + 字节不变）
+- `cli_reverse_terminal_failures_leave_the_account_dir_byte_identical`（错 key / 指纹不符：**目录**快照逐文件不变）
+- `cli_corrupt_plaintext_is_state_invalid_and_touches_nothing`（明文头+内容坏 → `store_state_invalid`，两个方向都零改动）
+- `cli_reverse_random_kill_converges_to_one_state`（**固定种子的 50 个 kill 点**：0–200ms 伪随机延迟，每点断言 signal=9、§5.5 谓词与无孤儿 staging）
+
+### 15.4 未决项（不属本次交付）
+
+1. **旧二进制实测**（§10.5 第 3 条）：需要「P0 之后、C 之前」的发布产物，本次只证到「无 key 可打开且
+   `integrity_check=ok`」，没有真的用旧版引擎收一条消息。
+2. **connector 编排**：`KT_ENGINE_STORE_MIGRATE` 三档、`StoreMigrationBlock` 锁存与 exit 10/11 的对外
+   错误面（`CAPABILITY_UNAVAILABLE` 的 retryable 分档）已按 §2.3/§2.4 落在 connector 侧
+   （分支 `fix/signal-runtime-state-authority`：`d87ff46` 按账号注入 store key、`963cee6` 迁移编排 + 槽锁存）。
+   本仓只需守住退出码与 `--json` 形状。
+3. **Windows**：`rename` 共享冲突与目录 fsync 仍未实机验证（§13.2 原样）。
+4. **磁盘峰值**：反向同样是「原库 + 加密备份 + 明文 staging」≈3.0×L，未实测（§13.3 原样）。
 
