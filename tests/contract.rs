@@ -353,6 +353,50 @@ fn missing_registry_with_store_fails_startup_and_preserves_dirs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// M6 C 阶段（评审第 3 条）：固定 stderr 码面 **每进程每码恰一条**——
+/// 起真进程（`KT_SIGNAL_STORE_KEY` 形状非法 → 启动期即落 `StoreKeyInvalid`），
+/// stdin 立即 EOF 收口后读全量 stderr：
+///
+/// - 该行逐字形状 + 恰出现一次（对照单测里只能断言「闸幂等」的那条）；
+/// - 除它之外没有别的 `event=store_open_failed`；
+/// - fail-closed：磁盘上不落 `store.db`（连 accounts/ 都不建）。
+#[test]
+fn store_open_failed_line_is_emitted_once_per_process() {
+    let dir = temp_dir("store-open-line-contract");
+    let output = Command::new(env!("CARGO_BIN_EXE_kt-signal-engine"))
+        .arg("--data-dir")
+        .arg(&dir)
+        .arg("jsonRpc")
+        .stdin(Stdio::null()) // 立即 EOF：进程干净退出
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env("KT_SIGNAL_STORE_KEY", "not-a-key")
+        .output()
+        .expect("engine spawns and exits");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("event=store_open_failed"))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "kt-signal-engine: ERROR event=store_open_failed code=StoreKeyInvalid retryable=false"
+        ],
+        "每进程每码恰一条固定行；实际 stderr:\n{stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdin EOF 是干净退出：{stderr}"
+    );
+    assert!(
+        !dir.join("accounts").exists(),
+        "形状非法的 key 一个账号目录都不该建"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// P0-B：正常启动清扫把「未登记但带 store.db」的目录隔离而非删除，并写
 /// 审计日志（恢复入口）。
 #[test]

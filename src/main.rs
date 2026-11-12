@@ -126,7 +126,7 @@ pub(crate) const INFLIGHT_REQUEST_LIMIT: usize = 8;
 const USAGE: &str = "usage: kt-signal-engine --data-dir <dir> jsonRpc \
 [--receive-mode <mode>] [--ignore-attachments] [--ignore-stories] [--ignore-stickers]\n       \
 kt-signal-engine --data-dir <dir> storeMigrate [--account <lk-hex>] \
-[--direction to-encrypted] [--dry-run] [--json]";
+[--direction to-encrypted|to-plaintext] [--dry-run] [--json]";
 
 struct LaunchArgs {
     data_dir: PathBuf,
@@ -496,14 +496,14 @@ async fn amain() -> ExitCode {
         Ok(store_migrate::Route::JsonRpc) => {}
         Err(()) => {
             eprintln!("{USAGE}");
-            return ExitCode::from(2);
+            return ExitCode::from(store_migrate::EXIT_USAGE);
         }
     }
     let args = match parse_launch_args(argv.into_iter()) {
         Ok(args) => args,
         Err(()) => {
             eprintln!("{USAGE}");
-            return ExitCode::from(2);
+            return ExitCode::from(store_migrate::EXIT_USAGE);
         }
     };
     // 引擎自身滚动文件日志（send 可观测批 2026-10-16，compat §1）：先于
