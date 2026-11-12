@@ -180,7 +180,7 @@ async fn warm_chunk(dir: &Path, targets: &[ServiceId]) -> (u64, u64) {
     let failed = (0, targets.len() as u64);
     let store = match open_store(dir).await {
         Ok(store) => store,
-        Err(()) => return failed,
+        Err(_) => return failed,
     };
     let Ok(mut manager) = Manager::<SqliteStore, Registered>::load_registered(store).await else {
         return failed;

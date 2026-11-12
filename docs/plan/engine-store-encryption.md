@@ -21,8 +21,8 @@
 | 2 | 密钥从哪来 | connector **已有** 32B store key（bootstrap 第二行，`src/auth.rs:19-21`、`src/store.rs:98,647-656`），但**引擎这条通道是空的**：connector 起引擎时显式把 key 环境变量剔掉（`src/engine.rs:2695-2697`）。推荐 **KEK（env 传入）→ 每账号随机 DEK → 包好后落 `store-key.v1`（0600）**，引擎侧只做解包，零新增 crate（`aes-gcm`/`hkdf`/`sha2`/`rand` 已在图：`Cargo.toml:53,100-103`）。 |
 | 3 | 明文库怎么迁 | 逐账号、离线、一次一账号：`wal_checkpoint(TRUNCATE)` → `VACUUM INTO` 备份 → `ATTACH … KEY` + `sqlcipher_export` 到 staging → 三重校验 → 清 sidecar + `rename` 原子替换 → 留备份可回滚。**connector 已经实现过同一套**（`src/store.rs:11752-11820`），引擎照抄即可，不要发明。 |
 | 4 | 性能/内存影响 | 确定性成本三条：页格式开销 **≈+2.0% 体积**（IV 16 + HMAC-SHA512 64 / 4096）、`SQLITE_TEMP_STORE=2`（临时表强制进内存，重排序会抬 RSS）、连接池每 10–30 分钟回收 → **密钥必须常驻堆**（`sqlx-core/src/pool/inner.rs:26`）。指标表与阈值见 §5。 |
-| 5 | 失败模式 | **密钥丢失 = 数据永久不可读**（本文 §6.1，必须写进产品文案与错误码）。次严重的是「半实施」：`PRAGMA key` 在纯 SQLite 上是**静默 no-op**，feature 没翻也不会报错 —— 测试全绿而库仍是明文。 |
-| 6 | 分阶段 | P0 构建门禁（1–2 人日）→ P1 密钥通道 + fail-closed（3–5）→ P2 迁移器（5–8）→ P3 灰度与文案（2–3）→ P4 清理（1–2）。**合计 12–20 人日**，不含合规等待。 |
+| 5 | 失败模式 | **密钥丢失 = 本机历史不可读**（本文 §6.1；G-A 已拍板，「重链再导」未取证，见 §6.1.1）。次严重的是「半实施」：`PRAGMA key` 在纯 SQLite 上是**静默 no-op**，feature 没翻也不会报错 —— 测试全绿而库仍是明文。 |
+| 6 | 分阶段 | P0 构建门禁（1–2 人日）→ P1 密钥通道 + fail-closed（3–5）→ P2 迁移器（5–8）→ P3 灰度与文案（2–3）→ P4 清理（1–2）。**合计 12–20 人日**，不含合规等待。**另有一套跨仓批次命名 A/B/C/D**（同一 M6 工作流）：A = 能力门（原 P0，已完成）、B = 失败语义与观测（原 P1 指标面）、**C = engine 半边 key 通道 + 五态矩阵 + 错误码（原 P1 引擎侧，已完成，见 §7「C 阶段」）**、D = 迁移器 + connector 接线（原 P2）。 |
 | 7 | 现在做/不做 | **做**（判定：做），但切成「P0+P1 立刻做；P2 迁移等下一个 release 窗口」。**三个前置门**任一不过就停在 P0（能力就绪、不迁移、不对外宣称加密）：G-A 合规口径、G-B Windows 构建、G-C fail-closed 可区分。 |
 
 **明确不做**（写在这里防止后续被塞进来）：
@@ -425,13 +425,56 @@ xxd -l 16 <DIR>/accounts/<lk>/store.db | grep -q 'SQLite format 3' && echo PLAIN
 
 > **结论必须写进产品文案、错误码、支持手册三处**：
 > **引擎账号库一旦加密，DEK 只能由 `store-key.v1` + KEK 解出。KEK 丢（换机、safeStorage 重置、
-> 用户目录被清、profile key 轮换没重包）或 `store-key.v1` 丢/坏 ⇒ 该账号历史数据永久不可读，
-> 且不可逆、不可恢复、不能靠重扫码救回历史。**
+> 用户目录被清、profile key 轮换没重包）或 `store-key.v1` 丢/坏 ⇒ **本机**该账号历史不可读，
+> 不可逆、不可恢复。**
 
-现在的代码对此**没有任何防线**（没有格式标记、没有 KEY_MISSING 语义、没有反静默重建闸）。
-桌面已有可抄的先例：`storeKey.ts:65-69`（"store 存在但 key 丢了 → 抛，绝不新建"）、`:352`（fail closed 并保留现场）。
+### 6.1.1 G-A 拍板记录（2026-11-11，**已拍板**）
+
+> 口径来源：`docs/plan/link-history-transfer-status.md`（只读取证，逐条带 file:line）。
+> 下面四段与原 G-A 的两问一一对应，措辞按「证据只支撑到哪一步」写，不放大也不缩小。
+
+**① 接受「KEK 丢 = 本机历史不可读」——已接受。**
+
+引擎账号库加密后 key 丢失/损坏：本机该账号历史（引擎库内的身份/会话密钥与会话记录）不可读，
+不可逆、不可恢复；不承诺任何「半恢复/部分解密」。这是加密的代价，产品侧明确接受。
+
+**② 不承诺「重扫码一定能恢复历史」——重链不得写成恢复手段。**
+
+| 事实 | 证据 | 状态 |
+|---|---|---|
+| 首次链接由手机导出历史（transfer archive / backup5，一次性通道）**已实现** | `adr/0005-link-history-transfer-backup5.md`、`src/service/mod.rs:4037`（只在 `finish_link` 收口 spawn）、`docs/plan/link-history-transfer-status.md` §1–§2 | 已实现；首链真机取证一次（档案 6576B，`adr/0005…md:63-64`） |
+| 「重链再导」：仓内**两处口径互相矛盾** | ADR 0005 `:137` 称「仅首次链接可导；重链/已注册安装不可再导」；parity matrix（`kt-desktop/.worktrees/signal-download-tiers/docs/plan/signal-official-parity-matrix.md:3425`）称「引擎恒声明（ADR 0005 每次新链接恒导入）」 | **待取证**（`link-history-transfer-status.md` §3.2 / 缺口 B1） |
+| 官方文案支持「重链可转移」 | matrix `:1389`（Signal-Desktop `_locales` 逐字） | 只作参照，不是本仓取证 |
+| 第二次链接的真机/日志证据 | 无（S1 只做首链一次，`adr/0005…md:53-64`） | **零取证** |
+
+结论：**「重链再导」按未取证处理**，不得写进对外承诺；要写只能写条件句。
+
+**③ UX 口径（对外唯一合法表述）**：
+
+> 「重新配对（重新扫码链接），历史**可能**由手机再导入，取决于手机与备份设置。」
+
+配套硬约束：
+
+- **绝不静默新建明文库**：丢 key 时引擎侧落 `StoreKeyRequired`（C 阶段的代码面，见 §7「C 阶段」），
+  终态、不退避重连、不替换文件；清数据/重链是桌面侧的**显式**动作，不自动触发。
+- 不写「重链必然恢复历史」（无取证），也不写「永久不可恢复」——手机侧那份历史不因本机 key 丢失而消失。
+- 云备份腿有前置门：未开通 Signal Secure Backups 的用户 `BACKUP_NOT_PROVISIONED` 诚实跳过
+  （`link-history-transfer-status.md` §3.4），文案不得暗示兜底一定存在。
+
+**④ 明文残留**：现有明文库/备份/文件系统残留**不做安全擦除承诺**（P4 只做常规删除 + 审计留痕）。
+这条与 ① 一起构成 G-A 的完整口径。
+
+代码面现状：丢 key 的 fail-closed 语义已就位（C 阶段的 `StoreKeyRequired`/`StoreKeyInvalid`/
+`StoreKeyRejected`/`StoreCorrupt`，见 §7「C 阶段」）；**产品文案与支持手册仍是 P3 待办**。
+桌面已有同款先例：`storeKey.ts:65-69`（"store 存在但 key 丢了 → 抛，绝不新建"）、`:352`（fail closed 并保留现场）。
 
 ### 6.2 失败模式全表
+
+> **命名以 C.3 为准**：下表是评估稿的原口径，落地后的码位统一为
+> `StoreKeyRequired`（原 `StoreKeyMissing`）/ `StoreCorrupt`（原 `StoreKeyCorrupt`）/
+> `StreamOutcome::StoreTerminal`（原 `StreamOutcome::StoreKeyRejected`），
+> 固定 stderr 行是 `event=store_open_failed code=… retryable=…`（不是 `event=store_key_rejected`）。
+> 本表保留用于「为什么要有这些码」的推理链。
 
 | # | 场景 | 现状行为（未改时） | 加密后必须的行为 | 落地动作 |
 |---|---|---|---|---|
@@ -498,7 +541,7 @@ DoD：三平台产物可启动；`cipher_version` 断言绿；现有测试全绿
 |---|---|---|---|
 | 1 | feature + 按目标依赖 | `Cargo.toml:9-23`（feature）、`Cargo.toml:158-180`（target 依赖） | `default = ["sqlcipher"]`、`sqlcipher = []`——feature **只做门**，不转发依赖特性。SQLCipher 的链接按目标声明：非 Windows `features = ["bundled", "bundled-sqlcipher"]`（macOS 走 CommonCrypto，`build.rs:220-223`，**不引 OpenSSL**）；Windows `features = ["bundled-sqlcipher-vendored-openssl"]`（隐含 `bundled-sqlcipher`→`bundled` 与 `openssl-sys/vendored`，libsqlite3-sys 0.36 `Cargo.toml:46-50`）。非 Windows 产物不变；Windows 新增 `openssl-sys`/`openssl-src`（build-time vendored，见「Windows 依赖报备」）。 |
 | 2 | 编译期门（每个 bin 一份） | `src/main.rs:42-45`、`src/bin/backup5-spike.rs:15-21` | `#[cfg(not(feature = "sqlcipher"))] compile_error!("engine requires the sqlcipher feature: PRAGMA key is a silent no-op on plain SQLite")`。本仓 bin-only（无 `lib.rs`），**bin target 各自独立编译**，所以门要各写一份：主 bin 覆盖 `kt-signal-engine`，开发 bin 覆盖 `backup5-spike`（它也 `SqliteStore::open`，临时目录、无 key）。`cargo build --no-default-features` 与 `cargo build --no-default-features --bin backup5-spike` 都要 101。 |
-| 3 | 运行时门（**前置**） | `src/store_cipher.rs`（`CipherGate` / `NegativeCache`）+ `src/service/mod.rs:14694-14744`（`open_store` → `open_store_gated`） | 顺序钉死为 **门 → 建目录 → 建 `store.db` → 打开并跑迁移**：`open_store_gated` 第一步 `gate.ensure()`，缺能力直接 `Err(())`，**不建目录、不建 `store.db`、不起连接池、不跑 `sqlx::migrate!()`**（这些正是 `open_with_options` 的副作用，vendor `presage-store-sqlite/src/lib.rs:67-92`）。判定结论**正负都缓存**：成功结论 `OnceLock`；失败进 `NegativeCache`（同样 `OnceLock`）→ 后续 open 只回同一错误，不重探 `:memory:`。失败证据行（`error!` + `eprintln!`，固定 `code=StoreCipherUnavailable`）由 `CipherGate::report_denial_once` 的 `compare_exchange` 闸控，**每进程只落一次**，重试不刷屏。走既有「store 打不开 → 未注册链接库保留 / 接收管线可重试」语义（`src/service/mod.rs:9183` 一带不变）。 |
+| 3 | 运行时门（**前置**） | `src/store_cipher.rs`（`CipherGate` / `NegativeCache`）+ `src/service/mod.rs:14694-14744`（`open_store` → `open_store_gated`） | 顺序钉死为 **门 → 建目录 → 建 `store.db` → 打开并跑迁移**：`open_store_gated` 第一步 `gate.ensure()`，缺能力直接 `Err(())`，**不建目录、不建 `store.db`、不起连接池、不跑 `sqlx::migrate!()`**（这些正是 `open_with_options` 的副作用，vendor `presage-store-sqlite/src/lib.rs:67-92`）。判定结论**正负都缓存**：成功结论 `OnceLock`；失败进 `NegativeCache`（同样 `OnceLock`）→ 后续 open 只回同一错误，不重探 `:memory:`。失败证据行（`error!` + 固定 stderr 行）由 `CipherGate::report_denial_once` 的 `compare_exchange` 闸控，**每进程只落一次**，重试不刷屏。**门失败是终态**：`StoreCipherUnavailable.is_terminal() == true`，接收管线停环、**不进** Fibonacci 退避重连（C 阶段把「store 打不开」从 `Recoverable` 拆成终态/可重试两类）；stderr 行形状与其余五个码一致——`kt-signal-engine: ERROR event=store_open_failed code=StoreCipherUnavailable retryable=false`。**2026-11-12 评审纠正**：本行原文写的「走既有 store 打不开 → 接收管线可重试」是 C 阶段之前的语义；落地后已改为终态，因为缺能力是构建属性、不会自愈，退避重试只会反复碰盘并把「终态」语义在接收层悄悄推翻。 |
 | 4 | 启动证据 | `src/main.rs`（`logfile::init` 之后、任何 store 打开之前） | 每进程一次：`WARN engine.startup: store encryption capability verified stage="store_cipher" cipher=SQLCipher 4.10.0 community`。级别取 WARN 是**落盘契约**（`src/logfile.rs:57` `MAX_LEVEL = LevelFilter::WARN`，info 不进滚动日志）；行内无密钥/路径/号码，stderr 纪律不变。**失败分支不再由启动路径打第二行**：门已落唯一一条证据行（同一事实只出现一遍）。 |
 | 5 | 断言 | `src/store_cipher_tests.rs`（6 条） | 见「测试」。 |
 
@@ -647,6 +690,10 @@ AGENTS.md「依赖最小化：新增 crate 需在 PR 描述说明用途与许可
 
 ### P1 — key 通道 + fail-closed 决策表（3–5 人日）
 
+> **C 阶段状态（2026-11-11）**：本节的**引擎侧**已按新契约落地（env 名 `KT_SIGNAL_STORE_KEY`、
+> 32B key 直接使用、终态统一为 `StreamOutcome::StoreTerminal`、六码错误面），见下方
+> 「C 阶段」小节与 C.5 偏差表；本节原文保留作**原设计口径**。connector 接线与迁移器仍在 D 阶段。
+
 改动（引擎）：
 - 启动读 `KT_ENGINE_STORE_KEK`（新 env，名字待定，参考现有 `KT_SIGNAL_SOCKS_PROXY`/`KT_ENGINE_SINGLE_ACCOUNT` 命名，`src/main.rs:133,428`）；
 - HKDF 派生子钥 → 解包/新建 `store-key.v1`（0600，tmp+rename）；
@@ -672,6 +719,263 @@ printf '{"jsonrpc":"2.0","id":1,"method":"engine.perfMetrics"}\n' | KT_ENGINE_ST
 
 DoD：F1/F2/F3/F9 四条失败模式有单测；fake 模式（`dir=None`，`src/state.rs:7`）与无 store 路径零影响；
 `tests/contract.rs:173-177` 的伪 `store.db` 字节仍按"打不开 → 保留"处理（测试语义不变）。
+
+### C 阶段 — engine 半边：key 通道 + 五态矩阵 + 错误码面（**已落地**）
+
+> **状态：已落地**（2026-11-11，kt-signal-engine @ `fix/admin-write` 工作区，**未 commit**）。
+> **定位**：原 P1 的**引擎侧子集**——只做「读 key → 分类 → 决策 → 错误码」，不写 §3.3 的
+> `store-key.v1` 包裹文件（KEK→DEK 留到下一批：包裹文件会引入第三类失败「包裹丢失/损坏」，
+> 与 G-C 的「三类可分辨」冲突），不做迁移器（原 P2 / D 阶段），不改 connector（它仍
+> `env_remove` 本变量，`src/engine.rs:2695-2697`）。所以**本阶段上线后生产路径的现实取值
+> = 矩阵 a（明文兼容）**；b/c/d 是能力，要等 connector 接线（D 阶段）与迁移器（D 阶段）才会在
+> 真机上出现。
+
+#### C.1 交付与落点
+
+| # | 交付 | 落点 | 要点 |
+|---|---|---|---|
+| 1 | env 形状解析 + 进程三态 | `src/store_key.rs`（`STORE_KEY_ENV` / `StoreKey::parse` / `StoreKeyState::process`） | 64 hex（大小写都收）或 32B base64（标准/url-safe、带不带 `=` 补位都收）；**空串按非法**（不是缺席）；非法 = `StoreKeyState::Invalid`，一个库都不建；key 不进 `Debug`/错误文本，只有 `pragma_literal()` 渲染 `"x'<64hex>'"`；`process()` 用 `OnceLock` 只读一次 env |
+| 2 | 文件状态分类 | `src/store_open.rs`（`classify` / `StoreFileState`） | 只读元数据 + 16 字节头：`SQLite format 3\\0` = 明文；非明文头 = `Opaque`（密文与垃圾不可分）；0 字节 = `Absent`；短于 512B = `StoreCorrupt(Truncated)`；`store.db` 位置被目录占住 = `StoreCorrupt(Unreadable)` |
+| 3 | 决策 + 打开 | `src/service/mod.rs`（`open_store` → `open_store_gated` → `open_store_with`；`store_connect_options_with_key`） | 顺序钉死：**能力门 → key 形状 → 文件分类 →（密文先验真）→ 建目录 → 打开并跑迁移**；前四步**不创建 `store.db` 主体**（能力门 / key 形状 / 文件分类全程零写入；**密文验真是读写连接**，SQLite 在 WAL 模式下会临时创建 `-wal`/`-shm`，连接收口即回收）——早期「前四步零落盘」的措辞已按实测纠正（见 C.5 与 C.6） |
+| 4 | 密文验真 | `src/store_open.rs`（`probe_keyed_store`） | `create_if_missing(false)` + `PRAGMA key` + 强制首页读 `sqlite_master`；`not a database` / code 26 → `StoreKeyRejected`；malformed → `StoreCorrupt`；其余 → `StoreOpenFailed`（可重试） |
+| 5 | 结构化错误码 + 固定 stderr | `StoreOpenError`（`code()` / `is_terminal()` / `report_once()`） | 码表：`StoreCipherUnavailable` / `StoreKeyInvalid` / `StoreKeyRequired` / `StoreKeyRejected` / `StoreCorrupt` / `StoreOpenFailed`；stderr 固定形状 `kt-signal-engine: ERROR event=store_open_failed code=<Code> retryable=<bool>`，**每进程每码一条**，六个码**无一例外**（2026-11-12 评审补齐：`StoreCipherUnavailable` 的固定行由 P0 门落 `store_cipher::unavailable_stderr_line()`（与 `StoreOpenError::stderr_line()` 逐字同形），本侧不重复打；可重试类 `StoreOpenFailed` 也落同形行 `retryable=true`——此前缺能力是自造形状、可重试类是自由文本，watchdog 都分类不到） |
+| 6 | 不退化成网络重试 | `StreamOutcome::StoreTerminal`（`src/service/mod.rs`，`is_terminal()` 已含）+ 接收建流分支按 `error.is_terminal()` 分流 | 终态停环、不进 Fibonacci 退避；只有 `StoreOpenFailed` 才 `Recoverable`；`ReconnectSchedule::next_delay` 单测钉死返回 `None` |
+| 7 | 启动证据 | `src/main.rs`（`store_open::report_startup_key_state`，紧跟 P0 能力证据） | 有效/缺席 = 滚动日志 WARN（`stage="store_key"`、`key=present` 或 `key=absent`）；非法 = **固定 stderr 行**（不必等第一次开库，connector 启动即能识别） |
+| 8 | 断言 | `src/store_encryption_tests.rs`（17 条：14 条为 2026-11-12 评审批，3 条为同日**收尾**新增——可重试类两条失败路径的固定行 + 每码一个闸的可失败证据）+ `src/service/mod.rs` 既有断言扩面与 3 条证书维护断言 | 见 C.2 / C.4 / C.10 / C.11 |
+
+#### C.2 五态行为矩阵（C 阶段契约逐条落点）
+
+| # | key（`KT_SIGNAL_STORE_KEY`） | store.db | 行为 | 代码落点 | 断言 |
+|---|---|---|---|---|---|
+| a | 无 | 无 | 明文创建（**现状兼容，不变**） | `open_store_with` 的 `(None, Absent)` → `store_connect_options`（无 key pragma） | 既有 `keyless_store_remains_plaintext_readable_and_writable` |
+| b | 有 | 无 | 建**加密**库（打开时 `PRAGMA key`） | `(Some, Absent)` → `store_connect_options_with_key` | `keyed_fresh_store_is_created_encrypted` |
+| c | 有 | 已是明文库（头 `SQLite format 3`） | **按 legacy 打开、不设 key**，日志 warn 一次说明待迁移（**D 阶段**做）；不重写、不加密 | `(Some, Plaintext)` → `warn_plaintext_legacy_once()` + 无 key 打开 | `plaintext_store_with_key_opens_legacy_and_is_left_intact` |
+| d | 有 | 已是加密库 | 正常打开；**错 key = `StoreKeyRejected`**（终态），先验真再跑迁移 | `(Some, Opaque)` → `probe_keyed_store` → keyed 打开 | `wrong_key_is_rejected_and_never_rewrites_the_store` + `keyed_fresh_store_is_created_encrypted`（同 key 重开） |
+| e | 任意 | 损坏 | **独立分类** `StoreCorrupt`（不混进 key 类、也不退化成网络重试） | `classify`（截断/不可读）+ `classify_failure_message`（malformed） | `corrupt_store_is_classified_apart_from_key_failures` |
+| — | 无 | 已是加密库 | `StoreKeyRequired`（终态，**绝不静默新建明文库**） | `(None, Opaque)` | `encrypted_store_without_key_reports_store_key_required` |
+| — | 形状非法 | 任意 | `StoreKeyInvalid`（终态，磁盘零文件） | key 判定在文件分类之前 | `invalid_key_shape_refuses_before_touching_disk` |
+| — | 任意 | 任意 | 缺能力时先报 `StoreCipherUnavailable`（**门在最前**） | `open_store_with` 第 1 步 | `capability_gate_still_precedes_key_and_disk_actions` |
+
+#### C.3 固定码面与「不退化」的落点
+
+| 码 | 触发 | 终态 | connector 可区分面 | 断言 |
+|---|---|---|---|---|
+| `StoreCipherUnavailable` | 链接的 sqlite 不是 SQLCipher（P0 门） | 是 | P0 门落**同形固定行** `event=store_open_failed code=StoreCipherUnavailable retryable=false`（每进程一次，与 `StoreOpenError::stderr_line()` 逐字相等） | 既有 P0 d/e + `capability_gate_still_precedes_...` + `every_store_open_code_emits_the_fixed_line_once` |
+| `StoreKeyInvalid` | `KT_SIGNAL_STORE_KEY` 形状非法 | 是 | 启动即落 `event=store_open_failed code=StoreKeyInvalid retryable=false` | `invalid_key_shape_refuses_before_touching_disk` |
+| `StoreKeyRequired` | 加密库 + 无 key | 是 | 同上形状，`code=StoreKeyRequired` | `encrypted_store_without_key_reports_store_key_required` |
+| `StoreKeyRejected` | 加密库 + 错 key（或第 1 页损坏） | 是 | 同上，`code=StoreKeyRejected` | `wrong_key_is_rejected_and_never_rewrites_the_store` |
+| `StoreCorrupt` | 截断/不可读/malformed | 是 | 同上，`code=StoreCorrupt` | `corrupt_store_is_classified_apart_from_key_failures` |
+| `StoreOpenFailed` | 权限/句柄耗尽/EIO/只读挂载/路径/连接池等其余失败 | **否**（保持既有重试语义） | 同上固定行 `code=StoreOpenFailed retryable=true`（2026-11-12 评审补齐：此前这是唯一没落固定行的码，stderr 是自由文本 `sqlite store open failed: …`）。**同日收尾**：该类在 `open_store_with` 内部的所有出口都经 `StoreOpenError::reported()`——路径非 UTF-8、`create_dir_all` 失败（EACCES/EROFS/ENOSPC）、连接串解析失败三处以前是裸 `return`/`?`，stderr **零行** | `failure_text_classification_maps_not_a_database_to_key_rejection` + `every_store_open_code_emits_the_fixed_line_once` + `classify_keeps_io_failures_retryable` + `create_dir_all_failure_reports_store_open_failed_once` + `non_utf8_store_path_reports_store_open_failed_once` |
+
+接收侧：`serve_account_stream` 命中终态 → `StreamOutcome::StoreTerminal` → 接收循环直接
+`return`（不 notify、不 `mark_terminal_account`：账号本身没坏，只是这一进程读不了盘），
+**不进** `ReconnectSchedule` 的 Fibonacci 退避；`Recoverable` 只在 `StoreOpenFailed` 时出现。
+connector 侧消费（把固定 stderr code 落进 `key_missing` / `data_corrupt` 修复桶）属 D 阶段。
+
+#### C.4 断言（17 条；文件 `src/store_encryption_tests.rs`；其中 3 条是**新进程**用例）
+
+| # | 名称 | 证明了什么 |
+|---|---|---|
+| 1 | `store_key_accepts_hex_and_base64_and_rejects_every_other_shape` | 64 hex（大小写）/ 32B base64（标准、url-safe、无补位）都收；短一位、长一位、31/33 字节、非 hex、空串全拒；`Debug` 打码、错误文本不回显候选值；raw key 字面量恰 69 字节 `"x'<64hex>'"` |
+| 2 | `invalid_key_shape_refuses_before_touching_disk` | 矩阵 1：`StoreKeyInvalid` + 终态 + 账号目录都没建（零文件） |
+| 3 | `keyed_fresh_store_is_created_encrypted` | 矩阵 b：新建库头非明文（≥1 页）、无 key 连接读不了、有 key 读得到迁移账本、同 key 可重开 |
+| 4 | `wrong_key_is_rejected_and_never_rewrites_the_store` | 矩阵 d：错 key = `StoreKeyRejected` + 终态；头仍是密文、探针行仍在（用对 key 读回）、没有多余文件/半写 journal、无 key 仍读不了；换回对 key 文件照常打开 |
+| 5 | `plaintext_store_with_key_opens_legacy_and_is_left_intact` | 矩阵 c：有 key 打开存量明文库成功；头仍是明文（未被原地转换）、存量行与迁移账本可无 key 读取；warn 每进程恰一次（与测试顺序无关） |
+| 6 | `encrypted_store_without_key_reports_store_key_required` | 密文 + 无 key = `StoreKeyRequired` + 终态 + 文件字节不变（没有静默新建明文库） |
+| 7 | `corrupt_store_is_classified_apart_from_key_failures` | 矩阵 e：明文头 + 垃圾页（带/不带 key）与「非明文头但短于一页」都归 `StoreCorrupt`，与 `StoreKeyRejected` 码不同、现场保留 |
+| 8 | `capability_gate_still_precedes_key_and_disk_actions` | 缺能力时即使有合法 key、或 key 形状非法，也先报 `StoreCipherUnavailable` 且零文件（P0 门禁不回退） |
+| 9 | `failure_text_classification_maps_not_a_database_to_key_rejection` | sqlx 文本归一：同一句 `not a database` 在带 key 时 → `StoreKeyRejected`、明文路径 → `StoreCorrupt`；`malformed` → `StoreCorrupt`；其余 → `StoreOpenFailed`（`is_terminal()==false`） |
+| 10 | `classify_keeps_io_failures_retryable`（**2026-11-12 评审阻塞项 1**） | EACCES / ELOOP / ENOTDIR 三种真实 IO 失败都归 `StoreOpenFailed`（可重试），**不**判 `StoreCorrupt` 终态；端到端同判 |
+| 11 | `corrupt_unreadable_layout_is_terminal_and_leaves_the_scene`（**评审 7b**） | `store.db` 位置被目录占住 = `Corrupt(Unreadable)` 终态，占位目录与账号目录条目都不被改动 |
+| 12 | `probe_keyed_store_requires_write_access`（**评审 4**） | 验真是读写连接：目录只读 → 验真 `StoreOpenFailed`（可重试）；恢复可写后同一份文件照常打开（证明失败来自挂载/权限，不是内容） |
+| 13 | `every_store_open_code_emits_the_fixed_line_once`（**评审 3**） | 六个码逐字同形 `event=store_open_failed code=<Code> retryable=<bool>`（含缺能力与可重试类）；缺能力行与 `store_cipher::unavailable_stderr_line()` 逐字相等。**闸的证据不在这条里**：它同一次循环里边打边读，`report_once()` 之后 `report_count()` 恒 1，合并闸也是绿（见 #15） |
+| 14 | `legacy_warn_is_emitted_by_the_open_not_by_a_manual_gate`（**评审 7a**） | legacy warn **由 `open_store_with` 触发**（此前那条用例先手工打闸，等于把待证事实当前提）：无 key 打开不触发、第一次 legacy 打开恰一次、再开不增 |
+| 15 | `each_store_open_code_emits_its_own_line`（**收尾 2**） | **新进程**里两个真实 fixture 各触发一个码（密文头 + 无 key → `StoreKeyRequired`；短于一页 → `StoreCorrupt`），断言 stderr 两行都在、各恰一条、`required_first`/`corrupt_first` 两种顺序都成立；把两码合并到同一个 `AtomicU8` → 只剩一行 → 必红（变异实跑见 C.11） |
+| 16 | `create_dir_all_failure_reports_store_open_failed_once`（**收尾 1**） | **新进程** + 只读父目录：`create_dir_all` 失败必须落**恰一条** `code=StoreOpenFailed retryable=true`，且账号目录与 `store.db` 都不存在（root 下自动 SKIP，与 #12 同口径） |
+| 17 | `non_utf8_store_path_reports_store_open_failed_once`（**收尾 1**） | **新进程** + 非 UTF-8 账号目录名（`path.to_str()` 为 `None`）同样落恰一条可重试固定行，且不留账号目录 |
+
+另：`src/service/mod.rs` 两条既有断言扩面——`StreamOutcome::StoreTerminal.is_terminal()` 为真、
+`ReconnectSchedule::next_delay(StoreTerminal)==None`（不进退避重连）。
+
+#### C.5 与 P1 原设计的偏差（据实登记）
+
+| 原 P1 设计 | 本批实际 | 原因 |
+|---|---|---|
+| env 名 `KT_ENGINE_STORE_KEK` | **`KT_SIGNAL_STORE_KEY`** | 与 connector 既有同名变量、同一把 32B 材料同源（`kt-signal-connector/src/store.rs:98`），省一次跨仓改名；KEK→DEK 包裹落地时再决定是否另立变量 |
+| KEK（env）→ HKDF → 每账号 DEK → `store-key.v1` 包裹落盘 | **本批直接使用 env 里的 32B key**（不做包裹文件） | 包裹文件引入第三类失败（包裹丢失/损坏），与 G-C「KEK 缺失/错误/库损坏三者可分辨」冲突；包裹与轮换属 D 阶段 |
+| 明文 + 有 key → 走 §4 迁移（或拒绝） | **legacy 打开 + warn 一次**（不拒绝、不迁移） | 迁移不能塞进 `open_store`（§2.4 的 90s 预算）；现在拒绝会直接打断存量用户，违反矩阵 c 的「不破坏存量」 |
+| `StreamOutcome::StoreKeyRejected` 单一终态 | **`StreamOutcome::StoreTerminal`** 一个终态 + 结构化 `code` | 四种终态（缺/错/非法/损坏）都要停环，码面已能区分，不必各开一个枚举变体 |
+| 新增 `store_open` 计时键与失败分桶 counters | 未做 | C 阶段只承诺「可区分 + 不重试」；指标属 B/P1 观测面，另批 |
+| P0 门失败按「store 打不开 → 接收管线可重试」处理 | **终态**：`StoreCipherUnavailable.is_terminal()==true`，停环、不进 Fibonacci 退避重连 | 门失败是构建属性、不会自愈；退避重试只是反复碰盘，并且会在接收层把「终态」语义悄悄推翻（**2026-11-12 评审第 5 条**纠正 P0 段口径与本行） |
+| 「前四步零落盘」 | **前四步不创建 `store.db` 主体**；密文验真是读写连接，会临时创建 `-wal`/`-shm`（连接收口即回收） | 验真要读首页/`sqlite_master`，WAL 模式下 SQLite 必须建 sidecar；改成只读/immutable 探测会漏读 WAL 页、可能把好库判成错 key（错得更贵）。测试白名单（`store.db` 家族）本就含 sidecar，现与文档对齐（**评审第 4 条**） |
+| IO 失败判 `StoreCorrupt`（旧实现把所有非 NotFound 错误都归到 `Corrupt(Unreadable)`） | **`StoreOpenFailed`（可重试）**；`Corrupt` 只保留稳定可证的结构事实（短于一页、位置被非普通文件占住、SQLite 报 malformed） | EACCES/EMFILE/EIO/只读挂载判终态 = 账号**永久停接收**，而这类条件外部一恢复就好（**评审阻塞项 1**） |
+| 证书维护任务按 60s→600s 无限重开磁盘 | 打开命中终态即返回 `CertTaskExit::StoreTerminal`（不再重开）；管线收口后 `abort` 兜底 | 后台任务用重试把接收层的「终态」判定推翻，错 key 重试一万次还是错 key（**评审阻塞项 2**） |
+| 缺能力 / 可重试类不落固定 stderr 行 | 六码**全落**同形固定行（缺能力行由 P0 门以同形同值落；可重试类 `retryable=true`） | connector watchdog 只按 `event=store_open_failed code=… retryable=…` 逐行分类；缺能力原来是自己一种形状、可重试类是自由文本（**评审第 3 条**） |
+| `StoreKey` 的 `Drop` 清零算内存保障 | 只覆盖它自己那份 `[u8;32]` 副本；进程内**不保证**清零，进程退出由 OS 回收 | 生产 key 常驻 `StoreKeyState::process()` 的 `OnceLock`，`pragma_literal()` 的 `String` 被 sqlx 移进 `SqliteConnectOptions`（`Cow::Owned`），`Drop` 都覆盖不到；能清的是 env 读入那一份（`process()` 里解析后立刻 `fill(0)`）（**评审第 6 条**） |
+
+#### C.6 已知边界与已知风险（诚实登记）
+
+**边界（分类学限制，不是缺陷）**
+
+- **错 key 与「第 1 页损坏」不可分辨**：SQLCipher 里两者都是 HMAC 失败 → `not a database`。
+  本批把「`Opaque` + 有 key + 首页读失败」判 `StoreKeyRejected`，把**结构性**损坏
+  （短于一页、明文头但内容非法、SQLite 报 malformed）判 `StoreCorrupt`。第 1 页已损坏的加密库
+  会被判成错 key——两者都是终态、都要人工介入，现场靠 `code` 与文件本身区分。
+- **「非明文头」不等于「真的是密文」**：SQLCipher 文件头是随机盐、没有 magic；垃圾文件 + 有 key
+  会落到 `StoreKeyRejected`。
+- 明文库的 legacy warn **每进程一次**：多账号同时命中只留一条（够用、不刷屏）。
+- 判定用「短于 512B = 截断」的下界（SQLite 最小页大小），不猜具体页大小（SQLCipher/sqlx 缺省 4096）。
+- **「零落盘」的准确口径**：能力门 / key 形状 / 文件分类三步全程零写入；**密文验真不是**——
+  它是读写连接，SQLite 在 WAL 模式下必须建 `store.db-wal`/`store.db-shm`（本机实测：正确 key 的
+  验真返回后立刻能看到 `store.db-wal`，连接收口后回收）。这也是「只读/immutable 探测」不可行的
+  原因：`immutable=1` 会忽略 WAL 内容，把「schema 还在 WAL 里」的健康库读成空的/不可解，
+  反而误判 `StoreKeyRejected`（假终态比多一个 sidecar 贵得多）。
+- **IO 失败与损坏的边界**（评审阻塞项 1）：`classify` 只有两个 IO 分支——`NotFound` → `Absent`，
+  其余一律 `StoreOpenFailed`。`Corrupt` 只保留**稳定可证的结构事实**：长度短于一页、`store.db`
+  位置被非普通文件占住（目录/设备/FIFO；不会自愈，等人工）、SQLite 自己报 malformed/not-a-database。
+  短读（`UnexpectedEof`）也算 IO 失败：元数据说 ≥512B 而这一刻读不满 16B，多半是并发替换/截断，
+  下一次分类会按当时的长度重判。
+
+**风险（本批实测发现，D 阶段必修）**
+
+- **带 key 的 sqlx 池在进程退出瞬间偶发 SIGSEGV**：`SqliteStore`（2 连接池）drop 只发关闭信号，
+  SQLite worker 线程仍在释放 SQLCipher codec 上下文时若进程已退出，本机 **1/5** 复现
+  `SIGSEGV`（退出码 139）。测试面已用 `quiesce_store_teardown()`（120ms）确定性收口，
+  复跑 10/10 稳定；**生产面**（stdin EOF 后 `amain` 返回、局部 `Arc` 析构）共享同一窗口，
+  需在 D 阶段加**显式 shutdown drain**（或 vendor 暴露 `SqliteStore::close()`），并配合
+  sanitizer/真机退出码观察。这条不是 C 的矩阵项，但**不能当没看见**：退出码被 connector 当作
+  「崩溃」会污染 restart 计数。
+
+#### C.7 D 阶段（下一批）待办
+
+1. **迁移器**（原 P2）：`storeMigrate` 子命令或启动前置阶段，把矩阵 c 的明文库一次性转加密
+   （§4.2 五步 + §4.3 校验矩阵 + §4.5 回滚）；迁移完成后 `warn_plaintext_legacy_once` 的「待迁移」
+   语义即可移除。
+2. **connector 接线**（走 connector 自己的仓库流程）：`src/engine.rs:2695-2697` 从 `env_remove`
+   改为显式注入 `KT_SIGNAL_STORE_KEY`（key 来源 = bootstrap 第二行）；届时矩阵 b/d 才真正生效。
+3. **connector 侧消费固定码**：把 `event=store_open_failed code=…` 落进 `key_missing` /
+   `data_corrupt` 修复桶并标 `retryable=false`，不再做 5 次无意义重启
+   （`docs/plan/signal-runtime-unified-state-implementation-plan.md` 已登记方向）。
+4. **shutdown drain**：见 C.6 的 SIGSEGV 窗口——引擎退出前显式等 SQLite worker 收口（或 vendor 暴露
+   `SqliteStore::close()`），并用真机退出码 / sanitizer 复核。
+5. 可选观测面：`store_open` 计时键 + 失败分桶 counters（原 P1/M2）。
+
+#### C.8 验收命令（本批实跑）
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets -- --test-threads=1
+cargo test --bin kt-signal-engine -- store_encryption_tests --test-threads=1
+```
+
+启动面手工核对（不建库、不落明文；`printf ''` 立即 EOF，进程干净退出）：
+
+```bash
+printf '' | KT_SIGNAL_STORE_KEY=not-a-key ./target/debug/kt-signal-engine --data-dir /tmp/e-key-invalid jsonRpc
+# stderr 期望：kt-signal-engine: ERROR event=store_open_failed code=StoreKeyInvalid retryable=false
+#             且 /tmp/e-key-invalid 下不出现任何 store.db
+```
+
+#### C.9 执行记录（2026-11-11，本机 macOS aarch64 / rustc 1.99.0，全部实跑）
+
+> 下表是 C 阶段首次落地的记录（历史快照，计数已过期）；**评审批之后的当前门禁结果见 C.10**。
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | 0（无 diff） |
+| `cargo clippy --all-targets -- -D warnings` | 0（零 warning） |
+| `cargo test --all-targets -- --test-threads=1` | 0：bin 662 条（661 passed / 1 ignored，既有 ignore）、`tests/contract.rs` 94 条全 passed、backup5-spike 0 条 |
+| `cargo test --bin kt-signal-engine -- store_encryption_tests --test-threads=1` | 9 passed（C.4 全部） |
+
+启动面实测（debug bin，stdin 立即 EOF）：
+
+```text
+$ printf '' | KT_SIGNAL_STORE_KEY=not-a-key ./target/debug/kt-signal-engine --data-dir /tmp/e-key-invalid jsonRpc
+kt-signal-engine: INFO network path: std-env (socks5://127.0.0.1:7890)   # 本机代理环境
+kt-signal-engine: ERROR event=store_open_failed code=StoreKeyInvalid retryable=false
+exit 0；/tmp/e-key-invalid 下只有 logs/，没有 store.db
+
+$ printf '' | KT_SIGNAL_STORE_KEY=<64hex> ./target/debug/kt-signal-engine --data-dir /tmp/e-key-valid jsonRpc
+exit 0；stderr 安静；滚动日志 WARN engine.startup stage="store_key" key=present
+         "store key present; new stores are created encrypted"
+```
+
+**SIGSEGV 复现与收口（C.6 风险条的证据）**：`keyed_fresh_store_is_created_encrypted` 单独连跑 5 次
+出现 1 次 exit 139（其余 exit 0）；加 `quiesce_store_teardown()`（120ms）后连跑 10 次全 0。
+对照组 `keyless_store_remains_plaintext_readable_and_writable` 8/8 干净、scratch「仅开 keyed 池」
+8/8 干净 → 窗口在「keyed 池 + 进程退出」的组合上，不是 key 本身。
+
+#### C.10 评审批（2026-11-12，7 条）—— 落地与证据
+
+> 触发：C 阶段复审提出 7 条（含 2 条阻塞）。全部落在本仓工作区，**未 commit**；
+> 门禁 = `cargo fmt` / `cargo clippy -D warnings` / `cargo test --all-targets`（含
+> `tests/contract.rs`）/ `store_encryption_tests` 定向跑。
+
+| # | 评审条目 | 落地 | 证据 |
+|---|---|---|---|
+| 1（阻塞） | `classify` 把 metadata / `File::open` 的**非 NotFound** 错误判成 `Corrupt` 终态 → 账号永久停接收 | 读盘动作失败统一 `StoreOpenFailed`（可重试）；`Corrupt` 只留**稳定可证的结构事实**（短于一页、`store.db` 位置被非普通文件占住、SQLite 报 malformed）；短读（`UnexpectedEof`）也算 IO 失败——元数据与真相打架时不钉终态 | `src/store_open.rs` `classify`；`classify_keeps_io_failures_retryable`（EACCES / ELOOP / ENOTDIR + 端到端同判） |
+| 2（阻塞） | 证书维护任务在 store 终态后仍按 60s→600s **无限重开磁盘** | `certificate_maintenance_tick` 返回 `CertTickOutcome`：终态 → 任务返回 `CertTaskExit::StoreTerminal`；`receive_pipeline` 在管线收口后 `abort` 兜底（终态/Unbound/停机都停手） | `certificate_tick_terminal_store_open_stops_the_task`、`certificate_maintenance_loop_stops_after_terminal_store_open`（终态只碰一次盘）、`certificate_maintenance_loop_keeps_retrying_transient_store_failures`（可重试类按 600s→60s 继续，停旗即收口） |
+| 3 | 缺能力 / 可重试类不落固定行，与本文「每进程每码一条」不一致 | 六码**全落**同形固定行：缺能力那条由门落 `store_cipher::unavailable_stderr_line()`（与 `StoreOpenError::stderr_line()` 逐字相等），可重试类落 `retryable=true`；`slot()` 改为**每码一个闸**（缺能力不再与 `Failed` 共用槽） | `every_store_open_code_emits_the_fixed_line_once`（形状逐字 + 幂等 + 互不压制 + 缺能力行与门逐字相等）+ `tests/contract.rs::store_open_failed_line_is_emitted_once_per_process`（**真进程**：非法 key 启动 → stderr 全量只有恰一条 `code=StoreKeyInvalid retryable=false`、exit 0、不建 accounts/） |
+| 4 | 「前四步零落盘」与实测不符 | **选「降级文档 + 对齐白名单」**，不做只读/immutable 探测：验真是读写连接，WAL 下必建 `-wal`/`-shm`（实测正确 key 的验真返回后立刻可见 `store.db-wal`）；`immutable=1` 会忽略 WAL 内容，可能把「schema 还在 WAL 里」的健康库读成不可解 → 误判 `StoreKeyRejected`（假终态比多一个 sidecar 贵得多）。文档改为「不创建 `store.db` 主体，可能产生 sidecar」，测试白名单（`store.db` 家族）同步写明理由 | `probe_keyed_store_requires_write_access`（目录只读 → `StoreOpenFailed` 可重试；恢复可写后同一份文件照常打开）+ C.6「零落盘的准确口径」 |
+| 5 | 文档登记行为变更 | P0 #3「门失败可重试」→ **终态**（`retryable=false`，停环不重连）；C.5 补 6 行偏差；`store_open.rs` 注释「三类」→「**五类**」；`docs/jsonrpc-compat.md` §1「四类」→「五类」 | 本文 P0 #3 / C.5；`docs/jsonrpc-compat.md` §1 stdio 条目 |
+| 6 | 「Drop 清零」被当成内存保障 | 措辞改为「**进程退出由 OS 回收，进程内不保证清零**」：`StoreKey::Drop` 只覆盖自己那份 `[u8;32]` 副本；`pragma_literal()` 的 `String` 随 `.pragma()` 移进 `SqliteConnectOptions`（`Cow::Owned`）常驻，拿不回所有权，复制一份再清只会多一份材料；**能清的确实清了**——`StoreKeyState::process()` 读入的 env 拷贝在解析后立刻 `fill(0)`（`String::into_bytes()`，安全代码、不引 unsafe） | `src/store_key.rs` 模块头「内存卫生」/ `Drop` / `process`；`src/store_key.rs` 的 `pragma_literal` 文档 |
+| 7 | 三处缺口测试 | 7a legacy warn **由 `open_store_with` 触发**（不再先自打闸）：配 async 串行闸 + `reset_legacy_plaintext_warn()`，并行用例不再互相推高进程级计数；7b `Corrupt(Unreadable)`（目录占住 `store.db`）终态且不动现场；7c `report_once` 每码一次（槽是进程级的，断言取**幂等 + 互不压制 + 形状逐字**，并用门的 `denial_reports` 覆盖缺能力那条） | `legacy_warn_is_emitted_by_the_open_not_by_a_manual_gate`、`corrupt_unreadable_layout_is_terminal_and_leaves_the_scene`、`every_store_open_code_emits_the_fixed_line_once` |
+
+门禁实跑（本机 macOS aarch64 / rustc 1.99.0，全部实跑）：
+
+```text
+cargo fmt --all -- --check                        → 0（无 diff）
+cargo clippy --all-targets -- -D warnings         → 0（零 warning）
+cargo test --bin kt-signal-engine -- store_encryption_tests --test-threads=1 → 14 passed
+cargo test --bin kt-signal-engine -- store_cipher                            → 6 passed
+cargo test --bin kt-signal-engine -- certificate_                            → 5 passed
+cargo test --all-targets -- --test-threads=1      → 0：bin 670 条（669 passed / 1 ignored，既有 ignore）、
+                                                    tests/contract.rs 95 passed（+1 本批新增）、backup5-spike 0 条
+```
+
+已知未覆盖（诚实登记）：EMFILE / EIO 没法在单进程里稳定造出来，只由 `classify` 的同一分支覆盖；
+Windows 上 `#[cfg(unix)]` 的三条 IO 用例不编译（权限位/符号环语义不同），Windows 面仍只靠编译与
+`store_cipher` 断言。
+
+#### C.11 收尾（2026-11-12，2 条）—— 可重试类的每条出口 + 每码一闸的可失败证据
+
+> 触发：C.10 落地后的两条尾巴。同样落在工作区、**未 commit**；门禁同 C.10。
+
+| # | 问题 | 落地 | 证据 |
+|---|---|---|---|
+| 1 | `open_store_with` 里三处裸 `StoreOpenError::Failed`（路径非 UTF-8 / `create_dir_all` 失败 / 连接串解析失败）直接 `return`/ `?`，**不走** `report_once`：建目录 EACCES/EROFS/ENOSPC、路径非 UTF-8 这两条真实失败路径的 stderr **零行**——同一函数里只有 `classify` / `probe_keyed_store` 的失败有固定行，watchdog 逐行分类等于看不见「盘写不了」 | 新增 `StoreOpenError::reported()`（落一次证据再把自己交回，与 `refuse()` 同一道闸，调两次仍只一行），三处全部改走它；`create_dir_all` 失败额外把 `io::ErrorKind` 落滚动日志（只进 kind 字段，不带路径/错误文本）。闸仍是**每进程每码一条** | `create_dir_all_failure_reports_store_open_failed_once`（只读父目录 → 新进程 stderr **恰一条** `code=StoreOpenFailed retryable=true`，账号目录与库都没建）、`non_utf8_store_path_reports_store_open_failed_once`（非 UTF-8 目录名同判） |
+| 2 | C.10 第 7c 条「每码一条」的断言在**同一次循环里**边打边读：`report_once()` 之后 `report_count() == 1` 无论闸共不共用都成立，**把两个码合并成同一个 `AtomicU8` 也不会红**（假绿） | 改成**新进程 + 真 stderr** 的独立用例：两个不同码各触发一次（顺序可反转），断言两行都在、各恰一条；旧循环里的形状断言保留，闸的证据移走 | `each_store_open_code_emits_its_own_line`（`StoreKeyRequired` + `StoreCorrupt` 两个真实 fixture，`required_first`/`corrupt_first` 各跑一个新进程） |
+
+**为什么必须换进程**：`report_once` 的闸是进程级一次性 `AtomicU8` 槽，同进程里任何先跑的用例都会把它消费掉——那时断言「stderr 恰一条」读到的是别人落下的历史行，永远绿。新进程 = 闸归零 + stderr 干净，才可能真的证明「这条失败路径落且只落一行」。子用例本身是 `#[ignore]` 的（`--ignored --exact` 拉起），父用例还会断言子进程 `1 passed`（名字漂了 `--exact` 只会静默 0 用例）。
+
+**变异验证（本机实跑，三处变异均已回滚、文件 md5 与变异前逐字节一致）**：
+
+```text
+变异 A：第 6 步改回 std::fs::create_dir_all(dir).map_err(|_| StoreOpenError::Failed)?
+        → create_dir_all_failure_reports_store_open_failed_once FAILED（断言 lines.len(): left 0 / right 1）
+变异 B：非 UTF-8 分支改回 return Err(StoreOpenError::Failed);
+        → non_utf8_store_path_reports_store_open_failed_once FAILED（left 0 / right 1）
+变异 C：store_open.rs slot() 的 Self::Corrupt(_) => &CORRUPT 改成 => &KEY_REQUIRED
+        → each_store_open_code_emits_its_own_line FAILED（stderr 只剩 code=StoreKeyRequired 一行；left 1 / right 2）
+```
+
+门禁实跑（本机 macOS aarch64 / rustc 1.99.0，2026-11-12）：
+
+```text
+cargo fmt --all -- --check                                  → 0（无 diff）
+cargo clippy --all-targets -- -D warnings                   → 0（零 warning）
+cargo test --bin kt-signal-engine -- store_encryption_tests → 17 passed / 3 ignored（三条 child 子用例按需拉起）
+cargo test --bin kt-signal-engine -- store_cipher           → 6 passed
+cargo test --bin kt-signal-engine -- store_open             → 7 passed
+cargo test --all-targets -- --test-threads=1                → 0：bin 672 passed / 4 ignored（3 条本批 child + 1 条既有 ignore）、
+                                                              tests/contract.rs 95 passed、backup5-spike 0 条
+```
+
+已知边界：连接串解析失败（`store_connect_options*` 的 `Err(())`）没有独立用例——它要求
+`path_str` 是合法 UTF-8 却让 sqlx 连接串解析失败，当前受信启动器给的路径走不到；该出口与
+另两处共用 `reported()`，由 `non_utf8_store_path_reports_store_open_failed_once` 覆盖同一条
+统一出口。Windows 上三条 `#[cfg(unix)]` 用例不编译（与 C.10 的既有边界一致）。
 
 ### P2 — 明文迁移器 + 校验 + 回滚（5–8 人日）
 
@@ -734,9 +1038,9 @@ DoD：pilot 账号行数/迁移账本/语义金样全一致；每个断点 kill 
 
 | 门 | 内容 | 不过的后果 | 谁拍板 |
 |---|---|---|---|
-| **G-A** | 合规/产品口径：谁需要"引擎库静态加密"；是否接受"KEK 丢 = 历史不可读"；是否接受"历史明文残留不可安全擦除" | 只做 P0+P1，存量不动，文档如实声明"连接器库已加密、引擎库未加密" | 产品 + 安全 |
+| **G-A** | **已拍板（2026-11-11）**：接受「KEK 丢 = 本机历史不可读」；**不承诺**「重链再导」（零取证，ADR 0005:137 与 parity matrix:3425 互相矛盾）；UX 口径固定为「重新配对，历史可能由手机再导入，取决于手机与备份设置」；明文残留不做安全擦除承诺。依据：§6.1.1 + `docs/plan/link-history-transfer-status.md` | —（已过） | 产品 + 安全 |
 | **G-B** | Windows `crt-static` + vendored OpenSSL 构建与**运行**通过（P0 验收命令全绿） | 停在 P0；不要为 Windows 单独降级成明文（会出现同一发布里两套格式） | 工程 |
-| **G-C** | fail-closed 可区分：KEK 缺失/错误/库损坏三者可分辨，且**不会**退化成"网络故障重试"或"新建明文库" | 停在 P1 | 工程 + QA |
+| **G-C** | fail-closed 可区分：KEK 缺失/错误/库损坏三者可分辨，且**不会**退化成"网络故障重试"或"新建明文库"。**引擎侧已具备**（C 阶段四码 + `StreamOutcome::StoreTerminal` 终态，见 §7「C 阶段」）；connector 侧消费（把固定 stderr code 落到 `key_missing`/`data_corrupt` 修复桶）待接 | 停在 P1 | 工程 + QA |
 
 ### 现在"不做"的部分
 

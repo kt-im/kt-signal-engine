@@ -42,16 +42,26 @@ fixture 同款）：
   `kt-signal-engine: ERROR event=startup_failed code=SingleAccountRegistryViolation accounts=N limit=1 …`，
   滚动日志落 `engine.startup` 结构化 error（`stage`/`code`/`accounts`/`limit`）。
   未设置或非 `1` 保持既有行为（多账号兼容路径）。
+- `KT_SIGNAL_STORE_KEY`（M6 C 阶段，可选）：store 静态加密的 32B key，两种编码——
+  64 个十六进制字符（大小写均可）或该 32 字节的 base64（标准/url-safe、带不带 `=` 补位均可）。
+  形状非法 = fail-closed（`StoreKeyInvalid`，不建库）；缺席 = 明文兼容路径。key 不进日志/argv/指标。
+  语义与失败码见 `docs/plan/engine-store-encryption.md` §7「C 阶段」。
 - JVM 相关环境（`JAVA_OPTS`/`JAVA_HOME`）：引擎非 JVM，**必须忽略**，
   不得因此失败（connector 现行启动器会设置它们）。
-- stdio：stdin 逐行请求，stdout 逐行响应/通知，stderr 除两处启动期输出外
+- stdio：stdin 逐行请求，stdout 逐行响应/通知，stderr 除三处启动期/故障输出外
   保持安静：网络路径 INFO 行（`kt-signal-engine: INFO network path:
   <direct|explicit-env|std-env|system-http|system-socks> <地址或说明>`，恰
   一条）与 `KT_SIGNAL_SOCKS_PROXY` 非法时的错误行（exit 2 前打印）。connector
   watchdog 只把「websocketioexception 或 websocket+失败关键词」形状的行判为
   接收面死活信号，INFO 行刻意避开该形状；除此之外引擎不得再写 stderr
-  （S5 单账号护栏失败行是唯一例外，固定 `kt-signal-engine: ERROR
-  event=startup_failed code=…` 形状，仅在启动失败路径出现）。
+  （两条例外：S5 单账号护栏失败行固定 `kt-signal-engine: ERROR
+  event=startup_failed code=…`，仅在启动失败路径出现；M6 C 阶段的 store 打开
+  行固定 `kt-signal-engine: ERROR event=store_open_failed code=… retryable=…`，
+  code ∈ `StoreCipherUnavailable`/`StoreKeyInvalid`/`StoreKeyRequired`/
+  `StoreKeyRejected`/`StoreCorrupt`/`StoreOpenFailed`，**每进程每码恰一条**；
+  `retryable=false` 的**五类**（缺能力 / 形状非法 / 缺 key / 错 key / 库损坏）
+  不进退避重连，`StoreOpenFailed` 一类 `retryable=true` 保持既有重试语义；语义见
+  `docs/plan/engine-store-encryption.md` §7「C 阶段」）。
   日志纪律：不落消息正文/号码/URI/密钥（代理 host:port 属网络配置，允许）。
   **引擎自身滚动文件日志（2026-10-16 send 链可观测批，§5）**：引擎进程内
   tracing 事件（vendor 传输栈 warn/error + 引擎自有失败证据行）镜像写入

@@ -64,6 +64,15 @@ mod store_cipher;
 /// 能力门禁断言（依赖 `service::open_store`，因此只编进主 bin 的测试面）。
 #[cfg(test)]
 mod store_cipher_tests;
+/// C 阶段 store 加密矩阵断言（同样依赖 `service::open_store_with`）。
+#[cfg(test)]
+mod store_encryption_tests;
+/// M6 C 阶段：store key 通道（`KT_SIGNAL_STORE_KEY` 的形状解析 + 进程内三态；
+/// 设计见 docs/plan/engine-store-encryption.md §7「C 阶段」）。
+mod store_key;
+/// M6 C 阶段：store 文件状态分类 + 打开失败的结构化错误码（connector 可区分
+/// 的固定码面；同一份设计文档 §3.4 决策表 / §7 C 阶段）。
+mod store_open;
 
 // Android 本地备份导出面（engine-compat 备份批）：内部 Rust API，装配链由
 // 消费批任务层（service::backup_task，契约 §10.3/§10.4）接线。
@@ -487,6 +496,11 @@ async fn amain() -> ExitCode {
     // 真正的闸在 open_store，且前置在任何磁盘动作/打开动作之前（fail closed，
     // 缺能力时不落 store.db、不建账号目录）。
     store_cipher::report_startup_capability().await;
+    // M6 C 阶段：store key 证据（`KT_SIGNAL_STORE_KEY` 的形状结论）。有效/
+    // 缺席落一条滚动日志 warn；形状非法落**固定 stderr 行**
+    //（`event=store_open_failed code=StoreKeyInvalid`），每进程一次——connector
+    // 不必等第一次 store 打开就能把这类故障与网络故障分开。
+    store_open::report_startup_key_state();
     // vendor 发送路径分段计时回注（send 性能批 2026-10-16，compat §5）：
     // 单向钩子一次性安装，缺省 no-op；键词表仍由 perf_metrics 封闭管理
     // （vendor 字面量漂移被 perf_metrics 单测钉红）。

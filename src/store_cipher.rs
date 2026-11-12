@@ -160,6 +160,11 @@ impl CipherGate {
 
     /// 失败证据行：`compare_exchange` 抢唯一名额，**每进程只落一次**
     /// （tracing error + stderr 各一行，同一事实只出现一遍）。
+    ///
+    /// stderr 用**契约形状**（[unavailable_stderr_line]，与
+    /// `StoreOpenError::stderr_line()` 同形同值）：connector watchdog 只按
+    /// `event=store_open_failed code=… retryable=…` 逐行分类，缺能力这条
+    /// 以前是另一种自造形状（`store open refused cause=…`），分类器看不见。
     fn report_denial_once(&self, error: &CipherProbeError) {
         if self
             .denial_reports
@@ -175,9 +180,7 @@ impl CipherGate {
             cause = %error,
             "refusing to open store: linked sqlite has no cipher_version"
         );
-        eprintln!(
-            "kt-signal-engine: store open refused cause={CIPHER_UNAVAILABLE_CAUSE} (linked sqlite reports no cipher_version; build with feature \"sqlcipher\")"
-        );
+        eprintln!("{}", unavailable_stderr_line());
     }
 
     /// 已发起的探测次数（单测断言「失败不重探」）。
@@ -227,6 +230,21 @@ pub(crate) async fn read_cipher_version() -> Result<String, CipherProbeError> {
         Some(version) if !version.is_empty() => Ok(version.to_owned()),
         _ => Err(CipherProbeError::Unavailable),
     }
+}
+
+/// 缺能力的固定 stderr 行（`retryable=false`：缺能力是构建属性，重试
+/// 一万次还是缺能力）。
+///
+/// 与 `store_open::StoreOpenError::stderr_line()` **逐字同形**——connector
+/// watchdog 只认 `event=store_open_failed code=<Code> retryable=<bool>` 这一
+/// 种形状。本文件被两个 bin 同源引入（`backup5-spike` 没有 `store_open`
+/// 模块），所以这里自带同一份字面量；两侧一致性由
+/// `store_encryption_tests::every_store_open_code_emits_the_fixed_line_once`
+/// 对拍断言（形状漂移会被钉红）。
+pub(crate) fn unavailable_stderr_line() -> String {
+    format!(
+        "kt-signal-engine: ERROR event=store_open_failed code={CIPHER_UNAVAILABLE_CAUSE} retryable=false"
+    )
 }
 
 /// 能力结论（正负都缓存：进程内最多探测一次，之后直接回缓存）。

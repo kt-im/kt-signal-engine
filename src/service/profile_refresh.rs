@@ -275,10 +275,11 @@ pub(crate) async fn refresh_contact_profiles(
             );
             store
         }
-        Err(()) => {
+        Err(error) => {
             tracing::warn!(
                 stage = "collect_store_open",
                 ok = false,
+                code = error.code(),
                 elapsed_ms = store_open_started.elapsed().as_millis() as u64,
                 "profile refresh store open",
             );

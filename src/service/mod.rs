@@ -43,6 +43,8 @@ use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Not
 
 use crate::state::{AccountEntry, EngineState, ACCOUNTS_DIR, QUARANTINE_DIR, QUARANTINE_LOG};
 use crate::store_cipher;
+use crate::store_key::StoreKeyState;
+use crate::store_open::{self, StoreFileState, StoreOpenError};
 
 /// A1 per-account 观测面（稳定性批 2026-10-20）：接收在飞/延迟分位/建流
 /// 结局/崩溃计数，经既有 `engine.perfMetrics` 快照 additive 暴露。
@@ -8484,6 +8486,11 @@ enum StreamOutcome {
     /// 官方 SocketManager 明确不重连（`SocketManager.preload.ts`:391-394）。
     /// 停环等连接器/重链显式重建，绝不与夺走连接的客户端互搏。
     Terminated,
+    /// M6 C 阶段：store 打开命中**终态**分类（`StoreKeyRequired` /
+    /// `StoreKeyRejected` / `StoreKeyInvalid` / `StoreCorrupt`）。
+    /// 停环等 key 补齐/人工处置，**不进** Fibonacci 退避重连：错 key 重试
+    /// 一万次还是错 key，每次重试还要再碰一遍盘（设计 F9）。
+    StoreTerminal,
 }
 
 impl StreamOutcome {
@@ -8491,7 +8498,10 @@ impl StreamOutcome {
     fn is_terminal(self) -> bool {
         matches!(
             self,
-            StreamOutcome::Unbound | StreamOutcome::StdioDead | StreamOutcome::Terminated
+            StreamOutcome::Unbound
+                | StreamOutcome::StdioDead
+                | StreamOutcome::Terminated
+                | StreamOutcome::StoreTerminal
         )
     }
 }
@@ -8811,19 +8821,21 @@ async fn receive_pipeline(
 ) {
     // 发送证书后台预轮换任务（止血批③）：与接收循环同生命周期（shutdown
     // 即止），周期检查 store 持久证书临期并刷新，发送路径只读缓存。
-    let mut cert_shutdown = shutdown.clone();
+    //
+    // 评审阻塞项 2：任务自身的停止条件补齐两条——①store 命中终态时
+    // `certificate_maintenance_loop` 自己返回（不再按 60s→600s 重开磁盘）；
+    // ②管线收口（StoreTerminal / Unbound / StdioDead / 停旗）后这里显式
+    // abort，绝不让一个「管线已死」的账号继续在后台碰盘。
+    let cert_shutdown = shutdown.clone();
     let cert_dir = dir.clone();
-    tokio::spawn(async move {
-        let mut maintenance = CertificateMaintenance::new();
-        loop {
-            tokio::select! {
-                _ = cert_shutdown.changed() => return,
-                _ = tokio::time::sleep(maintenance.delay()) => {
-                    certificate_maintenance_tick(&cert_dir, &mut maintenance).await;
-                }
-            }
-        }
-    });
+    let cert_task = tokio::spawn(certificate_maintenance_loop(
+        cert_dir,
+        cert_shutdown,
+        |path| {
+            let path = path.to_path_buf();
+            async move { open_store(&path).await }
+        },
+    ));
     supervision::run_account_supervisor(
         shutdown,
         supervision::AccountCrashBackoff::default(),
@@ -8844,6 +8856,9 @@ async fn receive_pipeline(
         },
     )
     .await;
+    // 管线收口即停手：证书维护任务不再有任何存在的理由（它只会继续开库
+    // 检查一份这个账号已经读不了的 store）。
+    cert_task.abort();
 }
 
 /// 单次账号运行态：流内重连由本循环承载（状态跨流存活），panic 时随
@@ -8954,6 +8969,19 @@ async fn receive_account_loop(
                     reason = "no_reconnect_close_code",
                     account = %crate::methods::probe_account8(Some(number)),
                     "receive stream closed with a no-reconnect close code; stopping per official semantics"
+                );
+                return;
+            }
+            // M6 C 阶段：store 终态（key/损坏）——停环等 key 补齐或人工
+            // 处置。不 notify、不 mark_terminal_account：账号本身没坏，
+            // 只是这一进程读不了盘；连接器按固定 stderr code 分类处置。
+            StreamOutcome::StoreTerminal => {
+                tracing::error!(
+                    target: "engine.receive",
+                    stage = "receive_stopped",
+                    reason = "store_terminal",
+                    account = %crate::methods::probe_account8(Some(number)),
+                    "store open hit a terminal class; stopping receive until the store is usable"
                 );
                 return;
             }
@@ -9080,12 +9108,49 @@ impl CertificateMaintenance {
     }
 }
 
+/// 证书维护单轮结局（评审阻塞项 2）。
+///
+/// `StoreTerminal` = store 命中终态（缺能力 / key 形状非法 / 缺 key / 错 key /
+/// 库损坏）：这类失败**不会自愈**，维护任务必须停手——否则它会按
+/// 60s→600s 无限重开磁盘（错 key 重试一万次还是同一个结论，每次都要再碰
+/// 一次盘，而且把固定 stderr 行的「终态」语义在后台悄悄推翻）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CertTickOutcome {
+    Continue,
+    StoreTerminal,
+}
+
+/// 证书维护任务的停因（观测/测试面）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CertTaskExit {
+    /// 停机旗（管线收口 / 账号删除 / 进程关停）。
+    Shutdown,
+    /// store 终态：不再重开磁盘，也不重试。
+    StoreTerminal,
+}
+
+/// store 打开失败 → 退避记账 or 终态停机（纯函数，单测直打这条映射）。
+fn note_cert_store_open_failure(
+    maintenance: &mut CertificateMaintenance,
+    error: StoreOpenError,
+) -> CertTickOutcome {
+    if error.is_terminal() {
+        return CertTickOutcome::StoreTerminal;
+    }
+    maintenance.failures += 1;
+    CertTickOutcome::Continue
+}
+
 /// 单轮检查：证书健康即不动（清退避）；不健康 → 刷新。零 stderr（接收
-/// 面纪律），失败只记退避态，下一轮自愈。
-async fn certificate_maintenance_tick(dir: &Path, maintenance: &mut CertificateMaintenance) {
-    let Ok(store) = open_store(dir).await else {
-        maintenance.failures += 1;
-        return;
+/// 面纪律），可重试失败只记退避态、下一轮自愈；store 终态则回报让调用方
+/// 停机（[CertificateMaintenance] 的退避不再被用上）。
+async fn certificate_maintenance_tick(
+    opened: Result<SqliteStore, StoreOpenError>,
+    maintenance: &mut CertificateMaintenance,
+) -> CertTickOutcome {
+    let store = match opened {
+        Ok(store) => store,
+        Err(error) => return note_cert_store_open_failure(maintenance, error),
     };
     let needs_refresh = match store.sender_certificate().await {
         Ok(Some(cert)) => match cert.expiration() {
@@ -9097,15 +9162,45 @@ async fn certificate_maintenance_tick(dir: &Path, maintenance: &mut CertificateM
     };
     if !needs_refresh {
         maintenance.failures = 0;
-        return;
+        return CertTickOutcome::Continue;
     }
     if let Ok(mut manager) = Manager::load_registered(store).await {
         if manager.refresh_sender_certificate().await.is_ok() {
             maintenance.failures = 0;
-            return;
+            return CertTickOutcome::Continue;
         }
     }
     maintenance.failures += 1;
+    CertTickOutcome::Continue
+}
+
+/// 证书维护任务主体（与接收管线同生命周期）：每轮按退避间隔开库检查证书，
+/// 命中 store 终态即返回 [CertTaskExit::StoreTerminal] 收口。
+///
+/// `open` 是注入点（生产传 `open_store`）：单测用它造终态/瞬时失败，
+/// 不必依赖真实能力门与进程 key 环境。
+async fn certificate_maintenance_loop<O, Fut>(
+    dir: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+    mut open: O,
+) -> CertTaskExit
+where
+    O: FnMut(&Path) -> Fut,
+    Fut: std::future::Future<Output = Result<SqliteStore, StoreOpenError>>,
+{
+    let mut maintenance = CertificateMaintenance::new();
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return CertTaskExit::Shutdown,
+            _ = tokio::time::sleep(maintenance.delay()) => {}
+        }
+        let opened = open(&dir).await;
+        if certificate_maintenance_tick(opened, &mut maintenance).await
+            == CertTickOutcome::StoreTerminal
+        {
+            return CertTaskExit::StoreTerminal;
+        }
+    }
 }
 
 /// 接收循环内任何网络维护调用的硬上限（官方单请求 30s 语义）：维护臂
@@ -9182,10 +9277,25 @@ async fn serve_account_stream(
     let account_hash = crate::methods::probe_account8(Some(number));
     let store = match tokio::time::timeout(RECEIVE_CONNECT_TIMEOUT, open_store(dir)).await {
         Ok(Ok(store)) => store,
-        Ok(Err(())) => {
+        // M6 C 阶段（设计 F9）：store 打开失败要分终态/可重试两类。终态
+        // （缺 key / 错 key / 形状非法 / 库损坏）停环，不进退避重连——
+        // 固定 stderr 证据行已由打开路径落过一次（`report_once`），这里只
+        // 落文件日志（带结构化 code，供逐账号对账）。
+        Ok(Err(error)) if error.is_terminal() => {
+            tracing::error!(
+                target: "engine.receive",
+                stage = "receive_store_terminal",
+                code = error.code(),
+                account = %account_hash,
+                "store open refused with a terminal class; stopping receive (no reconnect)"
+            );
+            return StreamOutcome::StoreTerminal;
+        }
+        Ok(Err(error)) => {
             tracing::warn!(
                 target: "engine.receive",
                 stage = "receive_store_open",
+                code = error.code(),
                 account = %account_hash,
                 "receive store unavailable; retrying with backoff"
             );
@@ -14693,47 +14803,152 @@ fn store_connect_options(path: &str) -> Result<SqliteConnectOptions, ()> {
 
 /// 打开（或建）账号目录下的 `store.db`。
 ///
-/// 唯一入口：`open_store` = 「进程唯一能力门 + 真实打开」，门由
-/// [`open_store_gated`] 在**任何磁盘动作之前**执行；单测把门换成自建实例
-/// 直打同一个函数，从而不必污染全局结论（见 `src/store_cipher_tests.rs`
-/// 的 `missing_capability_*` 两条）。
-pub(crate) async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
-    // 先过能力门（`ensure_cipher_capable` 的同一份判定），再打开：缺能力时
-    // 一个文件都不落（连账号目录都不建）。
+/// 唯一入口：`open_store` = 「进程唯一能力门 + 进程 key 三态 + 真实打开」，
+/// 门与 key 都由 [`open_store_with`] 在**任何磁盘动作之前**判定；单测把
+/// 门/key 换成自建实例直打同一个函数，从而不必污染全局结论（见
+/// `src/store_cipher_tests.rs` 与 `src/store_encryption_tests.rs`）。
+pub(crate) async fn open_store(dir: &Path) -> Result<SqliteStore, StoreOpenError> {
+    // 先过能力门（`ensure_cipher_capable` 的同一份判定），再按进程 key 三态
+    // 打开：缺能力/形状非法时一个文件都不落（连账号目录都不建）。
     open_store_gated(dir, store_cipher::gate()).await
 }
 
-/// 带能力门的打开实现：[门] → 建目录 → 建 `store.db` → 打开并跑迁移。
+/// 带 key 的连接选项（C 阶段矩阵 b/d）：基础选项 + SQLCipher raw key。
 ///
-/// M6 P0 能力门禁（运行时半边，docs/plan/engine-store-encryption.md §7）：
+/// sqlx 把 `key` pragma 固定排在建连语句的第 0 位（`SqliteConnectOptions::new`
+/// 预置槽位 + IndexMap 保序，设计 §2.2），所以这里追加不会排到
+/// `journal_mode`/`cache_size` 之后——`PRAGMA key` 必须先于任何页读，
+/// 否则 SQLCipher 会拿默认 key 去解页、把正确 key 也判成错。
+fn store_connect_options_with_key(
+    path: &str,
+    key: &crate::store_key::StoreKey,
+) -> Result<SqliteConnectOptions, ()> {
+    Ok(store_connect_options(path)?.pragma("key", key.pragma_literal()))
+}
+
+/// 带能力门的打开实现（key 三态取进程环境：[StoreKeyState::process]）。
+///
 /// 门必须**前置**——`open_with_options` 会 `create_if_missing` 建
 /// `store.db`、起连接池（2 连接）并跑 `sqlx::migrate!()` 落 schema
 /// （vendor `presage-store-sqlite/src/lib.rs:67-92`），门后置就等于「先落
-/// 明文库/明文 schema 再报错」。所以缺能力时这里**直接** `Err(())`：磁盘上
-/// 零文件（连目标目录都不建），走既有「store 打不开 → 未注册链接库保留 /
-/// 接收管线可重试」语义。
-///
-/// 结论缓存由门负责（成功/失败都缓存）：后续 open 只回同一个错误，不重探
-/// `:memory:`、不重复刷 error/eprintln（评审第 2 条）。
+/// 明文库/明文 schema 再报错」（P0 评审第 1 条）。
 pub(crate) async fn open_store_gated(
     dir: &Path,
     gate: &store_cipher::CipherGate,
-) -> Result<SqliteStore, ()> {
+) -> Result<SqliteStore, StoreOpenError> {
+    open_store_with(dir, gate, StoreKeyState::process()).await
+}
+
+/// 打开实现：门与 key 三态都可注入（单测直打真实顺序）。
+///
+/// 顺序是契约：**能力门 → key 形状 → 文件分类 → （加密库先验真）→
+/// 建目录 → 打开并跑迁移**。前四步**不创建 `store.db` 主体**，任何一步失败
+/// 都不建目录、不建 `store.db`；只有第 5 步的密文验真是读写连接，SQLite 在
+/// WAL 模式下会临时建 `-wal`/`-shm`（连接收口即回收，不是「零落盘」——见
+/// docs/plan/engine-store-encryption.md §7 C.6 的口径纠正）。
+///
+/// 决策表（C 阶段矩阵；`(key, 磁盘状态) → 行为`）：
+///
+/// | key | store.db | 行为 |
+/// |---|---|---|
+/// | 无 | 无 | 明文创建（现状兼容，a） |
+/// | 无 | 明文 | 明文打开（现状兼容） |
+/// | 无 | 密文 | `StoreKeyRequired`（终态，绝不新建明文库） |
+/// | 有 | 无 | 加密创建（b） |
+/// | 有 | 明文 | 按 legacy 打开**不设 key** + warn 一次（c，迁移在 D 阶段） |
+/// | 有 | 密文 | 先验真再打开；错 key → `StoreKeyRejected`（d） |
+/// | 任意 | 损坏 | `StoreCorrupt`（e） |
+/// | 形状非法 | 任意 | `StoreKeyInvalid`（终态，不建库） |
+pub(crate) async fn open_store_with(
+    dir: &Path,
+    gate: &store_cipher::CipherGate,
+    key_state: &StoreKeyState,
+) -> Result<SqliteStore, StoreOpenError> {
+    // 1) 能力门：缺能力时磁盘上零文件。固定 stderr 行由门在**首次判定**时
+    // 落下（`store_cipher::unavailable_stderr_line`，与
+    // `StoreOpenError::stderr_line()` 同形同值、每进程一次）；这里不再
+    // report_once，否则同一事实会出现两遍。
     if gate.ensure().await.is_err() {
-        // 证据行由门在首次判定时落盘（每进程一条），这里不重复打印。
-        return Err(());
+        return Err(StoreOpenError::CipherUnavailable);
     }
-    std::fs::create_dir_all(dir).map_err(|_| ())?;
-    // SqliteStore 要的是数据库文件路径，不是目录；sqlx 的连接串解析只剥
-    // `sqlite://`/`sqlite:` 前缀，传 `file:///…` 会把整串当文件名。这里固定
-    // 在账号目录下落 store.db、直接传裸路径。路径来自受信启动器，可入日志。
+    // 2) key 形状：非法形状在建目录/建库之前失败（fail-closed，矩阵 1）。
+    let key = match key_state {
+        StoreKeyState::Absent => None,
+        StoreKeyState::Present(key) => Some(key),
+        StoreKeyState::Invalid => return refuse(StoreOpenError::KeyInvalid),
+    };
+    // 3) 文件分类（只读元数据 + 16 字节头，不建目录）。
     let path = dir.join("store.db");
-    let path = path.to_str().ok_or(())?;
-    SqliteStore::open_with_options(store_connect_options(path)?, OnNewIdentity::Trust)
+    let state = store_open::classify(&path).inspect_err(|error| error.report_once())?;
+    // 4) 决策：这次是否带 key 打开（矩阵 a–d）。
+    let keyed = match (key, state) {
+        (None, StoreFileState::Opaque) => return refuse(StoreOpenError::KeyRequired),
+        (None, _) => false,
+        (Some(_), StoreFileState::Absent | StoreFileState::Opaque) => true,
+        (Some(_), StoreFileState::Plaintext) => {
+            // c：存量明文库 + 有 key。不设 key（存量照常可读、绝不重写），
+            // 迁移在 D 阶段；证据行每进程一次。
+            store_open::warn_plaintext_legacy_once();
+            false
+        }
+    };
+    // SqliteStore 要的是数据库文件路径，不是目录；sqlx 的连接串解析只剥
+    // `sqlite://`/`sqlite:` 前缀，传 `file:///…` 会把整串当文件名。路径来自
+    // 受信启动器，可入日志。
+    let Some(path_str) = path.to_str() else {
+        // 路径非 UTF-8：可重试类也要留一条固定行（以前裸返回，stderr 零行）。
+        return Err(StoreOpenError::Failed.reported());
+    };
+    // 5) 加密库先验真：错 key 在跑迁移之前就归一成 StoreKeyRejected（d）。
+    if keyed && state == StoreFileState::Opaque {
+        let Some(key) = key else {
+            // 决策表上不可达（keyed 且 Opaque 必有 key），仍按可重试类留痕：
+            // 真被走到时也要在 stderr 里看得见，而不是静默返回。
+            return Err(StoreOpenError::Failed.reported());
+        };
+        store_open::probe_keyed_store(&path, key)
+            .await
+            .inspect_err(|error| error.report_once())?;
+    }
+    // 6) 建目录 → 打开并跑迁移（既有动作，矩阵里唯一会落盘的一段）。
+    //
+    // 建目录失败（EACCES/EROFS/ENOSPC/ENOTDIR）以前是裸 `?`：stderr 零行，
+    // connector watchdog 看不到「盘写不了」。errno 只进滚动日志的 kind 字段
+    // （原始错误文本可能带路径，不进 stderr 固定行）。
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        tracing::warn!(
+            target: "engine.store",
+            stage = "create_store_dir",
+            kind = ?error.kind(),
+            "could not create store dir"
+        );
+        return Err(StoreOpenError::Failed.reported());
+    }
+    let options = match key {
+        Some(key) if keyed => store_connect_options_with_key(path_str, key),
+        _ => store_connect_options(path_str),
+    }
+    .map_err(|()| StoreOpenError::Failed.reported())?;
+    SqliteStore::open_with_options(options, OnNewIdentity::Trust)
         .await
         .map_err(|error| {
-            eprintln!("kt-signal-engine: sqlite store open failed: {error}");
+            // 终态与可重试**都**走同一条固定 stderr 行（每进程每码一条）：
+            // 可重试类以前只打一行自由文本（`sqlite store open failed: …`），
+            // connector watchdog 的分类器看不见，而且把原始错误文本（可能带
+            // 路径）写进了 stderr。两者现在都归一到
+            // `event=store_open_failed code=… retryable=…`。
+            let classified = store_open::classify_failure_message(&error.to_string(), keyed);
+            classified.report_once();
+            classified
         })
+}
+
+/// 终态拒绝的唯一出口：落一次固定证据行 + 回错误。
+///
+/// 早退点用这个；`?` 链上看 [`StoreOpenError::reported`]。两者同一道闸，
+/// 所以同一条失败路径不会落两行。
+fn refuse<T>(error: StoreOpenError) -> Result<T, StoreOpenError> {
+    Err(error.reported())
 }
 
 /// 回收本次已死链接的未注册 store（B1，issue #951）。
@@ -27289,6 +27504,8 @@ mod tests {
         assert!(!receive_close_is_terminal(Some(3001)));
         assert!(!receive_close_is_terminal(None));
         assert!(StreamOutcome::Terminated.is_terminal());
+        // M6 C 阶段：store 终态与 1000/4409 同语义——停环、不退避重连。
+        assert!(StreamOutcome::StoreTerminal.is_terminal());
     }
 
     /// 重连排程：manager 不可用（Recoverable）按官方 Fibonacci 逐级重试，
@@ -27331,6 +27548,11 @@ mod tests {
         assert_eq!(schedule.next_delay(StreamOutcome::Unbound), None);
         assert_eq!(schedule.next_delay(StreamOutcome::Terminated), None);
         assert_eq!(schedule.next_delay(StreamOutcome::StdioDead), None);
+        assert_eq!(
+            schedule.next_delay(StreamOutcome::StoreTerminal),
+            None,
+            "错 key/缺 key/库损坏不进 Fibonacci 退避重连（设计 F9）"
+        );
     }
 
     /// 最小复现（2026-10-21 静默接收事故）：manager 在启动期不可用
@@ -27459,6 +27681,108 @@ mod tests {
         assert_eq!(delay(4).as_secs(), 480);
         assert_eq!(delay(5).as_secs(), 600, "封顶轮询间隔");
         assert_eq!(delay(20).as_secs(), 600);
+    }
+
+    /// 评审阻塞项 2（映射面）：store 打开**终态**必须让证书维护任务停手，
+    /// 只有可重试失败（`StoreOpenError::Failed`）才继续按退避轮询。
+    ///
+    /// 以前的实现不看分类，一律 `failures += 1`，于是错 key/缺 key/库损坏
+    /// 的账号会按 60s→600s **无限重开磁盘**——固定 stderr 行说「终态」，
+    /// 后台任务却在推翻它。
+    #[test]
+    fn certificate_tick_terminal_store_open_stops_the_task() {
+        let mut maintenance = CertificateMaintenance::new();
+        for terminal in [
+            StoreOpenError::CipherUnavailable,
+            StoreOpenError::KeyInvalid,
+            StoreOpenError::KeyRequired,
+            StoreOpenError::KeyRejected,
+            StoreOpenError::Corrupt(store_open::CorruptDetail::Unreadable),
+            StoreOpenError::Corrupt(store_open::CorruptDetail::Truncated),
+            StoreOpenError::Corrupt(store_open::CorruptDetail::Malformed),
+        ] {
+            assert_eq!(
+                note_cert_store_open_failure(&mut maintenance, terminal),
+                CertTickOutcome::StoreTerminal,
+                "{} 是终态，维护任务必须停",
+                terminal.code()
+            );
+            assert_eq!(maintenance.failures, 0, "终态不进退避记账");
+        }
+        assert_eq!(
+            note_cert_store_open_failure(&mut maintenance, StoreOpenError::Failed),
+            CertTickOutcome::Continue,
+            "权限/EIO 这类可重试失败照旧轮询"
+        );
+        assert_eq!(maintenance.failures, 1, "可重试失败记一次退避");
+    }
+
+    /// 评审阻塞项 2（行为面）：终态下维护任务**只碰一次盘**就收口，绝不
+    /// 再按 60s→600s 重开。
+    #[tokio::test(start_paused = true)]
+    async fn certificate_maintenance_loop_stops_after_terminal_store_open() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let opens = Rc::new(Cell::new(0_u32));
+        let counted = Rc::clone(&opens);
+        let (_tx, rx) = watch::channel(false);
+        let mut task = Box::pin(certificate_maintenance_loop(
+            PathBuf::from("/nonexistent/account"),
+            rx,
+            move |_dir| {
+                counted.set(counted.get() + 1);
+                async { Err(StoreOpenError::KeyRejected) }
+            },
+        ));
+
+        // 与生产同序：先等一个轮询间隔，再开库检查。
+        assert!(futures::poll!(task.as_mut()).is_pending());
+        tokio::time::advance(CERT_CHECK_INTERVAL).await;
+        match futures::poll!(task.as_mut()) {
+            std::task::Poll::Ready(exit) => assert_eq!(exit, CertTaskExit::StoreTerminal),
+            std::task::Poll::Pending => panic!("store 终态必须让证书维护任务收口"),
+        }
+        assert_eq!(opens.get(), 1, "终态只碰一次盘，不再重开");
+    }
+
+    /// 评审阻塞项 2（对照面）：可重试失败不终止任务——按 600s→60s→120s
+    /// 的既有退避继续轮询，停旗即收口。
+    #[tokio::test(start_paused = true)]
+    async fn certificate_maintenance_loop_keeps_retrying_transient_store_failures() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let opens = Rc::new(Cell::new(0_u32));
+        let counted = Rc::clone(&opens);
+        let (tx, rx) = watch::channel(false);
+        let mut task = Box::pin(certificate_maintenance_loop(
+            PathBuf::from("/nonexistent/account"),
+            rx,
+            move |_dir| {
+                counted.set(counted.get() + 1);
+                async { Err(StoreOpenError::Failed) }
+            },
+        ));
+
+        assert!(futures::poll!(task.as_mut()).is_pending());
+        tokio::time::advance(CERT_CHECK_INTERVAL).await;
+        assert!(
+            futures::poll!(task.as_mut()).is_pending(),
+            "可重试失败不得终止维护任务"
+        );
+        assert_eq!(opens.get(), 1);
+        // 失败后下一拍是 60s（1→16min 指数退避），不是又等 600s。
+        tokio::time::advance(CERT_FAILURE_BACKOFF).await;
+        assert!(futures::poll!(task.as_mut()).is_pending());
+        assert_eq!(opens.get(), 2, "可重试失败继续开库检查");
+
+        tx.send(true).expect("shutdown sent");
+        assert_eq!(
+            futures::poll!(task.as_mut()),
+            std::task::Poll::Ready(CertTaskExit::Shutdown)
+        );
+        assert_eq!(opens.get(), 2, "停旗后不再开库");
     }
 
     /// identified 保险丝（止血批③，官方 Desktop identified fallback 同
