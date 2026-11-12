@@ -33,6 +33,17 @@
 //! （presage future 持有非 Send 状态，进不了 tokio::spawn），finishLink
 //! 阻塞不饿死其他方法；启动即为每个已登记账号拉起接收管线。
 
+// M6 P0 编译期能力门禁（设计：docs/plan/engine-store-encryption.md §7 P0）。
+// `PRAGMA key` 在纯 SQLite 上是静默 no-op——漏开 feature 会得到「代码在跑、
+// 测试全绿、磁盘仍是明文」的半实施（该文档失败模式 F5）。本仓是 bin-only
+// crate（无 lib.rs），main.rs 即 crate 根，门禁放这里覆盖全部 target；
+// `cargo build --no-default-features` 直接编译失败，运行时兜底见
+// src/store_cipher.rs + open_store。
+#[cfg(not(feature = "sqlcipher"))]
+compile_error!(
+    "engine requires the sqlcipher feature: PRAGMA key is a silent no-op on plain SQLite"
+);
+
 /// 契约修订单源（version / engine.protocolCapabilities 两面共取）。
 mod contract;
 #[allow(dead_code)]
@@ -45,6 +56,14 @@ mod outbox_model;
 mod proto;
 mod service;
 mod state;
+/// M6 P0 store 加密能力门禁（运行时半边：cipher_version 探测 + fail-closed
+/// 证据行；设计见 docs/plan/engine-store-encryption.md §7 P0）。本文件被
+/// `src/bin/backup5-spike.rs` 以 `#[path]` 同源引入，所以它不引用 `crate::`
+/// 下的其它模块。
+mod store_cipher;
+/// 能力门禁断言（依赖 `service::open_store`，因此只编进主 bin 的测试面）。
+#[cfg(test)]
+mod store_cipher_tests;
 
 // Android 本地备份导出面（engine-compat 备份批）：内部 Rust API，装配链由
 // 消费批任务层（service::backup_task，契约 §10.3/§10.4）接线。
@@ -462,6 +481,12 @@ async fn amain() -> ExitCode {
     // 引擎自身滚动文件日志（send 可观测批 2026-10-16，compat §1）：先于
     // 任何服务活动安装；失败静默降级（无 stderr 输出，IPC 服务不受影响）。
     logfile::init(&args.data_dir);
+    // M6 P0：链接的 sqlite 必须是 SQLCipher 构建（`cipher_version` 只在这个
+    // 构建里存在）。每进程打一次证据（`cipher=SQLCipher <version>`，不含
+    // 密钥）；缺能力时证据行由能力门在本次判定里落一条（error + stderr），
+    // 真正的闸在 open_store，且前置在任何磁盘动作/打开动作之前（fail closed，
+    // 缺能力时不落 store.db、不建账号目录）。
+    store_cipher::report_startup_capability().await;
     // vendor 发送路径分段计时回注（send 性能批 2026-10-16，compat §5）：
     // 单向钩子一次性安装，缺省 no-op；键词表仍由 perf_metrics 封闭管理
     // （vendor 字面量漂移被 perf_metrics 单测钉红）。

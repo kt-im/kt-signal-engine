@@ -42,6 +42,7 @@ use serde_json::{json, Value};
 use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify};
 
 use crate::state::{AccountEntry, EngineState, ACCOUNTS_DIR, QUARANTINE_DIR, QUARANTINE_LOG};
+use crate::store_cipher;
 
 /// A1 per-account 观测面（稳定性批 2026-10-20）：接收在飞/延迟分位/建流
 /// 结局/崩溃计数，经既有 `engine.perfMetrics` 快照 additive 暴露。
@@ -14690,7 +14691,38 @@ fn store_connect_options(path: &str) -> Result<SqliteConnectOptions, ()> {
         .pragma("cache_size", SQLITE_CACHE_SIZE_PRAGMA))
 }
 
-async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
+/// 打开（或建）账号目录下的 `store.db`。
+///
+/// 唯一入口：`open_store` = 「进程唯一能力门 + 真实打开」，门由
+/// [`open_store_gated`] 在**任何磁盘动作之前**执行；单测把门换成自建实例
+/// 直打同一个函数，从而不必污染全局结论（见 `src/store_cipher_tests.rs`
+/// 的 `missing_capability_*` 两条）。
+pub(crate) async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
+    // 先过能力门（`ensure_cipher_capable` 的同一份判定），再打开：缺能力时
+    // 一个文件都不落（连账号目录都不建）。
+    open_store_gated(dir, store_cipher::gate()).await
+}
+
+/// 带能力门的打开实现：[门] → 建目录 → 建 `store.db` → 打开并跑迁移。
+///
+/// M6 P0 能力门禁（运行时半边，docs/plan/engine-store-encryption.md §7）：
+/// 门必须**前置**——`open_with_options` 会 `create_if_missing` 建
+/// `store.db`、起连接池（2 连接）并跑 `sqlx::migrate!()` 落 schema
+/// （vendor `presage-store-sqlite/src/lib.rs:67-92`），门后置就等于「先落
+/// 明文库/明文 schema 再报错」。所以缺能力时这里**直接** `Err(())`：磁盘上
+/// 零文件（连目标目录都不建），走既有「store 打不开 → 未注册链接库保留 /
+/// 接收管线可重试」语义。
+///
+/// 结论缓存由门负责（成功/失败都缓存）：后续 open 只回同一个错误，不重探
+/// `:memory:`、不重复刷 error/eprintln（评审第 2 条）。
+pub(crate) async fn open_store_gated(
+    dir: &Path,
+    gate: &store_cipher::CipherGate,
+) -> Result<SqliteStore, ()> {
+    if gate.ensure().await.is_err() {
+        // 证据行由门在首次判定时落盘（每进程一条），这里不重复打印。
+        return Err(());
+    }
     std::fs::create_dir_all(dir).map_err(|_| ())?;
     // SqliteStore 要的是数据库文件路径，不是目录；sqlx 的连接串解析只剥
     // `sqlite://`/`sqlite:` 前缀，传 `file:///…` 会把整串当文件名。这里固定

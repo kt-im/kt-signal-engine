@@ -85,8 +85,11 @@ libsqlite3-sys = { version = "0.36", features = ["bundled-sqlcipher-vendored-ope
 
 [target.'cfg(not(windows))'.dependencies]
 # macOS 走 CommonCrypto（-DSQLCIPHER_CRYPTO_CC + Security/CoreFoundation，build.rs:220-223）
-libsqlite3-sys = { version = "0.36", features = ["bundled-sqlcipher"] }
+libsqlite3-sys = { version = "0.36", features = ["bundled", "bundled-sqlcipher"] }
 ```
+
+> 落地形状与本节一致（非 Windows 段显式写出 `bundled`，Windows 段照抄；`sqlcipher`
+> 留作纯门）。实际 diff 与目标解析证据见 §7 P0「Windows 目标修复」。
 
 平台代价（`~/.cargo/registry/src/…/libsqlite3-sys-0.36.0/build.rs`）：
 
@@ -103,8 +106,8 @@ Linux 现在没有发布面。
 （`vendor/…/Cargo.toml:8`、`:40-51`）。也就是说 **vendor 自己的测试跑在 SQLCipher 上、引擎的测试跑在纯 SQLite 上**，
 今天没有任何引擎测试覆盖加密路径。
 
-依赖图/许可影响：不新增自研 crate；Windows 会引入 `openssl-sys`+`openssl-src`（Apache-2.0/ISC 与 OpenSSL 许可），
-按 AGENTS.md「依赖最小化」需在 PR 里报备用途与许可。
+依赖图/许可影响：不新增自研 crate；Windows 会引入 `openssl-sys`+`openssl-src`（MIT / MIT+Apache-2.0，内含 OpenSSL 3.x），
+按 AGENTS.md「依赖最小化」需在 PR 里报备用途与许可——报备表已落在 §7 P0「Windows 依赖报备」。
 
 ### 2.2 `PRAGMA key` 注入点：位置已经被上游留好了
 
@@ -455,6 +458,19 @@ xxd -l 16 <DIR>/accounts/<lk>/store.db | grep -q 'SQLite format 3' && echo PLAIN
 
 ### P0 — 构建门禁 + 加密探针（1–2 人日，必须先过）
 
+> **状态：已完成**（2026-11-11，kt-signal-engine `fix/admin-write` 工作区，未 commit）。
+> 本节下方「原设计口径」保留评审原文；实际落地形状、偏差与证据见「P0 落地事实」。
+> 文档头部那句「本文未改任何代码/未跑构建」只适用于 P1–P4（评估部分）。
+>
+> **2026-11-11 补丁（Windows 目标拆分，必须项）**：P0 首批的
+> `sqlcipher = ["libsqlite3-sys/bundled-sqlcipher"]` 在 `x86_64-pc-windows-msvc`
+> 上会让 libsqlite3-sys build.rs panic，而 release matrix 含该 target
+> （`.github/workflows/release.yml:39-40`）。现按 §2.1 改为**两段 target 依赖**，
+> `sqlcipher` 降级为纯 `compile_error!` 门；macOS 依赖图与产物不变（不引
+> OpenSSL）。见「Windows 目标修复」与「Windows 依赖报备」。
+
+#### 原设计口径（评审原文，保留）
+
 改动：
 1. `Cargo.toml:33-35` 按 §2.1 换成按目标的 SQLCipher feature。
 2. 新增 `tests/cipher.rs`（3 条断言）：
@@ -475,6 +491,159 @@ RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-
 ```
 
 DoD：三平台产物可启动；`cipher_version` 断言绿；现有测试全绿；`cargo clippy --all-targets -- -D warnings` 绿。
+
+#### P0 落地事实（本仓，已执行）
+
+| # | 交付 | 位置 | 实现要点 |
+|---|---|---|---|
+| 1 | feature + 按目标依赖 | `Cargo.toml:9-23`（feature）、`Cargo.toml:158-180`（target 依赖） | `default = ["sqlcipher"]`、`sqlcipher = []`——feature **只做门**，不转发依赖特性。SQLCipher 的链接按目标声明：非 Windows `features = ["bundled", "bundled-sqlcipher"]`（macOS 走 CommonCrypto，`build.rs:220-223`，**不引 OpenSSL**）；Windows `features = ["bundled-sqlcipher-vendored-openssl"]`（隐含 `bundled-sqlcipher`→`bundled` 与 `openssl-sys/vendored`，libsqlite3-sys 0.36 `Cargo.toml:46-50`）。非 Windows 产物不变；Windows 新增 `openssl-sys`/`openssl-src`（build-time vendored，见「Windows 依赖报备」）。 |
+| 2 | 编译期门（每个 bin 一份） | `src/main.rs:42-45`、`src/bin/backup5-spike.rs:15-21` | `#[cfg(not(feature = "sqlcipher"))] compile_error!("engine requires the sqlcipher feature: PRAGMA key is a silent no-op on plain SQLite")`。本仓 bin-only（无 `lib.rs`），**bin target 各自独立编译**，所以门要各写一份：主 bin 覆盖 `kt-signal-engine`，开发 bin 覆盖 `backup5-spike`（它也 `SqliteStore::open`，临时目录、无 key）。`cargo build --no-default-features` 与 `cargo build --no-default-features --bin backup5-spike` 都要 101。 |
+| 3 | 运行时门（**前置**） | `src/store_cipher.rs`（`CipherGate` / `NegativeCache`）+ `src/service/mod.rs:14694-14744`（`open_store` → `open_store_gated`） | 顺序钉死为 **门 → 建目录 → 建 `store.db` → 打开并跑迁移**：`open_store_gated` 第一步 `gate.ensure()`，缺能力直接 `Err(())`，**不建目录、不建 `store.db`、不起连接池、不跑 `sqlx::migrate!()`**（这些正是 `open_with_options` 的副作用，vendor `presage-store-sqlite/src/lib.rs:67-92`）。判定结论**正负都缓存**：成功结论 `OnceLock`；失败进 `NegativeCache`（同样 `OnceLock`）→ 后续 open 只回同一错误，不重探 `:memory:`。失败证据行（`error!` + `eprintln!`，固定 `code=StoreCipherUnavailable`）由 `CipherGate::report_denial_once` 的 `compare_exchange` 闸控，**每进程只落一次**，重试不刷屏。走既有「store 打不开 → 未注册链接库保留 / 接收管线可重试」语义（`src/service/mod.rs:9183` 一带不变）。 |
+| 4 | 启动证据 | `src/main.rs`（`logfile::init` 之后、任何 store 打开之前） | 每进程一次：`WARN engine.startup: store encryption capability verified stage="store_cipher" cipher=SQLCipher 4.10.0 community`。级别取 WARN 是**落盘契约**（`src/logfile.rs:57` `MAX_LEVEL = LevelFilter::WARN`，info 不进滚动日志）；行内无密钥/路径/号码，stderr 纪律不变。**失败分支不再由启动路径打第二行**：门已落唯一一条证据行（同一事实只出现一遍）。 |
+| 5 | 断言 | `src/store_cipher_tests.rs`（6 条） | 见「测试」。 |
+
+> **评审回改（2026-11-12）**：第 3 条原来把门放在 `open_with_options` **之后**（建连成功才判），
+> 缺能力时磁盘上已经落了明文 `store.db` + schema；现已前置到打开之前，并补「缺能力 → 目标目录
+> 零文件」「负缓存 + 证据行每进程一次」两条断言。第 3 条评审同时要求 `backup5-spike` 不得绕门：
+> 该 bin 现在有独立 `compile_error!` + `#[path = "../store_cipher.rs"]` 引入同一份门，
+> 打开前先 `ensure_cipher_capable()`。
+
+**P0 边界（本批明确不碰）**：不引入 KEK/DEK、不写任何密钥文件、不改 store 迁移
+（vendor 的 `sqlx::migrate!()` 原样）、不改连接池参数（`max_connections(2)` /
+`acquire_timeout(5s)` / `cache_size=-1024` 全部原状）、不接 `PRAGMA key` 注入面
+（P1 才做）。P0 只把「这条构建到底能不能用 SQLCipher」这一步钉死。
+
+#### 测试（6 条，均为进程内单测；文件 `src/store_cipher_tests.rs`）
+
+| 断言 | 名称 | 证明了什么 |
+|---|---|---|
+| a | `cipher_version_is_present_and_identifies_sqlcipher`（`src/store_cipher_tests.rs`） | `cipher_version` 非空且为 `<major>.<minor>.<patch>[ <build>]` 形状；落盘证据行含 `SQLCipher` 标识。**口径说明**：SQLCipher 自己的 `PRAGMA cipher_version` 实测是 `4.10.0 community`（不含产品名），所以「含 SQLCipher 标识」由 `capability_line()` 的 `SQLCipher <version>` 承担，而非硬拼在 pragma 返回值里。 |
+| b | `keyless_store_remains_plaintext_readable_and_writable`（`src/store_cipher_tests.rs`） | 不设 key 时：`open_store` 建库后文件头仍是 `SQLite format 3\0`；无 key 的裸 sqlx 连接可读（`_sqlx_migrations`）可写（自建表 + insert）；再走 `open_store` 打开后数据仍在 → **存量明文库行为不变**。 |
+| c | `keyed_store_is_unreadable_without_key`（`src/store_cipher_tests.rs`） | `PRAGMA key = "x'<64hex>'"` 建库写入后：文件前 16 字节是盐（≠ 明文头）；无 key 的 sqlx 连接查询报 `not a database`（code 26）；同 key 重开能读回 → **`PRAGMA key` 不是 no-op**。 |
+| d | `missing_capability_refuses_before_touching_disk` | **评审第 1 条**：走生产同一条 `open_store_gated`（只把门换成自建「缺能力」实例）→ 返回 `Err(())`，且目标目录**零文件**：目录不存在或零条目、无 `store.db`、父目录（`accounts/`）都没被建出来 → 证明门在 `create_dir_all`/`open_with_options` 之前。 |
+| e | `missing_capability_is_probed_and_reported_once` | **评审第 2 条**：首次判定失败后探测计数停在 1、证据行计数停在 1；再判定 3 次 + 再 `open_store` 2 次后两者仍是 1（负缓存命中，不重探 `:memory:`、不重复刷 error/eprintln），磁盘仍零文件。 |
+| f | `capable_gate_probes_once_and_caches_version` | 正缓存对照：能力可用时也只探一次、版本串一致、失败证据行 0 条。 |
+
+执行记录（本机 macOS aarch64 / rustc 1.99.0，全部实跑；2026-11-12 评审回改后重跑）：
+
+```text
+cargo fmt --all -- --check                        → 0（无 diff）
+cargo clippy --all-targets -- -D warnings         → 0（Finished in 5.77s，零 warning）
+cargo test --all-targets -- --test-threads=1      → 0；bin 653 条（652 passed / 1 ignored，原有 ignore）、
+                                                    backup5-spike 0 条、tests/contract.rs 94 条全 passed
+cargo test --bin kt-signal-engine -- store_cipher  → 6 passed（a–f；其中 d/e/f 为本批新增）
+cargo build --no-default-features --bin backup5-spike → 101，唯一错误：
+  error: engine requires the sqlcipher feature: PRAGMA key is a silent no-op on plain SQLite (backup5-spike bin)
+cargo build --no-default-features                 → 101，两条 compile_error（main.rs + backup5-spike.rs）
+启动日志实测（printf '' | ./target/debug/kt-signal-engine --data-dir /tmp/… jsonRpc，exit 0）：
+  logs/engine-stderr.log: WARN engine.startup: store encryption capability verified
+    stage="store_cipher" cipher=SQLCipher 4.10.0 community
+  （仅此一条能力证据行；stderr 只有既有的 network path INFO 行，未新增 stderr 输出）
+```
+
+突变验证（把门临时移回 `open_with_options` 之前以外的位置 = 删掉门，跑完已还原）：
+`missing_capability_refuses_before_touching_disk` 与
+`missing_capability_is_probed_and_reported_once` 立即**红**
+（`missing cipher capability must fail closed` / `open_store_gated(...).is_err()`）→
+两条断言确实钉住「门在打开之前」而不是「门存在」。
+
+缺能力路径的实机证据目前是**单测级**（d/e：注入门 + 断言零文件/计数），刻意不做成
+`--no-default-features` 进程级验证——那条路已被两条 `compile_error!` 挡在编译期，
+运行期门只是「feature 开了但链接到的 sqlite 没 cipher_version」（构建脚本被覆写等）
+的兜底。
+
+构建耗时（实测）：feature 切换后的增量 `cargo build` = **24.99s**（libsqlite3-sys +
+sqlx-sqlite + sqlx + presage-store-sqlite + kt-signal-engine 五个 crate 重编 + 链接）；
+其中 SQLCipher 混合体单独重编（`cargo clean -p libsqlite3-sys && cargo build -p
+libsqlite3-sys`）= **2.09s**（debug/`-O0`，cc 编 `sqlcipher/sqlite3.c`）。**未跑** clean
+全量构建（target/ 已有 66G 缓存），所以「从零构建」的绝对值没有实测数据。
+
+**2026-11-11 补丁验证（Windows 目标拆分；本机 macOS aarch64 / rustc 1.99.0，全部实跑）**：
+
+```text
+cargo fmt --all -- --check                     → 0（无 diff）
+cargo clippy --all-targets -- -D warnings      → 0（Finished in 2.61s，零 warning）
+cargo test --all-targets -- --test-threads=1   → 0；bin 649 passed / 1 ignored（原有 ignore）、
+                                                 tests/contract.rs 94 passed
+cargo check --no-default-features              → 101，仍由 compile_error! 拦下：
+  error: engine requires the sqlcipher feature: PRAGMA key is a silent no-op on plain SQLite
+cargo metadata --filter-platform x86_64-pc-windows-msvc --no-deps
+  → 本包依赖里 libsqlite3-sys 两条声明：
+    target=cfg(not(windows))  features=[bundled, bundled-sqlcipher]
+    target=cfg(windows)       features=[bundled-sqlcipher-vendored-openssl]
+    （--no-deps 列的是 manifest 声明、不按平台裁剪；裁剪后的真实图看下面两条）
+cargo tree --target x86_64-pc-windows-msvc -e normal,build
+  → libsqlite3-sys → openssl-sys v0.9.118 → libc / openssl-src v300.6.1+3.6.3
+cargo tree --target x86_64-pc-windows-msvc -e features -i libsqlite3-sys
+  → feature "bundled-sqlcipher-vendored-openssl" ← kt-signal-engine
+cargo tree --target aarch64-apple-darwin -e normal,build
+  → libsqlite3-sys 下没有 openssl-sys/openssl-src（图里唯一的 openssl-macros 来自既有的
+    boring/libsignal 栈，proc-macro，与本次改动无关）
+target/debug/build 下 openssl* 构建目录 = 0（macOS 从未编 OpenSSL）
+Cargo.lock：+openssl-src 300.6.1+3.6.3、+openssl-sys 0.9.118，libsqlite3-sys 依赖表 +"openssl-sys"
+  （lock 是跨平台并集；macOS 构建不编译它们）
+```
+
+**未实跑**：Windows 产物构建与启动（本机无 MSVC/Perl/CMake）。上面证明的是**目标解析**与
+非 Windows 编译面不变，不是 Windows 产物行为。
+
+#### 偏差（相对本节原文设计）
+
+- **D1 测试落点**：原文写 `tests/cipher.rs` + `cargo test --test cipher`。本仓是 bin-only
+  crate（无 lib target），集成测试无法 import crate 内部（`open_store` 与探测都在 bin 里），
+  所以三条断言落成 `src/store_cipher.rs` 的 `mod tests`（`cargo test --bin kt-signal-engine
+  store_cipher`），仍由 `cargo test --all-targets` 全量覆盖。错 key 归一 `NotADatabase`
+  一项按「**无 key 打开必须报错**」实现：SQLCipher 上错 key 与无 key 同为首页解密失败，
+  `StoreKeyRejected` 的语义区分属 P1（`§6` 决策表），P0 只需证明「key 不是 no-op」。
+- **D2 Cargo 形状（已修复，见「Windows 目标修复」）**：原文 §2.1 建议按目标拆
+  `bundled-sqlcipher` / `bundled-sqlcipher-vendored-openssl`。P0 首批按任务书只加了**一个**
+  转发 feature（`bundled-sqlcipher`），Windows 的 vendored OpenSSL 分支未落 → Windows 必挂。
+  2026-11-11 补丁改成两段 target 依赖，`sqlcipher` 只留作 `compile_error!` 门（`sqlcipher = []`）。
+- **D3 CI**：未改 `.github/workflows/ci.yml`（本批门禁口径是本地 fmt/clippy/test 全绿）。
+  `ci.yml:46` 的 `cargo test --all-targets` 已经跑到这三条断言，无需单独加 `--test cipher`。
+- **D4 未做**（不计入 P0 完成口径）：三平台 release 产物启动验证、vendor 独立 workspace 的
+  `(cd vendor/presage/presage-store-sqlite && cargo test)`。
+
+#### Windows 目标修复（2026-11-11，已落）
+
+原形状 `sqlcipher = ["libsqlite3-sys/bundled-sqlcipher"]` 在 Windows 上的失败链：
+`libsqlite3-sys` 0.36 `build.rs:157-175` 判 `is_windows && !bundled-sqlcipher-vendored-openssl`
+且 `find_openssl_dir` 找不到 `OPENSSL_DIR` → **编译期 panic**（`Missing environment variable
+OPENSSL_DIR …`）。release matrix 含 `x86_64-pc-windows-msvc`（`.github/workflows/release.yml:39-40`），
+所以这是必须项而不是可选优化。
+
+现形状（`Cargo.toml:158-180`）：
+
+| 目标 | 声明 | 生效特性 | crypto |
+|---|---|---|---|
+| 非 Windows（macOS/Linux） | `[target.'cfg(not(windows))'.dependencies]` | `bundled` + `bundled-sqlcipher` | macOS：CommonCrypto（`build.rs:220-223`）；Linux：系统 `libcrypto` |
+| Windows | `[target.'cfg(windows)'.dependencies]` | `bundled-sqlcipher-vendored-openssl`（→ `bundled-sqlcipher` → `bundled` + `openssl-sys/vendored`） | vendored OpenSSL 3.6.3，静态链 `libcrypto` |
+
+`sqlcipher` feature 降级为**纯门**（`sqlcipher = []`，仍默认开）：只喂 `src/main.rs` 的
+`compile_error!`，不参与依赖特性。语义变化要记一笔：**feature 不再控制"链不链 SQLCipher"**，
+它只控制"允许不允许编译"（`cargo build --no-default-features` 仍会在 `compile_error!` 停下，
+但链接的仍是 SQLCipher）。这样平台差异只有一处（target 依赖），feature 开关不会再把 Windows
+推进 panic 分支。Windows 分支的说明注释写在 `Cargo.toml:171-178`（`cfg(windows)` 段内）。
+
+#### Windows 依赖报备（AGENTS.md：依赖最小化）
+
+`openssl-sys 0.9.118` + `openssl-src 300.6.1+3.6.3` **只在 `cfg(windows)` 入图**，按
+AGENTS.md「依赖最小化：新增 crate 需在 PR 描述说明用途与许可」报备：
+
+| 项 | 内容 |
+|---|---|
+| 为什么必须 | MSVC 无 CommonCrypto；单用 `bundled-sqlcipher` 会 panic（见上）。vendored 是 libsqlite3-sys 给出的唯一支持路径：`bundled-sqlcipher-vendored-openssl = ["bundled-sqlcipher", "openssl-sys/vendored"]`（`libsqlite3-sys-0.36.0/Cargo.toml:47-50`） |
+| 用途 | **build-time only**：`openssl-src` 编出 OpenSSL 3.6.3 静态库，`openssl-sys` 通过 `DEP_OPENSSL_INCLUDE` 把头文件交给 libsqlite3-sys 编 SQLCipher（`build.rs:209-212`）；产物静态链 `libcrypto`，运行时不依赖系统 OpenSSL |
+| 许可 | `openssl-sys` MIT；`openssl-src` MIT/Apache-2.0（内含 OpenSSL 3.x，Apache-2.0）。与本仓 AGPL-3.0-only 兼容，无 GPL-ink 冲突 |
+| 构建前置 | Windows runner 需要 **Perl + CMake**（openssl-src 的构建前置）与 MSVC 工具链；构建时间会明显上升（OpenSSL 全量编译） |
+| 非 Windows | 不引入：`cargo tree --target aarch64-apple-darwin` 里没有 `openssl-sys`/`openssl-src`，macOS 编译面与 P0 首批一致。Cargo.lock 会记条目（lock 是跨平台并集），但 macOS 不编译它们 |
+| 未验证 | Windows 上 `crt-static`（`release.yml:65-66`）+ 静态 OpenSSL 的组合仍未实测（build.rs 另有 msvc `crt-static` 分支，两条路径叠加无上游背书）→ 仍是 G-B |
+
+其余 Windows 侧未验证项（不因本次拆分消失）：
+
+3. `crt-static` + 静态 OpenSSL 的构建/启动**未实跑**（本机 macOS，无 MSVC 交叉工具链）。
+4. `bundled-sqlcipher` 追加 `-DSQLITE_TEMP_STORE=2`（`build.rs:147-152`，临时表/排序强制进内存）：
+   非格式变更，但 Windows 上 RSS 曲线与今天不同，G-B 需一并观察。
 
 ### P1 — key 通道 + fail-closed 决策表（3–5 人日）
 
@@ -592,12 +761,12 @@ DoD：pilot 账号行数/迁移账本/语义金样全一致；每个断点 kill 
 - `Cargo.toml:13`（sqlx 0.9）、`:19-25`（presage 系列 rev 钉定 + `default-features=false`）、`:33-35`（`libsqlite3-sys/bundled`）、`:53,100-103`（rand/aes-gcm/hkdf/sha2 已在图）、`:166-168`（`[patch]` 指向 vendor）
 - `vendor/presage/presage-store-sqlite/Cargo.toml:8`（默认 SQLCipher）、`:34`（`libsqlite3-sys` 空 feature）、`:40-51`（独立 workspace）
 - `vendor/presage/presage-store-sqlite/src/lib.rs:41-47`（`open`）、`:49-65`（`open_with_passphrase` → `pragma("key")`）、`:67-92`（WAL/Full/busy_timeout/池 2/migrate）
-- `src/service/mod.rs:14668-14688`（cache_size 与 `store_connect_options`）、`:14695-14707`（`open_store`）、`:14705-14720`（未注册库探测）、`:14728-14748`（`remove_link_store`）、`:14772-14780`（`store.db` 存在性）、`:15205`、`:9116`（90s）、`:9179-9191`（store 打不开→Recoverable）、`:8472-8483`（`StreamOutcome`）、`:3598-3601`（perf 快照）、`:29583-29587`（cache_size 单测）
+- `src/service/mod.rs:14668-14688`（cache_size 与 `store_connect_options`）、`:14700-14735`（`open_store` → `open_store_gated`，门在打开之前）、`:14705-14720`（未注册库探测）、`:14728-14748`（`remove_link_store`）、`:14772-14780`（`store.db` 存在性）、`:15205`、`:9116`（90s）、`:9179-9191`（store 打不开→Recoverable）、`:8472-8483`（`StreamOutcome`）、`:3598-3601`（perf 快照）、`:29583-29587`（cache_size 单测）
 - `src/state.rs:47`（`STORE_DB_FILE`）、`:84-96`（注册表 fail-closed）、`:302-341`（`lk-*` 扫描/`store_db_present`）、`:7`（fake 账号无 store）
 - `src/main.rs:95-126`（严格 argv）、`:133,428`（env 读取先例）、`:444`（`ERROR event=…` 形状）、`:472-476`（启动先扫库再进主循环）
 - `src/service/perf_metrics.rs:33-60`（封闭词表）、`:258-287`（快照）
 - `src/methods.rs:4820`（`engine.perfMetrics` wire 面）
-- `src/bin/backup5-spike.rs:37-40`（开发 bin 直接用无 key 的 `SqliteStore::open`，临时目录）
+- `src/bin/backup5-spike.rs:10-29`（开发 bin 的编译期门 + `#[path]` 引入同一份运行时门）、`:59-69`（门在 `SqliteStore::open` 之前；临时目录、无 key）
 - `tests/contract.rs:33-49`（真进程 harness）、`:173-177`（伪 `store.db` 字节）、`:240-260`（注册表损坏保留 store）
 - `adr/0004-p1b-link-flow-and-identity-trust.md:39-42`（`accounts/<lk-hex>` 布局与删除语义）
 - `vendor/presage/presage-store-sqlite/migrations/20250112201436_init.sql`（表清单：identities/sessions/pre_keys/…）
