@@ -278,6 +278,8 @@ pub struct SignalWebSocket<C: WebSocketType> {
         oneshot::Sender<Result<WebSocketResponseMessage, ServiceError>>,
     )>,
     kill: Arc<Notify>,
+    /// Instance id for correlating inbound-frame logs with the owning socket.
+    socket_id: u32,
 }
 
 // Manual impl (no `C: Clone` bound): every field is cloneable for any `C`.
@@ -290,15 +292,24 @@ impl<C: WebSocketType> Clone for SignalWebSocket<C> {
             inner: Arc::clone(&self.inner),
             request_sink: self.request_sink.clone(),
             kill: Arc::clone(&self.kill),
+            socket_id: self.socket_id,
         }
     }
 }
 
+/// Monotonic id handed to each socket facade so frame logs name their owner.
+fn next_socket_id() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Read-only latency evidence: one line per sampled inbound frame.
-fn log_frame_received(stamp: &WsFrameStamp) {
+fn log_frame_received(socket_id: u32, stamp: &WsFrameStamp) {
     tracing::warn!(
         target: "engine.latency",
         stage = "ws_frame_received",
+        socket_id,
         seq = stamp.seq(),
         frame_bytes = stamp.frame_bytes(),
         "websocket frame received"
@@ -313,6 +324,7 @@ struct SignalWebSocketInner {
 }
 
 struct SignalWebSocketProcess {
+    socket_id: u32,
     /// Whether to enable keep-alive or not (and send a request to this path)
     keep_alive_path: String,
 
@@ -360,7 +372,26 @@ impl SignalWebSocketProcess {
         frame_stamp: WsFrameStamp,
     ) -> Result<(), ServiceError> {
         use prost::Message;
-        let msg = WebSocketMessage::decode(frame)?;
+        tracing::warn!(
+            target: "signal.pipe",
+            stage = "process_frame_enter",
+            seq = frame_stamp.seq(),
+            frame_bytes = frame_stamp.frame_bytes(),
+            "process_frame entered"
+        );
+        let msg = match WebSocketMessage::decode(frame) {
+            Ok(msg) => msg,
+            Err(error) => {
+                tracing::warn!(
+                    target: "signal.pipe",
+                    stage = "decode_failed",
+                    seq = frame_stamp.seq(),
+                    error = %error,
+                    "websocket frame failed to decode"
+                );
+                return Err(error.into());
+            }
+        };
         if let Some(request) = &msg.request {
             tracing::trace!(
                 msg_type =? msg.r#type(),
@@ -386,6 +417,16 @@ impl SignalWebSocketProcess {
         }
 
         use web_socket_message::Type;
+        tracing::warn!(
+            target: "signal.pipe",
+            stage = "frame_branch",
+            seq = frame_stamp.seq(),
+            frame_bytes = frame_stamp.frame_bytes(),
+            kind = ?msg.r#type(),
+            has_request = msg.request.is_some(),
+            has_response = msg.response.is_some(),
+            "frame classified"
+        );
         match (msg.r#type(), msg.request, msg.response) {
             (Type::Unknown, _, _) => Err(ServiceError::InvalidFrame {
                 reason: "unknown frame type",
@@ -394,11 +435,19 @@ impl SignalWebSocketProcess {
                 let (sink, recv) = oneshot::channel();
                 tracing::trace!("sending request with body");
                 self.request_sink
-                    .send((request, sink, frame_stamp))
+                    .send((request, sink, frame_stamp.clone()))
                     .await
                     .map_err(|_| ServiceError::WsClosing {
                         reason: "request handler failed",
                     })?;
+                tracing::warn!(
+                    target: "signal.pipe",
+                    stage = "request_stream_sent",
+                    socket_id = self.socket_id,
+                    seq = frame_stamp.seq(),
+                    frame_bytes = frame_stamp.frame_bytes(),
+                    "frame pushed to request stream"
+                );
                 self.outgoing_responses.push(Box::pin(recv));
 
                 Ok(())
@@ -648,9 +697,18 @@ impl SignalWebSocketProcess {
                                 .latency
                                 .should_log_received(std::time::Instant::now())
                             {
-                                log_frame_received(&frame_stamp);
+                                log_frame_received(self.socket_id, &frame_stamp);
                             }
-                            self.process_frame(frame, frame_stamp).await?;
+                            if let Err(error) = self.process_frame(frame, frame_stamp).await {
+                                tracing::warn!(
+                                    target: "signal.pipe",
+                                    stage = "process_frame_failed",
+                                    seq = frame_stamp.seq(),
+                                    error = %error,
+                                    "process loop exiting on frame error"
+                                );
+                                return Err(error);
+                            }
                         }
                         WsEvent::Chat(_) => {
                             tracing::warn!("official chat event reached legacy process; ignoring");
@@ -716,7 +774,16 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         }));
         let kill = Arc::new(Notify::new());
 
+        let socket_id = next_socket_id();
+        tracing::warn!(
+            target: "signal.pipe",
+            stage = "ws_instance",
+            socket_id,
+            kind = "legacy",
+            "websocket facade created"
+        );
         let process = SignalWebSocketProcess {
+            socket_id,
             keep_alive_path,
             requests: outgoing_requests,
             request_sink: incoming_request_sink,
@@ -748,6 +815,7 @@ impl<C: WebSocketType> SignalWebSocket<C> {
                 unidentified_push_service,
                 inner,
                 kill,
+                socket_id,
             },
             process,
         )
@@ -769,12 +837,21 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         }));
         let kill = Arc::new(Notify::new());
 
+        let socket_id = next_socket_id();
+        tracing::warn!(
+            target: "signal.pipe",
+            stage = "ws_instance",
+            socket_id,
+            kind = "official",
+            "websocket facade created"
+        );
         let task = run_official(
             socket,
             outgoing_requests,
             incoming_sink,
             Arc::clone(&inner),
             Arc::clone(&kill),
+            socket_id,
         );
 
         (
@@ -784,9 +861,15 @@ impl<C: WebSocketType> SignalWebSocket<C> {
                 unidentified_push_service,
                 inner,
                 kill,
+                socket_id,
             },
             task,
         )
+    }
+
+    /// Instance id of this socket facade, for log correlation.
+    pub fn socket_id(&self) -> u32 {
+        self.socket_id
     }
 
     pub fn servers(&self) -> SignalServers {
@@ -1076,6 +1159,7 @@ async fn run_official(
     request_sink: mpsc::UnboundedSender<RequestStreamItem>,
     shared: Arc<Mutex<SignalWebSocketInner>>,
     kill: Arc<Notify>,
+    socket_id: u32,
 ) {
     use crate::websocket::chat_adapter::ChatEvent;
 
@@ -1132,9 +1216,10 @@ async fn run_official(
                         if latency
                             .should_log_received(std::time::Instant::now())
                         {
-                            log_frame_received(&incoming.frame_stamp);
+                            log_frame_received(socket_id, &incoming.frame_stamp);
                         }
                         let (ack_tx, ack_rx) = oneshot::channel();
+                        let seq = incoming.frame_stamp.seq();
                         if request_sink
                             .unbounded_send((
                                 incoming.message,
@@ -1145,6 +1230,13 @@ async fn run_official(
                         {
                             continue;
                         }
+                        tracing::warn!(
+                            target: "signal.pipe",
+                            stage = "pipe_enqueued",
+                            socket_id,
+                            seq,
+                            "frame enqueued for the request stream"
+                        );
                         let responder = incoming.responder;
                         acks.push(Box::pin(async move {
                             if let Ok(response) = ack_rx.await {

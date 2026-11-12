@@ -184,11 +184,19 @@ impl EnvelopeAck {
 
 pub struct MessagePipe {
     ws: SignalWebSocket<websocket::Identified>,
+    socket_id: u32,
 }
 
 impl MessagePipe {
     pub fn from_socket(ws: SignalWebSocket<websocket::Identified>) -> Self {
-        MessagePipe { ws }
+        let socket_id = ws.socket_id();
+        tracing::warn!(
+            target: "signal.pipe",
+            stage = "pipe_attached",
+            socket_id,
+            "message pipe attached to socket"
+        );
+        MessagePipe { ws, socket_id }
     }
 
     /// Return a SignalWebSocket for sending messages and other purposes beyond receiving messages.
@@ -199,30 +207,61 @@ impl MessagePipe {
     /// Worker task that processes the websocket into Envelopes
     async fn run(
         mut self,
-        mut sink: Sender<Result<Incoming, ServiceError>>,
-    ) -> Result<(), mpsc::SendError> {
+        sink: mpsc::UnboundedSender<Result<Incoming, ServiceError>>,
+    ) {
         let mut ws = self.ws.clone();
         let mut stream = ws
             .take_request_stream()
             .expect("web socket request handler not in use");
 
-        while let Some((request, responder, frame_stamp)) = stream.next().await
-        {
+        loop {
+            let wait_started = std::time::Instant::now();
+            let Some((request, responder, frame_stamp)) = stream.next().await else {
+                break;
+            };
+            let waited_ms = wait_started.elapsed().as_millis() as u64;
+            tracing::warn!(
+                target: "signal.pipe",
+                stage = "pipe_event_wait",
+                socket_id = self.socket_id,
+                waited_ms,
+                "pipeline item dequeued from socket"
+            );
+            let decode_started = std::time::Instant::now();
             // WebsocketConnection::onMessage(ByteString)
             if let Some(env) = self
                 .process_request(request, responder, frame_stamp)
                 .await
                 .transpose()
             {
-                sink.send(env).await?;
+                let decode_ms = decode_started.elapsed().as_millis() as u64;
+                let send_started = std::time::Instant::now();
+                if sink.unbounded_send(env).is_err() {
+                    break;
+                }
+                let blocked_ms = send_started.elapsed().as_millis() as u64;
+                if decode_ms >= 200 {
+                    tracing::warn!(
+                        target: "signal.pipe",
+                        stage = "pipe_decode",
+                        decode_ms,
+                        "pipeline item decoded"
+                    );
+                }
+                if blocked_ms >= 200 {
+                    tracing::warn!(
+                        target: "signal.pipe",
+                        stage = "pipe_send",
+                        blocked_ms,
+                        "pipeline item handed to consumer"
+                    );
+                }
             } else {
                 tracing::trace!("got empty message in websocket");
             }
         }
 
         ws.return_request_stream(stream);
-
-        Ok(())
     }
 
     async fn process_request(
@@ -291,16 +330,16 @@ impl MessagePipe {
     /// Envelopes yield an [`EnvelopeAck`] handle; the consumer acks after
     /// processing. Queue markers ack immediately.
     pub fn stream(self) -> impl Stream<Item = Result<Incoming, ServiceError>> {
-        let (sink, stream) = mpsc::channel(1);
-
-        let stream = stream.map(Some);
-        let runner = self.run(sink).map(|e| {
-            tracing::info!("sink was closed: {:?}", e);
-            None
-        });
-
-        let combined = futures::stream::select(stream, runner.into_stream());
-        combined.filter_map(|x| async { x })
+        // Unbounded relay driven by tokio::select so the consumer's waker is
+        // registered on the receiver (the previous select-composition lost it).
+        let (sink, rx) = mpsc::unbounded();
+        let runner = Box::pin(self.run(sink));
+        futures::stream::unfold((runner, rx), |(mut runner, mut rx)| async move {
+            tokio::select! {
+                item = rx.next() => item.map(|item| (item, (runner, rx))),
+                _ = &mut runner => None,
+            }
+        })
     }
 }
 
@@ -360,20 +399,46 @@ pub fn stream_from_chat(
 ) -> impl Stream<Item = Result<Incoming, ServiceError>> {
     use crate::websocket::chat_adapter::ChatEvent;
 
-    let (mut sink, stream) = mpsc::channel::<Result<Incoming, ServiceError>>(1);
+    let (mut sink, stream) = mpsc::channel::<Result<Incoming, ServiceError>>(64);
     let runner = async move {
-        while let Some(event) = events.recv().await {
+        loop {
+            let wait_started = std::time::Instant::now();
+            let Some(event) = events.recv().await else {
+                break;
+            };
+            tracing::warn!(
+                target: "signal.pipe",
+                stage = "pipe_event_wait",
+                waited_ms = wait_started.elapsed().as_millis() as u64,
+                "pipeline event dequeued"
+            );
             match event {
                 ChatEvent::Incoming(incoming) => {
                     match decode_chat_incoming(incoming) {
                         Ok(Some(item)) => {
-                            if sink.send(Ok(item)).await.is_err() {
+                            let send_started = std::time::Instant::now();
+                            let send_failed = sink.send(Ok(item)).await.is_err();
+                            tracing::warn!(
+                                target: "signal.pipe",
+                                stage = "pipe_send",
+                                blocked_ms = send_started.elapsed().as_millis() as u64,
+                                "pipeline item handed to consumer"
+                            );
+                            if send_failed {
                                 break;
                             }
                         }
                         Ok(None) => {}
                         Err(error) => {
-                            if sink.send(Err(error)).await.is_err() {
+                            let send_started = std::time::Instant::now();
+                            let send_failed = sink.send(Err(error)).await.is_err();
+                            tracing::warn!(
+                                target: "signal.pipe",
+                                stage = "pipe_send",
+                                blocked_ms = send_started.elapsed().as_millis() as u64,
+                                "pipeline error handed to consumer"
+                            );
+                            if send_failed {
                                 break;
                             }
                         }

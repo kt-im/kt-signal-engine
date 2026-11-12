@@ -1527,6 +1527,7 @@ impl<S: Store> Manager<S, Registered> {
                     // failure must not lose the batch — the items are
                     // still yielded (and acked downstream), exactly like
                     // the per-message path logs and continues today.
+                    let save_started = std::time::Instant::now();
                     if let Err(error) = save_messages_batch(
                         &mut state.store,
                         &mut state.identified_websocket,
@@ -1535,6 +1536,16 @@ impl<S: Store> Manager<S, Registered> {
                     .await
                     {
                         error!(%error, "error saving message batch to store");
+                    }
+                    let save_ms = save_started.elapsed().as_millis() as u64;
+                    if save_ms >= 200 {
+                        tracing::warn!(
+                            target: "signal.pipe",
+                            stage = "presage_batch_save",
+                            elapsed_ms = save_ms,
+                            batch = to_save.len() as u64,
+                            "message batch save slow"
+                        );
                     }
 
                     // Materialize the slots in arrival order; `Content`
