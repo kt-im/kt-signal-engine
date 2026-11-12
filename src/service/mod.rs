@@ -112,6 +112,9 @@ pub(crate) mod voice_note;
 /// 形状/拒集压缩/失败不毒缓存纪律）：冷启动/TTL 过期后的发送路径零 Storage
 /// 网络读，过期只做后台 best-effort 刷新。
 pub(crate) mod whitelist_store;
+/// 只读延迟探针（WebSocket 收帧 → receive loop）：区分服务端晚到与本地排队，
+/// 固定采样门槛、零账号/正文、失败静默。
+pub(crate) mod ws_latency;
 pub(crate) mod zkgroup_consts;
 
 /// C 批群发提速：sender-key + 单请求 MRM 发送链（vendored 逐收件人路径
@@ -9472,6 +9475,8 @@ async fn serve_account_stream(
     // account_manager 改为复用活动 WS（registered.rs account_manager 传
     // require_unused=false），不再拨第二条——维护恢复默认开启。
     let envelope_probe_until = tokio::time::Instant::now() + Duration::from_secs(60);
+    // WebSocket 收帧 → receive loop 延迟探针（只读采样，零接收语义变化）。
+    let mut ws_latency_probe = ws_latency::WsLatencyProbe::new();
     let mut maint_at = Some(tokio::time::Instant::now() + Duration::from_millis(0));
     // prekey 快速巡检（P12/R4）：30min 时间触发 + 200 信封量触发的低水位
     // 快速路径——长连接内 prekey 耗尽的发现窗从 2 天（maintenance_tick）
@@ -9749,6 +9754,12 @@ async fn serve_account_stream(
             item = stream.next() => {
                 // S2a 打点：信封级到达起点（ack 前逐臂落 RECEIVE_ENVELOPE）。
                 let envelope_started = std::time::Instant::now();
+                // 只读延迟探针：帧进入传输栈的本地时刻 → 本处理点的差值。
+                // 无帧戳的条目（QueueEmpty / GroupSyncFailed）静默跳过；
+                // 采样与日志均不参与接收分支。
+                if let Some(sample) = ws_latency_probe.observe(&item) {
+                    ws_latency::log_frame_to_loop(&sample);
+                }
                 // Bounded link-window probe: type + server timestamp only.
                 if tokio::time::Instant::now() < envelope_probe_until {
                     let (kind, server_ts) = match &item {
@@ -11933,7 +11944,18 @@ fn project_data_message(
         // E2：官方 isValidTapToView 同构校验——非法行补 viewOnceInvalid
         // （官方 isTapToViewInvalid 同位）。引擎 metadata-only 无字节可擦，
         // 只标记不擦除（compat §5）。
-        if !is_valid_view_once_row(data_message) {
+        if let Some(reason) = view_once_invalid_reason(data_message) {
+            // 诊断面（2026-11-12）：只记判据名与附件数，不含正文/文件名/账号。
+            // 用途：把「对方版本较旧，暂不能展示」的兜底分成 我们判严/官方新形状/消息损坏 三类。
+            tracing::warn!(
+                target: "engine.view_once",
+                stage = "view_once_invalid",
+                reason = reason,
+                attachments = data_message.attachments.len(),
+                has_quote = data_message.quote.is_some(),
+                has_sticker = data_message.sticker.is_some(),
+                "view-once row failed shape validation"
+            );
             out["viewOnceInvalid"] = json!(true);
         }
     }
@@ -12330,27 +12352,38 @@ fn project_data_message(
 /// JS `if (body)` 同口径：空串为 falsy 即合法）∧ 恰 1 附件 ∧ 媒体族
 /// image|video ∧ 无 quote/sticker/contact/preview。官方不查 mentions，接收
 /// 面同构不查（发送面 E1 更严：mentions 禁发，compat §5）。
-fn is_valid_view_once_row(data_message: &presage::proto::DataMessage) -> bool {
+/// 非法判据名（诊断面用；顺序即官方 isValidTapToView 的短路顺序）。
+/// 返回 `None` = 合法。文案只进日志，不上 wire。
+fn view_once_invalid_reason(data_message: &presage::proto::DataMessage) -> Option<&'static str> {
     if data_message
         .body
         .as_deref()
         .is_some_and(|body| !body.is_empty())
     {
-        return false;
+        return Some("body_non_empty");
     }
     if data_message.attachments.len() != 1 {
-        return false;
+        return Some("attachment_count");
     }
     let Some(content_type) = data_message.attachments[0].content_type.as_deref() else {
-        return false;
+        return Some("content_type_missing");
     };
     if !is_view_once_media(content_type) {
-        return false;
+        return Some("content_type_not_view_once");
     }
-    if data_message.quote.is_some() || data_message.sticker.is_some() {
-        return false;
+    if data_message.quote.is_some() {
+        return Some("has_quote");
     }
-    data_message.contact.is_empty() && data_message.preview.is_empty()
+    if data_message.sticker.is_some() {
+        return Some("has_sticker");
+    }
+    if !data_message.contact.is_empty() {
+        return Some("has_contact");
+    }
+    if !data_message.preview.is_empty() {
+        return Some("has_preview");
+    }
+    None
 }
 
 /// story 回复作者解析（Stories 接收批，E2）：author_aci_binary 16B UUID
@@ -19570,6 +19603,116 @@ mod tests {
         assert!(body.attachments.is_empty());
         assert!(body.delete.is_none());
         assert_eq!(body.timestamp, Some(7_777));
+    }
+
+    /// 诊断面：非法行必须报出具体判据名（顺序即官方短路顺序）。
+    #[test]
+    fn view_once_invalid_reason_names_the_failed_predicate() {
+        let image = presage::proto::AttachmentPointer {
+            content_type: Some("image/jpeg".to_owned()),
+            ..Default::default()
+        };
+        let audio = presage::proto::AttachmentPointer {
+            content_type: Some("audio/mp4".to_owned()),
+            ..Default::default()
+        };
+        let no_ct = presage::proto::AttachmentPointer::default();
+
+        let cases: Vec<(DataMessage, Option<&'static str>)> = vec![
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image.clone()],
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    body: Some("hi".to_owned()),
+                    attachments: vec![image.clone()],
+                    ..Default::default()
+                },
+                Some("body_non_empty"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![],
+                    ..Default::default()
+                },
+                Some("attachment_count"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image.clone(), audio.clone()],
+                    ..Default::default()
+                },
+                Some("attachment_count"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![no_ct],
+                    ..Default::default()
+                },
+                Some("content_type_missing"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![audio],
+                    ..Default::default()
+                },
+                Some("content_type_not_view_once"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image.clone()],
+                    quote: Some(Default::default()),
+                    ..Default::default()
+                },
+                Some("has_quote"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image.clone()],
+                    sticker: Some(Default::default()),
+                    ..Default::default()
+                },
+                Some("has_sticker"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image.clone()],
+                    contact: vec![Default::default()],
+                    ..Default::default()
+                },
+                Some("has_contact"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image],
+                    preview: vec![Default::default()],
+                    ..Default::default()
+                },
+                Some("has_preview"),
+            ),
+        ];
+
+        for (message, expected) in cases {
+            assert_eq!(
+                view_once_invalid_reason(&message),
+                expected,
+                "reason mismatch for {expected:?}"
+            );
+        }
     }
 
     /// 阅后即焚 E2：收投影对 viewOnce:true 行跑官方 isValidTapToView 同构

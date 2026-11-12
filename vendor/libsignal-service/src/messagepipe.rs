@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
 use futures::{
     channel::{
         mpsc::{self, Sender},
@@ -20,6 +23,127 @@ use crate::{
     websocket::{self, SignalWebSocket},
 };
 
+/// Receive-side evidence for one inbound websocket frame.
+///
+/// Captured where the transport hands a frame to the receive stack, carried
+/// with the envelope, and read again when the receive loop sees it. This is
+/// deliberately a plain copyable value: the probe must not add work or failure
+/// modes to the receive path.
+#[derive(Clone, Copy, Debug)]
+pub struct WsFrameStamp {
+    received_at: Instant,
+    seq: u64,
+    frame_bytes: usize,
+}
+
+impl WsFrameStamp {
+    /// Stamp one frame and give it a process-wide monotonic sequence number.
+    pub fn capture(frame_bytes: usize) -> Self {
+        static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+        Self {
+            received_at: Instant::now(),
+            seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
+            frame_bytes,
+        }
+    }
+
+    /// Build a stamp for tests or for callers that already timed the frame.
+    pub fn from_parts(
+        received_at: Instant,
+        seq: u64,
+        frame_bytes: usize,
+    ) -> Self {
+        Self {
+            received_at,
+            seq,
+            frame_bytes,
+        }
+    }
+
+    pub fn received_at(&self) -> Instant {
+        self.received_at
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub fn frame_bytes(&self) -> usize {
+        self.frame_bytes
+    }
+
+    /// Milliseconds from frame receipt to now (saturating, never panics).
+    pub fn delay_ms_until(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.received_at).as_millis() as u64
+    }
+}
+
+/// Frames logged unconditionally after a stream starts (cold-start evidence).
+pub const LATENCY_PROBE_WARMUP_FRAMES: u64 = 50;
+/// Minimum gap between sampled logs once the warmup window is over.
+pub const LATENCY_PROBE_MIN_INTERVAL: Duration = Duration::from_millis(200);
+/// Only a frame-to-loop delay at least this large escapes the steady-state
+/// filter (this is the local-queueing signal the probe exists for).
+pub const LATENCY_PROBE_DELAY_THRESHOLD_MS: u64 = 200;
+
+/// Sampling policy shared by the frame-received and frame-to-loop log sites.
+///
+/// Steady state stays quiet: the first LATENCY_PROBE_WARMUP_FRAMES frames
+/// are always logged, then at most one line per LATENCY_PROBE_MIN_INTERVAL.
+/// The loop-stage gate additionally requires
+/// LATENCY_PROBE_DELAY_THRESHOLD_MS so ordinary sub-200ms batching does not
+/// flood the log.
+#[derive(Debug, Default)]
+pub struct FrameLatencySampler {
+    observed: u64,
+    last_emit: Option<Instant>,
+}
+
+impl FrameLatencySampler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn warmup(&mut self, now: Instant) -> bool {
+        self.observed = self.observed.saturating_add(1);
+        if self.observed <= LATENCY_PROBE_WARMUP_FRAMES {
+            self.last_emit = Some(now);
+            return true;
+        }
+        false
+    }
+
+    fn interval_elapsed(&mut self, now: Instant) -> bool {
+        if self.last_emit.is_none_or(|last| {
+            now.saturating_duration_since(last) >= LATENCY_PROBE_MIN_INTERVAL
+        }) {
+            self.last_emit = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether to log ws_frame_received for the next frame.
+    pub fn should_log_received(&mut self, now: Instant) -> bool {
+        if self.warmup(now) {
+            return true;
+        }
+        self.interval_elapsed(now)
+    }
+
+    /// Whether to log ws_frame_to_loop for an envelope that took delay_ms.
+    pub fn should_log_loop(&mut self, delay_ms: u64, now: Instant) -> bool {
+        if self.warmup(now) {
+            return true;
+        }
+        if delay_ms < LATENCY_PROBE_DELAY_THRESHOLD_MS {
+            return false;
+        }
+        self.interval_elapsed(now)
+    }
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Incoming {
@@ -36,11 +160,18 @@ pub enum Incoming {
 pub struct EnvelopeAck {
     response: WebSocketResponseMessage,
     responder: oneshot::Sender<WebSocketResponseMessage>,
+    /// Receive time of the websocket frame that carried this envelope.
+    frame_stamp: Option<WsFrameStamp>,
     #[cfg(feature = "cdsi")]
     chat_responder: Option<libsignal_net::chat::ws::Responder>,
 }
 
 impl EnvelopeAck {
+    /// Frame receipt evidence carried alongside the envelope, when known.
+    pub fn frame_stamp(&self) -> Option<WsFrameStamp> {
+        self.frame_stamp
+    }
+
     /// Send the 200 ack. Returns false when the socket is already gone.
     pub fn ack(self) -> bool {
         #[cfg(feature = "cdsi")]
@@ -75,10 +206,13 @@ impl MessagePipe {
             .take_request_stream()
             .expect("web socket request handler not in use");
 
-        while let Some((request, responder)) = stream.next().await {
+        while let Some((request, responder, frame_stamp)) = stream.next().await
+        {
             // WebsocketConnection::onMessage(ByteString)
-            if let Some(env) =
-                self.process_request(request, responder).await.transpose()
+            if let Some(env) = self
+                .process_request(request, responder, frame_stamp)
+                .await
+                .transpose()
             {
                 sink.send(env).await?;
             } else {
@@ -95,6 +229,7 @@ impl MessagePipe {
         &mut self,
         request: WebSocketRequestMessage,
         responder: oneshot::Sender<WebSocketResponseMessage>,
+        frame_stamp: WsFrameStamp,
     ) -> Result<Option<Incoming>, ServiceError> {
         // Java: MessagePipe::read
         let response = WebSocketResponseMessage::from_request(&request);
@@ -117,6 +252,7 @@ impl MessagePipe {
                 EnvelopeAck {
                     response,
                     responder,
+                    frame_stamp: Some(frame_stamp),
                     #[cfg(feature = "cdsi")]
                     chat_responder: None,
                 },
@@ -175,6 +311,7 @@ pub fn decode_chat_incoming(
 ) -> Result<Option<Incoming>, ServiceError> {
     let request = incoming.message;
     let responder = incoming.responder;
+    let frame_stamp = incoming.frame_stamp;
 
     if request.is_signal_service_envelope() {
         let Some(body) = request.body.as_ref() else {
@@ -196,6 +333,7 @@ pub fn decode_chat_incoming(
             EnvelopeAck {
                 response: WebSocketResponseMessage::from_request(&request),
                 responder: responder_tx,
+                frame_stamp: Some(frame_stamp),
                 chat_responder: Some(responder),
             },
         )));
@@ -261,12 +399,24 @@ pub fn stream_from_chat(
 mod tests {
     use super::*;
 
+    fn stamp_ack(received_at: Instant) -> EnvelopeAck {
+        let (responder, _receiver) = oneshot::channel();
+        EnvelopeAck {
+            response: WebSocketResponseMessage::default(),
+            responder,
+            frame_stamp: Some(WsFrameStamp::from_parts(received_at, 7, 1234)),
+            #[cfg(feature = "cdsi")]
+            chat_responder: None,
+        }
+    }
+
     #[test]
     fn envelope_ack_writes_the_response_exactly_once() {
         let (responder, mut receiver) = oneshot::channel();
         let ack = EnvelopeAck {
             response: WebSocketResponseMessage::default(),
             responder,
+            frame_stamp: None,
             #[cfg(feature = "cdsi")]
             chat_responder: None,
         };
@@ -281,11 +431,82 @@ mod tests {
         let ack = EnvelopeAck {
             response: WebSocketResponseMessage::default(),
             responder,
+            frame_stamp: None,
             #[cfg(feature = "cdsi")]
             chat_responder: None,
         };
         drop(receiver);
 
         assert!(!ack.ack());
+    }
+
+    #[test]
+    fn stamped_envelope_computes_delay_from_capture_instant() {
+        let now = Instant::now();
+        let received_at = now
+            .checked_sub(Duration::from_millis(250))
+            .expect("clock is far enough from the epoch");
+        let ack = stamp_ack(received_at);
+
+        let stamp = ack.frame_stamp().expect("stamped envelope");
+        assert_eq!(stamp.seq(), 7);
+        assert_eq!(stamp.frame_bytes(), 1234);
+        assert_eq!(stamp.delay_ms_until(now), 250);
+        // Saturating: a clock reading earlier than receipt yields 0, not panic.
+        assert_eq!(stamp.delay_ms_until(received_at), 0);
+    }
+
+    #[test]
+    fn frame_sampler_warmup_logs_first_fifty_frames_then_throttles() {
+        let mut sampler = FrameLatencySampler::new();
+        let start = Instant::now();
+
+        for _ in 0..LATENCY_PROBE_WARMUP_FRAMES {
+            assert!(sampler.should_log_received(start));
+        }
+        assert!(!sampler.should_log_received(start + Duration::from_millis(199)));
+        assert!(sampler.should_log_received(start + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn frame_sampler_loop_gate_requires_delay_and_interval() {
+        let mut sampler = FrameLatencySampler::new();
+        let start = Instant::now();
+
+        for _ in 0..LATENCY_PROBE_WARMUP_FRAMES {
+            assert!(sampler.should_log_loop(0, start));
+        }
+        // Warmup is over: sub-threshold delay is dropped outright.
+        assert!(!sampler.should_log_loop(199, start));
+        // At/above the threshold it logs, then the interval throttles repeats.
+        assert!(sampler.should_log_loop(200, start + Duration::from_millis(200)));
+        assert!(!sampler.should_log_loop(200, start + Duration::from_millis(399)));
+        assert!(sampler.should_log_loop(200, start + Duration::from_millis(400)));
+    }
+
+    #[test]
+    fn incoming_envelope_carries_the_frame_stamp() {
+        let now = Instant::now();
+        let received_at = now
+            .checked_sub(Duration::from_millis(250))
+            .expect("clock is far enough from the epoch");
+        let incoming = Incoming::Envelope(Envelope::default(), stamp_ack(received_at));
+
+        match incoming {
+            Incoming::Envelope(_, ack) => {
+                let stamp = ack.frame_stamp().expect("stamped envelope");
+                assert_eq!(stamp.delay_ms_until(now), 250);
+                assert_eq!(stamp.seq(), 7);
+            },
+            Incoming::QueueEmpty => panic!("expected an envelope item"),
+        }
+    }
+
+    #[test]
+    fn frame_stamps_are_monotonic() {
+        let first = WsFrameStamp::capture(10);
+        let second = WsFrameStamp::capture(20);
+        assert!(second.seq() > first.seq());
+        assert_eq!(second.frame_bytes(), 20);
     }
 }

@@ -18,6 +18,7 @@ use tokio::time::Instant;
 use tracing::debug;
 
 use crate::configuration::SignalServers;
+use crate::messagepipe::{FrameLatencySampler, WsFrameStamp};
 use crate::prelude::PushService;
 use crate::proto::{
     web_socket_message, WebSocketMessage, WebSocketRequestMessage,
@@ -231,6 +232,7 @@ pub mod link;
 type RequestStreamItem = (
     WebSocketRequestMessage,
     oneshot::Sender<WebSocketResponseMessage>,
+    WsFrameStamp,
 );
 
 pub struct SignalRequestStream {
@@ -292,6 +294,17 @@ impl<C: WebSocketType> Clone for SignalWebSocket<C> {
     }
 }
 
+/// Read-only latency evidence: one line per sampled inbound frame.
+fn log_frame_received(stamp: &WsFrameStamp) {
+    tracing::warn!(
+        target: "engine.latency",
+        stage = "ws_frame_received",
+        seq = stamp.seq(),
+        frame_bytes = stamp.frame_bytes(),
+        "websocket frame received"
+    );
+}
+
 struct SignalWebSocketInner {
     stream: Option<SignalRequestStream>,
     // KT (single-connection): close code of the last server close frame, for
@@ -325,6 +338,9 @@ struct SignalWebSocketProcess {
     /// Keepalive cadence/response deadlines and the last successful response.
     keepalive: KeepAliveState,
 
+    /// Read-only frame-received sampling for the latency probe.
+    latency: FrameLatencySampler,
+
     outgoing_responses: FuturesUnordered<
         BoxFuture<'static, Result<WebSocketResponseMessage, Canceled>>,
     >,
@@ -341,6 +357,7 @@ impl SignalWebSocketProcess {
     async fn process_frame(
         &mut self,
         frame: Bytes,
+        frame_stamp: WsFrameStamp,
     ) -> Result<(), ServiceError> {
         use prost::Message;
         let msg = WebSocketMessage::decode(frame)?;
@@ -376,11 +393,12 @@ impl SignalWebSocketProcess {
             (Type::Request, Some(request), _) => {
                 let (sink, recv) = oneshot::channel();
                 tracing::trace!("sending request with body");
-                self.request_sink.send((request, sink)).await.map_err(
-                    |_| ServiceError::WsClosing {
+                self.request_sink
+                    .send((request, sink, frame_stamp))
+                    .await
+                    .map_err(|_| ServiceError::WsClosing {
                         reason: "request handler failed",
-                    },
-                )?;
+                    })?;
                 self.outgoing_responses.push(Box::pin(recv));
 
                 Ok(())
@@ -625,8 +643,14 @@ impl SignalWebSocketProcess {
                             self.shared.lock().unwrap().last_close_code = code;
                             break;
                         },
-                        WsEvent::Frame(frame) => {
-                            self.process_frame(frame).await?;
+                        WsEvent::Frame(frame, frame_stamp) => {
+                            if self
+                                .latency
+                                .should_log_received(std::time::Instant::now())
+                            {
+                                log_frame_received(&frame_stamp);
+                            }
+                            self.process_frame(frame, frame_stamp).await?;
                         }
                         WsEvent::Chat(_) => {
                             tracing::warn!("official chat event reached legacy process; ignoring");
@@ -698,6 +722,7 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             request_sink: incoming_request_sink,
             outgoing_requests: HashMap::default(),
             keepalive: KeepAliveState::new(Instant::now()),
+            latency: FrameLatencySampler::new(),
             // Initializing the FuturesUnordered with a `pending` future means it will never fuse
             // itself, so an "empty" FuturesUnordered will still allow new futures to be added.
             outgoing_responses: vec![
@@ -1055,6 +1080,7 @@ async fn run_official(
     use crate::websocket::chat_adapter::ChatEvent;
 
     let chat = socket.chat();
+    let mut latency = FrameLatencySampler::new();
     let mut acks: FuturesUnordered<BoxFuture<'static, ()>> =
         std::iter::once(Box::pin(futures::future::pending()) as BoxFuture<'static, ()>)
             .collect();
@@ -1103,8 +1129,20 @@ async fn run_official(
             event = socket.next().fuse() => {
                 match event {
                     Some(ChatEvent::Incoming(incoming)) => {
+                        if latency
+                            .should_log_received(std::time::Instant::now())
+                        {
+                            log_frame_received(&incoming.frame_stamp);
+                        }
                         let (ack_tx, ack_rx) = oneshot::channel();
-                        if request_sink.unbounded_send((incoming.message, ack_tx)).is_err() {
+                        if request_sink
+                            .unbounded_send((
+                                incoming.message,
+                                ack_tx,
+                                incoming.frame_stamp,
+                            ))
+                            .is_err()
+                        {
                             continue;
                         }
                         let responder = incoming.responder;

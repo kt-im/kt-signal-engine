@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use prost::Message as _;
 use libsignal_net::chat::{
     ChatConnection, ChatHeaders, RECOMMENDED_CHAT_WS_CONFIG,
 };
@@ -62,6 +63,7 @@ use libsignal_net::chat::RequestProto;
 use libsignal_net::chat::ws::Responder;
 use reqwest::StatusCode;
 
+use crate::messagepipe::WsFrameStamp;
 use crate::proto::WebSocketRequestMessage;
 use crate::websocket::request::ChatMessageConversionError;
 
@@ -70,6 +72,8 @@ use crate::websocket::request::ChatMessageConversionError;
 pub struct ChatIncoming {
     pub message: WebSocketRequestMessage,
     pub responder: Responder,
+    /// Receive-side timing for the frame that carried this request.
+    pub frame_stamp: WsFrameStamp,
 }
 
 /// Converts an official incoming request without touching its body.
@@ -84,9 +88,13 @@ pub fn map_request(request: RequestProto) -> WebSocketRequestMessage {
 }
 
 pub fn map_incoming(request: RequestProto, responder: Responder) -> ChatIncoming {
+    // The official listener exposes the decoded request, not the raw frame;
+    // its protobuf length is the closest wire-size evidence available here.
+    let frame_bytes = request.encoded_len();
     ChatIncoming {
         message: map_request(request),
         responder,
+        frame_stamp: WsFrameStamp::capture(frame_bytes),
     }
 }
 

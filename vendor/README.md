@@ -652,6 +652,21 @@
   保留、回滚脚本恢复 schema/UNIQUE 后可再前滚、重开幂等）；phase1 的两件
   断言改为「表已不存在」。
 
+- `src/messagepipe.rs`、`src/websocket/{mod.rs,link.rs,chat_adapter.rs}`、
+  `src/provisioning/pipe.rs`（2026-11-12 ws 延迟探针批，只读）— ①新增
+  `WsFrameStamp`（received_at/单调 seq/frame_bytes）：legacy 在
+  `WsLink::next_event` 读到 Binary 帧时捕获，official 在
+  `ChatEvent::Incoming` 的 listener 回调（`map_incoming`）捕获（帧长用
+  request protobuf `encoded_len` 近似，官方 listener 不透出原始 wire 帧）；
+  ②戳随 `RequestStreamItem`（新增第三元）穿到 `EnvelopeAck.frame_stamp`，
+  再随 presage `Received` 到 engine receive loop，provisioning pipe 仅
+  解构忽略该字段；③新增 `FrameLatencySampler`（前 50 帧恒打，此后
+  received 腿按 200ms 间隔、loop 腿按 delay_ms>=200 且 200ms 间隔采样），
+  收帧处打 `engine.latency stage="ws_frame_received"`，engine 处理点打
+  `stage="ws_frame_to_loop"`；接收语义/ack 时序/错误面零变化，日志不含
+  账号与内容。单测：`messagepipe::tests::stamped_envelope_*` /
+  `incoming_envelope_carries_the_frame_stamp` / `frame_sampler_*`。
+
 ## 更新纪律
 
 后续再动 `vendor/`：先 `diff -rq` 对照上表 rev 的 cargo checkout 确认

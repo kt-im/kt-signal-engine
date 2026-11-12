@@ -12,6 +12,7 @@ use futures::{SinkExt, StreamExt};
 use prost::Message as _;
 use reqwest_websocket::{CloseCode, Message, WebSocket};
 
+use crate::messagepipe::WsFrameStamp;
 use crate::proto::WebSocketMessage;
 use crate::websocket::chat_adapter::{
     ChatEvent, ChatIncoming, OfficialSocket,
@@ -19,7 +20,7 @@ use crate::websocket::chat_adapter::{
 use crate::websocket::WsWriteError;
 
 pub(crate) enum WsEvent {
-    Frame(Bytes),
+    Frame(Bytes, WsFrameStamp),
     #[allow(dead_code)] // consumed once the official listener is wired
     Chat(ChatIncoming),
     Closed(Option<u16>),
@@ -100,7 +101,8 @@ impl WsLink {
             Self::Legacy(ws) => loop {
                 match ws.next().await {
                     Some(Ok(Message::Binary(frame))) => {
-                        return WsEvent::Frame(frame);
+                        let stamp = WsFrameStamp::capture(frame.len());
+                        return WsEvent::Frame(frame, stamp);
                     }
                     Some(Ok(Message::Close { code, .. })) => {
                         return WsEvent::Closed(Some(u16::from(code)));
