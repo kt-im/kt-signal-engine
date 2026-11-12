@@ -850,7 +850,8 @@ connector 侧消费（把固定 stderr code 落进 `key_missing` / `data_corrupt
 
 1. **迁移器**（原 P2）：`storeMigrate` 子命令或启动前置阶段，把矩阵 c 的明文库一次性转加密
    （§4.2 五步 + §4.3 校验矩阵 + §4.5 回滚）；迁移完成后 `warn_plaintext_legacy_once` 的「待迁移」
-   语义即可移除。
+   语义即可移除。**正向已落地**（见本文件末尾「D1 状态」）；反向（`--direction to-plaintext`）
+   与 C-1 一起留 D2。
 2. **connector 接线**（走 connector 自己的仓库流程）：`src/engine.rs:2695-2697` 从 `env_remove`
    改为显式注入 `KT_SIGNAL_STORE_KEY`（key 来源 = bootstrap 第二行）；届时矩阵 b/d 才真正生效。
 3. **connector 侧消费固定码**：把 `event=store_open_failed code=…` 落进 `key_missing` /
@@ -1108,3 +1109,63 @@ DoD：pilot 账号行数/迁移账本/语义金样全一致；每个断点 kill 
    但没有实测过加密库上的迁移重入。
 6. **ADR 0006 的 `file:line` 已过期**：该文引用的 `store.rs:24-25/474-481/1766-1780` 在当前 checkout（`d491396`）
    已漂移到 `:59/608-641/2444-2467`。引用它时按本文索引，别照抄旧行号。
+
+#### D1 状态（2026-11-11，正向迁移器已落地，未 commit）
+
+> 触发：D 拆两批（**D1 正向** / D2 反向），本批只做正向。设计稿：
+> `docs/plan/engine-store-migration-design.md`（§2 命令面、§3 五步、§4 校验、§5 幂等、§9 失败矩阵、§10 验收）。
+
+| 项 | 落地 | 证据 |
+|---|---|---|
+| 命令面 | 同一二进制的新 argv 模式 `--data-dir <DIR> storeMigrate [--account <lk-hex>] [--direction to-encrypted] [--dry-run] [--json]`，与 `jsonRpc` 互斥、未知参数仍 exit 2 | `src/main.rs`（`store_migrate::route` 分流）、`src/store_migrate.rs` `route()`/`is_account_name()`；`tests/store_migrate.rs::cli_usage_errors_exit_2` |
+| 退出码 | 0 成功/noop/干跑、2 用法、10 可重试（空间、占用、瞬时 IO、并发持锁、**权限/只读 IO 读失败**——裁决 #14 与 C 同口径）、11 终态（缺 key、错 key、指纹不符、源库损坏、校验不过、**主库状态违规 `store_state_invalid`**、**data-dir 不存在**、账号消失、缺能力） | `src/store_migrate.rs` `EXIT_OK`/`EXIT_USAGE`/`EXIT_RETRY`/`EXIT_TERMINAL` / `MigrateReport::exit_code()` / `Failure::io()`；`permission_failures_are_retryable_not_terminal` |
+| 能力门 | `store_cipher::ensure_cipher_capable()` 是 `entry()` 的第一个动作，**早于 `logfile::init`**（连 `logs/` 都不建） | `entry()` |
+| 五步 | 残留清理 → `wal_checkpoint(TRUNCATE)`（读回 busy，偏离 D-2）→ `VACUUM INTO` 备份 + fsync → `ATTACH … KEY ?`（绑定参数）+ `sqlcipher_export` + 补 `user_version`/`application_id` → 校验矩阵 → **swap 前再 `wal_checkpoint(TRUNCATE)` 源库（busy≠0 或 WAL 非空 → 10，绝不删活帧）** → 删 sidecar + `rename` + fsync + marker | `migrate_plaintext()` / `attach_export()` / `checkpoint_source_quiet()` |
+| 幂等 | **文件头是唯一权威**（复用 `store_open::classify`）；`store.format` 只作审计与指纹；B4 窗口（rename 后无 marker）自动补写、B5 的 `*.tmp` 一律清；no-op 前先过 §5.5 健康闸（损坏 → `store_state_invalid`，不静默绿灯） | `migrate_account()` / `settle_encrypted()`；`second_run_is_a_byte_identical_noop`（单测 + 真进程各一条）、`corrupt_encrypted_store_is_state_invalid_not_noop` |
+| 校验矩阵 | 头非明文 / 无 key 打不开 / keyed 验真 / `integrity_check` / `foreign_key_check` / `cipher_integrity_check` / schema 集合 / 逐表行数 / `thread_messages` 抽样 / `_sqlx_migrations` 逐行 / `sqlite_sequence` / `user_version` / `application_id` / presage 语义 probe（**源侧只读取注册事实，要求 staging `Some` 且 ACI/设备名逐项相等**） | `verify_staging()` / `collect_stats()` / `read_registration_facts()` / `semantic_probe()`；`migrates_plaintext_store_and_verifies_the_matrix`、`semantic_probe_requires_matching_registration` |
+| 已迁移库的健康闸 | no-op 分支不只 probe 首页：`integrity_check` + `cipher_integrity_check` 不过 → 终态 `store_state_invalid`（保留现场、不 prune 备份） | `settle_encrypted()` / `verify_encrypted_integrity()`；`corrupt_encrypted_store_is_state_invalid_not_noop`、`cli_corrupt_encrypted_store_is_state_invalid` |
+| 干跑 | `--dry-run` 只出计划：`action=dry-run` / `code=store_migration_planned` / `backup=null` / `did=[]`，零写入 | `migrate_account()`；`dry_run_plans_without_writing`、`cli_dry_run_plans_without_writing` |
+| 崩溃可续 | 五个确定性断点（`after_backup`/`after_export`/`after_sidecar`/`after_rename`/`before_marker`，**仅 debug 构建**）+「先删 staging 再重做」；另有两条注入钩子 `corrupt_staging_rows`（验失败清理）与 `before_swap`（验 pre-swap checkpoint） | `fault_point()` / `fault_mutate_staging()` / `fault_inject_foreign_writer()`；`cli_fault_points_converge`、`cli_verify_failure_discards_staging_and_keeps_source_and_backup`、`cli_pre_swap_checkpoint_refuses_to_drop_live_wal_frames` |
+| 零写入 | 缺 key / 形状非法 / 空间不足 / 库被占用四条路径都不写库、不建备份与 staging | `missing_key_writes_nothing`、`invalid_key_shape_writes_nothing`、`insufficient_space_is_retryable_and_writes_nothing`、`busy_checkpoint_is_retryable_and_touches_nothing`、`cli_missing_key_exits_11_and_writes_nothing` |
+| 证据行 | 每账号一条 WARN，字段 `code/stage/account_tag/bytes/elapsed_ms/keyid`，无 key、无号码 | `emit_evidence()` |
+
+门禁实跑（本机 macOS aarch64 / rustc 1.99.0，全部实跑）：
+
+```text
+cargo fmt --all -- --check                        → 0（无 diff）
+cargo clippy --all-targets -- -D warnings         → 0（零 warning）
+cargo test --all-targets -- --test-threads=1      → 0：bin 693 passed / 4 ignored（既有 ignore）、
+                                                    tests/contract.rs 95 passed、tests/store_migrate.rs 14 passed
+                                                    （2026-11-11 审计修复批复跑；修复批新增 6 条可失败用例 + 3 条裁决用例）
+```
+
+**与设计稿的偏差（4 条，均已实测）**：
+
+1. **ATTACH 的建文件权限跟随主库连接**（SQLite ≥3.21）：D-1 的 `create_if_missing(false)` 会让 `ATTACH … AS encrypted` 拿不到 CREATE 权限（`SQLITE_CANTOPEN`）。落地改成「先由本进程建一个空 staging 文件，再交给 ATTACH + KEY」——空库正是 SQLCipher 生成随机盐的形态，D-1 的语义（不因路径打错而悄悄建源库）不变。
+2. **`sqlx::query` 对裸 `String` 有注入审计门**：带动态表名与 `PRAGMA schema.x` 的两处改走 `QueryBuilder`（表名仍按 SQLite 标识符规则转义）。
+3. **`-shm` 不算迁移写入**：SQLite 的连接共享内存每连接进出都会改写，「零写入」的判据取**库文件 + 备份 + staging**，不取 `-shm`（`busy_checkpoint_is_retryable_and_touches_nothing` 写明了这条边界）。
+4. **VACUUM 之后多一道备份闸**：SQLite 内核在个别页布局上会让 `VACUUM INTO` 的 step 失败，而 sqlx 仍把 `execute` 报成 Ok（本机复现：系统 sqlite3 3.54 写出的 12B reserved 页布局 → 目标文件 0 字节 + worker `MISUSE`）。备份是唯一回滚物，所以落地加了 `ensure_plaintext_backup()`（非空 + 明文头，不过就删掉半个备份并 exit 10）。该边界的 stderr 里仍会看到 sqlx 那句 panic（sqlx 对 `SQLITE_MISUSE` 的选择），但迁移器已收敛为**可重试失败、原库不动、无残留**；生产库全部由 presage/SQLCipher 写出（reserved 0），不走这条边界。
+
+**审计后修复批（D1-audit → task-3，2026-11-11）**：
+
+| # | 问题 | 修法 | 可失败用例（回滚该修法即红） |
+|---|---|---|---|
+| 1 | `--dry-run` 谎报 `action=migrate` / `code=store_migrated` / 备份名 | 干跑专用 `action=dry-run` + `code=store_migration_planned`，`backup=null` | `dry_run_plans_without_writing`、`cli_dry_run_plans_without_writing` |
+| 2 | argv 误吞：`--data-dir` 的**取值**被当成子命令 | `subcommand_position()` 跳过取值位置（`--data-dir`/`--receive-mode`/`--account`/`--direction`） | `argv_route_is_strict`（新增取值位置用例）、`cli_data_dir_named_store_migrate_still_starts_json_rpc` |
+| 3 | data-dir 不存在也 `ok:true`/exit 0 | 终态 11 + `store_migrate_data_dir_missing`，且不代建目录 | `missing_data_dir_is_terminal_and_creates_nothing`、`cli_missing_data_dir_exits_11` |
+| 4 | 语义校验空转（`Ok(None)` 也算通过，不比 ACI/设备名） | 源侧只读 `kv` 取注册事实，staging 必须 `Some` 且 ACI/设备名逐项相等 | `semantic_probe_requires_matching_registration`（漂移/丢行/多行三变体） |
+| 5 | 加密库只 probe 首页：页 HMAC/结构坏了仍报 noop/exit 0 | no-op 分支加 `integrity_check` + `cipher_integrity_check`，不过报 `store_state_invalid` | `corrupt_encrypted_store_is_state_invalid_not_noop`、`cli_corrupt_encrypted_store_is_state_invalid` |
+| 6 | verify 失败路径无注入用例 | debug 断点 `corrupt_staging_rows` 改 staging 行数：删 staging、留原库与备份、exit 11 | `cli_verify_failure_discards_staging_and_keeps_source_and_backup` |
+
+两条裁决同步落地：#14 权限/只读 IO 读失败统一 exit 10（设计 D-15 改口径，`permission_failures_are_retryable_not_terminal`）；
+#8 `--json` 的 `plan[]/did[]` 以设计 §10.2 为准改成**步骤名数组**（跨账号并集、规范顺序）；
+#10 swap 前再 checkpoint 一次源库再删 sidecar（`checkpoint_source_quiet()`，活帧 → exit 10 且不删 WAL，`cli_pre_swap_checkpoint_refuses_to_drop_live_wal_frames`）。
+
+**本批未做（明确留给下一批）**：
+
+1. **反向迁移（`--direction to-plaintext`）**：`entry()` 以 exit 2 明确拒绝；往返一致性属 D2。
+2. **C-1（明文 + 有 key → 终态 `StorePlaintextRequiresMigration`）**：本批不动 `open_store_with`（矩阵 c 与既有断言保持原样）。它与连接器注入 key（`src/engine.rs:2695-2697` 的 `env_remove`）必须同批做，否则只是把「静默明文」换成「静默起不来」。
+3. **指标词表（§10.7 的 `timings.store_migrate_*` / `counters.store_migrate_*`）**：本批只落滚动日志证据行，`perf_metrics` 的封闭词表未扩（扩词表要同步漂移单测）。
+4. **`KT_ENGINE_STORE_MIGRATE` 三档开关与连接器编排（§2.3）**：跨仓，走 connector 自己的流程。
+5. **50 轮随机 kill 属性测试（§10.4）**：确定性 5 断点已覆盖收敛；随机杀循环与「无第三态」谓词留给 D2 一起做（那时才有往返谓词可断言）。
+

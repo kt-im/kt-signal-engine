@@ -101,6 +101,8 @@ kt-signal-engine --data-dir <DIR> storeMigrate [--account <lk-hex>] [--direction
 ~~~
 
 - 与现有 `jsonRpc` 模式**互斥**；未知参数/两种模式同时出现仍 exit 2（`src/main.rs:123-165` 的严格口径不变）。
+- **子命令只认非取值位置**：`--data-dir` / `--receive-mode` / `--account` / `--direction` 的取值位置不参与子命令识别——
+  一个叫 `storeMigrate` 的 data-dir（`--data-dir storeMigrate jsonRpc`）必须照常按 `jsonRpc` 启动，否则合法启动被误判成迁移模式 exit 2。
 - 模式内**不读 stdin、不写 stdout 协议帧**；`--json` 时 stdout 只输出一份结果 JSON（一行），其余证据走滚动日志与 stderr。
 - 同一份 `main.rs` 装配：先 `logfile::init`（`:483`）→ 能力门证据（`:489`，SQLCipher 构建断言，防"feature 没开、`PRAGMA key` 静默 no-op"）→ 再进迁移器。**能力门在迁移器里是硬门**，不是提示。
 
@@ -109,9 +111,9 @@ kt-signal-engine --data-dir <DIR> storeMigrate [--account <lk-hex>] [--direction
 | 字段 | 类型 | 含义 |
 |---|---|---|
 | `ok` | bool | 全部账号成功才 true |
-| `accounts[]` | array | 每个账号一条：`lk`（目录名）、`action`（`migrate`/`noop`/`absent`/`failed`）、`code`、`bytes`、`elapsedMs`、`keyid`、`backup`（文件名或 null） |
+| `accounts[]` | array | 每个账号一条：`lk`（目录名）、`action`（`migrate`/`dry-run`/`noop`/`absent`/`failed`）、`code`、`bytes`、`elapsedMs`、`keyid`、`backup`（文件名或 null；**干跑恒 null**）、`checks`（本次实际通过的校验项名） |
 | `freeBytes` / `needBytes` | number | 预检读数（失败时是证据，不是猜测） |
-| `plan[]` / `did[]` | array | `--dry-run` 只有 `plan`；实跑两者都有，便于对账 |
+| `plan[]` / `did[]` | array | **步骤名数组**（`checkpoint`/`backup`/`export`/`verify`/`swap` 的规范顺序）。多账号取并集；`--dry-run` 只有 `plan`（且 `action=dry-run`、`code=store_migration_planned`、`backup=null`），实跑两者都有，便于对账 |
 
 为什么单独一个模式而不是启动内联：迁移器要能被**连接器按槽单独计时/单独失败/单独重试**，也要能被支持人员拿同一个二进制在副本上演练（`--dry-run`）。它不该继承引擎的请求超时、watchdog 与重启预算。
 
@@ -140,10 +142,10 @@ connector.supervisor.start_slot(account)
 
 | 码 | 含义 | 连接器动作 |
 |---|---|---|
-| 0 | 成功 / 无事可做（`noop`） | 继续起引擎 |
+| 0 | 成功 / 无事可做（`noop`），或干跑（`action=dry-run`） | 继续起引擎 |
 | 2 | 用法错误 | 不重试（属集成 bug） |
-| 10 | **可重试**：空间不足、库被占用、瞬时 I/O 失败 | 退避重试 ≤3 次；仍失败 → 上报 |
-| 11 | **终态**：key 缺失/不匹配、源库损坏、校验不过、权限拒绝、账号目录消失 | 标 `migration_blocked`，不重启，桌面可提示 |
+| 10 | **可重试**：空间不足、库被占用（含 swap 前 WAL 折不进去）、瞬时 I/O 失败、**权限/只读 IO 读失败**（D-15 口径，与 C 一致） | 退避重试 ≤3 次；仍失败 → 上报 |
+| 11 | **终态**：key 缺失/不匹配、源库损坏、校验不过、主库状态违规（`store_state_invalid`：加密库完整性/页 HMAC 不过）、data-dir 不存在、账号目录消失 | 标 `migration_blocked`，不重启，桌面可提示 |
 
 ---
 
@@ -226,6 +228,7 @@ exit 11，**不替换**。
 ### 3.4 Step 4：替换（sidecar → rename → marker）
 
 ~~~text
+wal_checkpoint(TRUNCATE) + busy=0 # 删 sidecar 之前再收口一次源库（裁决 #10）
 remove_sidecars(store.db)         # -wal / -shm / -journal（明文残留会让加密库下次打不开）
 rename(store.db.encrypting → store.db)
 fsync(父目录)
@@ -335,9 +338,11 @@ magic=KTSF ver=1 state=sqlcipher-v1 keyid=<8hex> fp=<8hex> at=<unixms> tool=<eng
 
 | 输入 | 结局 | 证据行 |
 |---|---|---|
+| 明文（`--dry-run`） | 只出计划，exit 0，零字节改动 | `action=dry-run` / `code=store_migration_planned` |
 | 明文 | 迁移 → 加密 | `code=store_migrated` |
-| 加密且 key 打得开 | **no-op**，exit 0，零字节改动 | `code=store_migration_noop` |
+| 加密、key 打得开且§5.5 谓词成立 | **no-op**，exit 0，零字节改动 | `code=store_migration_noop` |
 | 加密但 key 打不开 | 终态 exit 11，**不**重建、**不**迁移 | `code=store_key_rejected` |
+| 加密、打得开但完整性不过（`integrity_check`≠ok 或 `cipher_integrity_check` 非空） | 终态 exit 11，保留全部现场（不 prune 备份） | `code=store_state_invalid` |
 | 不存在/长度 0 | no-op（新建是 C 的事） | `code=store_migration_absent` |
 
 "零字节改动"要能被验收断言（§10.2 的 `snap` 前后 diff 为空），否则"幂等"只是口号。
@@ -544,11 +549,13 @@ C-1 是唯一会改变 C 已落地行为的请求，必须由 C 的 owner 确认
 | D-12 | staging/备份残留 | 每次运行第一步 | 删 staging + sidecar；备份按"主库已加密"才删 | 收敛 | 0 |
 | D-13 | sidecar 残留（`-wal/-shm`） | 替换前 | 与 rename 同一步删除 | 加密库可打开 | 0 |
 | D-14 | 跨文件系统 rename（EXDEV） | P7 断言同目录 | 拒绝 | 原样 | 11 |
-| D-15 | 权限/只读文件系统 | 打开或写失败 EACCES/EROFS | 零写入 | 原样 | 11 |
+| D-15 | 权限/只读文件系统 | 打开或写失败 EACCES/EROFS | 零写入 | 原样 | **10**（裁决 #14：与 C 的 `StoreOpenFailed` 同口径；这类失败多为槽还没 chown/挂载未就位，退避重试能自愈，归终态会把槽误标成 `migration_blocked`） |
 | D-16 | Windows 句柄未释放（sharing violation） | rename 失败 | 保留明文，等下次 | 原样 | 10 |
 | D-17 | 两个迁移器并发 | flock 非阻塞失败 | 立即退出 | 由先到者收敛 | 10 |
 | D-18 | 迁移中账号目录被删（并发 deleteAccount） | ENOENT | **不重建目录**，报 `account_vanished` | 无（已删） | 11 |
 | D-19 | 校验不过（任一项） | §4 矩阵 | 删 staging，保留原库与备份 | 原样 | 11 |
+| D-20 | data-dir 不存在（路径打错/槽没建/挂载丢） | `run()` 的第一条前置 | **不代建目录**、不建锁/日志 | 不变（目录仍不存在） | 11（`store_migrate_data_dir_missing`） |
+| D-21 | 加密库打得开但完整性/页 HMAC 不过（§5.5 违规） | no-op 分支的 `integrity_check` + `cipher_integrity_check` | 保留全部现场，**不** prune 备份、**不**重建 | 原样 | 11（`store_state_invalid`） |
 
 > 分类原则：**10 = 等一等还能成；11 = 等人**。连接器只需要认这两个数，不需要解析文案。
 
@@ -572,7 +579,9 @@ ls -l "[DIR]/accounts/[LK]/"                        # 期望：无 .encrypting /
 
 ~~~bash
 KT_SIGNAL_STORE_KEY=[KEK] [BIN] --data-dir "[DIR]" storeMigrate --dry-run --json
-# 期望：exit 0；JSON 里 action=migrate、bytes、free、keyid、plan=[checkpoint,backup,export,verify,swap]
+# 期望：exit 0；JSON 里 accounts[0].action=dry-run、code=store_migration_planned、backup=null、bytes、keyid，
+#       plan=[checkpoint,backup,export,verify,swap]（顶层步骤名数组），did=[]
+#      （干跑**不许**报 action=migrate / code=store_migrated / backup，否则连接器会以为替换已完成）
 
 KT_SIGNAL_STORE_KEY=[KEK] [BIN] --data-dir "[DIR]" storeMigrate --account [LK] --json
 # 期望：exit 0；code=store_migrated

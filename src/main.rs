@@ -70,6 +70,9 @@ mod store_encryption_tests;
 /// M6 C 阶段：store key 通道（`KT_SIGNAL_STORE_KEY` 的形状解析 + 进程内三态；
 /// 设计见 docs/plan/engine-store-encryption.md §7「C 阶段」）。
 mod store_key;
+/// M6 D1：明文 store.db → 加密库的**正向**迁移器（同一二进制的新 argv 模式
+/// `storeMigrate`；设计见 docs/plan/engine-store-migration-design.md）。
+mod store_migrate;
 /// M6 C 阶段：store 文件状态分类 + 打开失败的结构化错误码（connector 可区分
 /// 的固定码面；同一份设计文档 §3.4 决策表 / §7 C 阶段）。
 mod store_open;
@@ -121,7 +124,9 @@ pub(crate) const INBOUND_PENDING_BYTES_BUDGET: usize = 2 * MAX_LINE_BYTES;
 pub(crate) const INFLIGHT_REQUEST_LIMIT: usize = 8;
 
 const USAGE: &str = "usage: kt-signal-engine --data-dir <dir> jsonRpc \
-[--receive-mode <mode>] [--ignore-attachments] [--ignore-stories] [--ignore-stickers]";
+[--receive-mode <mode>] [--ignore-attachments] [--ignore-stories] [--ignore-stickers]\n       \
+kt-signal-engine --data-dir <dir> storeMigrate [--account <lk-hex>] \
+[--direction to-encrypted] [--dry-run] [--json]";
 
 struct LaunchArgs {
     data_dir: PathBuf,
@@ -480,7 +485,21 @@ fn report_single_account_violation(accounts: usize) {
 // 取舍（设计 §13 决策 8）。
 #[tokio::main(flavor = "current_thread")]
 async fn amain() -> ExitCode {
-    let args = match parse_launch_args(std::env::args_os().skip(1)) {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // M6 D1：`storeMigrate` 是同一二进制的新 argv 模式（迁移设计 §2.2）。分流
+    // 必须在既有严格解析之前，且**早于任何磁盘动作**——迁移器自己把能力门排在
+    // 第一个动作（连 logs/ 都还没建）。两种模式同时出现仍走 exit 2。
+    match store_migrate::route(&argv) {
+        Ok(store_migrate::Route::Migrate(migrate_args)) => {
+            return store_migrate::entry(migrate_args).await;
+        }
+        Ok(store_migrate::Route::JsonRpc) => {}
+        Err(()) => {
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    }
+    let args = match parse_launch_args(argv.into_iter()) {
         Ok(args) => args,
         Err(()) => {
             eprintln!("{USAGE}");
