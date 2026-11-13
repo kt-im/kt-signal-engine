@@ -50,6 +50,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # libsqlite3-sys 在 Linux 上走 bundled-sqlcipher（系统 crypto），sqlite3.c
+      # 用系统 OpenSSL 头文件编译，链接也必须解析到同一份系统 libcrypto。只装
+      # libssl-dev 而不设 OPENSSL_NO_VENDOR，避免「头文件 3.x + 库 1.1.x」混搭
+      # （此前两次失败分别是 EVP_MAC_* 与 EVP_CIPHER_get_* undefined）。
       - name: install protoc and libssl-dev
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
 
