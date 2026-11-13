@@ -1319,10 +1319,20 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
             ServiceError::RateLimitExceeded { retry_after } => SendError::RateLimited {
                 retry_after_secs: retry_after.map(|d| d.num_seconds().max(0) as u64),
             },
-            ServiceError::ProofRequiredError(proof) => SendError::ProofRequired {
-                token: Some(proof.token.clone()),
-                options: proof.options.clone(),
-            },
+            ServiceError::ProofRequiredError(proof) => {
+                // BUG-16 proof 观测（2026-11-13）：挑战类型词表决定后续动作
+                // （push=全自动 / recaptcha 等=人工）。只落类型词，token 与
+                // 号码绝不入日志。
+                tracing::warn!(
+                    target: "engine.proof",
+                    options = ?proof.options,
+                    "server requires a proof challenge"
+                );
+                SendError::ProofRequired {
+                    token: Some(proof.token.clone()),
+                    options: proof.options.clone(),
+                }
+            }
             ServiceError::UnhandledResponseCode { status, .. } if status.as_u16() >= 500 => {
                 SendError::ServerUnavailable
             }
