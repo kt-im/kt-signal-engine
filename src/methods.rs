@@ -5502,6 +5502,10 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
         // 面——-32010 数字码（不与 -1 通用 upstream 面撞码），connector 只
         // 映射这一个码，-32603 全透传（boot_send_integrity 契约保持）。
         SendError::UnregisteredRecipient => (-32010, "UNREGISTERED_RECIPIENT"),
+        // BUG-16 2a 终极批：CDS 自身失败的可重试专用面——connector 未知
+        // 此码自然折叠通用 upstream（retryable=true 进自动重试），绝不落
+        // 「未注册」文案；后续文案契约可按码收窄。
+        SendError::CdsUnavailable => (-32011, "CDS_UNAVAILABLE"),
         SendError::TargetTerminated => (-1, "SEND_TARGET_TERMINATED"),
         SendError::AnnouncementsOnly => (-1, "SEND_TARGET_ANNOUNCEMENTS_ONLY"),
         SendError::Unbound => (-32603, USER_UNBOUND_MESSAGE),
@@ -5558,6 +5562,15 @@ mod tests {
         let (code, message) = send_error_face(&crate::service::SendError::UnregisteredRecipient);
         assert_eq!(code, -32010);
         assert_eq!(message, "UNREGISTERED_RECIPIENT");
+    }
+
+    /// BUG-16 2a 终极批：CDS 自身失败面 -32011（可重试）——与 -32010
+    /// （服务端确证未注册）严格分家。
+    #[test]
+    fn send_error_face_pins_cds_unavailable() {
+        let (code, message) = send_error_face(&crate::service::SendError::CdsUnavailable);
+        assert_eq!(code, -32011);
+        assert_eq!(message, "CDS_UNAVAILABLE");
     }
 
     /// 双槽 QR 轮换（engine 侧 additive，2026-11-11 批）：rotateLink 的

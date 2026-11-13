@@ -1145,6 +1145,12 @@ pub(crate) enum SendError {
     /// 实证）。专用面 -32010 + UNREGISTERED_RECIPIENT（数字码无歧义，
     /// 不与 -1 通用 upstream 面撞码）；确定性失败不重试。
     UnregisteredRecipient,
+    /// CDS 联系人发现自身失败（传输/认证/超时——**服务端没答**，与
+    /// UnregisteredRecipient 的「服务端确证未注册」严格区分）。BUG-16
+    /// 2a 终极批（2026-11-13，CDS 三级梯）：可重试面 -32011 +
+    /// CDS_UNAVAILABLE——connector 未知此码自然折叠通用 upstream 可重试
+    /// 臂，绝不落「未注册」文案（2b 打回教训的前置化）。
+    CdsUnavailable,
     /// 目标群已终止（官方 shouldSendToConversation terminated 位硬拒；错误
     /// 面 `-1` + `SEND_TARGET_TERMINATED`，compat §3）。
     TargetTerminated,
@@ -1590,6 +1596,7 @@ pub(crate) fn send_error_variant_face(error: &SendError) -> &'static str {
     match error {
         SendError::UnknownAccount => "SendError::UnknownAccount",
         SendError::UnregisteredRecipient => "SendError::UnregisteredRecipient",
+        SendError::CdsUnavailable => "SendError::CdsUnavailable",
         SendError::TargetTerminated => "SendError::TargetTerminated",
         SendError::AnnouncementsOnly => "SendError::AnnouncementsOnly",
         SendError::Unbound => "SendError::Unbound",
@@ -3065,6 +3072,10 @@ pub(crate) mod cloud_upload;
 pub(crate) struct Service {
     data_dir: PathBuf,
     real: bool,
+    /// BUG-16 CDS 三级梯（2a 终极批，2026-11-13）：号码→身份的线上发现
+    /// 门——灰度开关/熔断/负缓存全进程内存（每账号一引擎=账号隔离天然
+    /// 成立）。默认关（KT_ENGINE_CDS_ENABLED 缺席=本地语义不变）。
+    cds_gate: CdsGate,
     state: Arc<AsyncMutex<EngineState>>,
     /// receive 通知出口（与 JSON-RPC 响应同一 stdout writer 队列；帧协议
     /// 见 main::OutboundFrame——Notice 直通，Flush 背压栅栏）。全局队列
@@ -3321,6 +3332,7 @@ impl Service {
         Arc::new(Self {
             data_dir,
             real,
+            cds_gate: CdsGate::from_env(),
             state,
             outbound,
             inner: AsyncMutex::new(Inner {
@@ -4728,9 +4740,9 @@ impl Service {
         for number in recipients {
             let send_one = async {
                 let probe_resolve_t0 = std::time::Instant::now();
-                let service_id = resolve_recipient(&manager, number)
-                    .await
-                    .ok_or(SendError::UnregisteredRecipient)?;
+                let service_id = self
+                    .resolve_recipient_for_send(&mut manager, number)
+                    .await?;
                 tracing::warn!(
                     target: "send_latency_probe",
                     stage = "engine.resolve",
@@ -4858,9 +4870,9 @@ impl Service {
         // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
         let whitelist = profile_sharing_whitelist(self, account).await;
         for number in recipients {
-            let service_id = resolve_recipient(&manager, number)
-                .await
-                .ok_or(SendError::UnregisteredRecipient)?;
+            let service_id = self
+                .resolve_recipient_for_send(&mut manager, number)
+                .await?;
             // P9 身份拒发闸（撤回同为内容面）。
             identity_send_gate(&account_dir, &service_id)?;
             // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -5028,9 +5040,9 @@ impl Service {
             .await
             .ok_or(SendError::Internal)?;
         // 目的地 = story 作者会话（号码/UUID 双形态收敛同一 ServiceId）。
-        let service_id = resolve_recipient(&manager, story_author)
-            .await
-            .ok_or(SendError::UnregisteredRecipient)?;
+        let service_id = self
+            .resolve_recipient_for_send(&mut manager, story_author)
+            .await?;
         // P9 身份拒发闸（story 反应同为直聊内容发送）。
         identity_send_gate(&account_dir, &service_id)?;
         // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -5124,9 +5136,9 @@ impl Service {
             .await
             .ok_or(SendError::Internal)?;
         for number in recipients {
-            let service_id = resolve_recipient(&manager, number)
-                .await
-                .ok_or(SendError::UnregisteredRecipient)?;
+            let service_id = self
+                .resolve_recipient_for_send(&mut manager, number)
+                .await?;
             // P9 身份拒发闸（回应面同为直聊内容发送）。
             identity_send_gate(&account_dir, &service_id)?;
             // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -5464,9 +5476,9 @@ impl Service {
             .ok_or(SendError::Internal)?;
         let aci_bytes = aci_to_bytes(&target_aci).ok_or(SendError::Internal)?;
         for number in recipients {
-            let service_id = resolve_recipient(&manager, number)
-                .await
-                .ok_or(SendError::UnregisteredRecipient)?;
+            let service_id = self
+                .resolve_recipient_for_send(&mut manager, number)
+                .await?;
             // P9 身份拒发闸（pin/unpin 同为直聊内容发送）。
             identity_send_gate(&account_dir, &service_id)?;
             // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -5504,9 +5516,9 @@ impl Service {
         // land in the vendored self-None path and fail this RPC (-32603).
         let own = ServiceId::from(manager.registration_data().service_ids.aci());
         for number in recipients {
-            let service_id = resolve_recipient(&manager, number)
-                .await
-                .ok_or(SendError::UnregisteredRecipient)?;
+            let service_id = self
+                .resolve_recipient_for_send(&mut manager, number)
+                .await?;
             if service_id == own {
                 continue;
             }
@@ -5550,9 +5562,9 @@ impl Service {
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
-        let service_id = resolve_recipient(&manager, recipient)
-            .await
-            .ok_or(SendError::UnregisteredRecipient)?;
+        let service_id = self
+            .resolve_recipient_for_send(&mut manager, recipient)
+            .await?;
         // P9 身份拒发闸（官方 conversationJobQueue 对 untrusted 目标取消
         // Receipts 任务同位——conversationJobQueue.preload.ts:1141-1146；
         // 自动 delivery receipt flush 复用本面，失败静默弃批）。
@@ -5957,9 +5969,9 @@ impl Service {
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
-        let service_id = resolve_recipient(&manager, recipient)
-            .await
-            .ok_or(SendError::UnregisteredRecipient)?;
+        let service_id = self
+            .resolve_recipient_for_send(&mut manager, recipient)
+            .await?;
         // P9 身份拒发闸（直聊通话信令臂；群臂走群发送通路不在此闸）。
         identity_send_gate(&account_dir, &service_id)?;
         let timestamp = now_ms();
@@ -6032,9 +6044,9 @@ impl Service {
         let mut manager = lock_registered_for_send(&shared).await;
         let conversation_bytes = match &event.conversation {
             CallEventConversation::Direct(recipient) => {
-                let service_id = resolve_recipient(&manager, recipient)
-                    .await
-                    .ok_or(SendError::UnregisteredRecipient)?;
+                let service_id = self
+                    .resolve_recipient_for_send(&mut manager, recipient)
+                    .await?;
                 aci_to_bytes(&service_id.service_id_string()).ok_or(SendError::Internal)?
             }
             CallEventConversation::Group(bytes) | CallEventConversation::AdHoc(bytes) => {
@@ -6101,9 +6113,9 @@ impl Service {
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
-        let service_id = resolve_recipient(&manager, recipient)
-            .await
-            .ok_or(SendError::UnregisteredRecipient)?;
+        let service_id = self
+            .resolve_recipient_for_send(&mut manager, recipient)
+            .await?;
         // P9 身份拒发闸（直聊内容面同纪律）。
         identity_send_gate(&account_dir, &service_id)?;
         let timestamp = now_ms();
@@ -6177,9 +6189,9 @@ impl Service {
         let whitelist = profile_sharing_whitelist(self, account).await;
         let mut results = Vec::new();
         for number in recipients {
-            let service_id = resolve_recipient(&manager, number)
-                .await
-                .ok_or(SendError::UnregisteredRecipient)?;
+            let service_id = self
+                .resolve_recipient_for_send(&mut manager, number)
+                .await?;
             // P9 身份拒发闸（编辑同为内容面）。
             identity_send_gate(&account_dir, &service_id)?;
             let include_profile_key = include_profile_key_for(&whitelist, &service_id);
@@ -7085,9 +7097,9 @@ impl Service {
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
-        let service_id = resolve_recipient(&manager, recipient)
-            .await
-            .ok_or(SendError::UnregisteredRecipient)?;
+        let service_id = self
+            .resolve_recipient_for_send(&mut manager, recipient)
+            .await?;
         let mut store = manager.store().clone();
         // 未注册联系人拒绝：contacts 表必须已有该收件人行（UUID 形态直通
         // 也不例外——无行 = presage 持久化面静默 no-op，宁拒不哑改）。
@@ -15768,6 +15780,176 @@ pub(crate) async fn open_registered_with_dir(
 /// 号码，self 不在手机 contacts 表是常态，compat §5）；其余号码走 contacts
 /// 数字位匹配（链接后手机端立即推送同步）。冷启动窗口内未命中返回 None
 /// （发送按内部失败处理，compat §5）。
+/// BUG-16 CDS 三级梯（2a 终极批，2026-11-13）：本地解析 miss 后的
+/// 号码→身份线上发现门。七条工程约束（dsh 04:57/04:59 定案）落点：
+/// ①灰度默认关（`KT_ENGINE_CDS_ENABLED` 非 0 才开）②CDS 自身失败
+/// （传输/认证/超时）→ `CdsUnavailable`(-32011 可重试)，**服务端答
+/// None 才是 UnregisteredRecipient**——绝不把网络问题说成未注册
+/// ③负缓存 TTL（服务端确证的 miss 5 分钟内不再打，CDS 上游限流）
+/// ④连续 3 次失败熔断 5 分钟（CDS 是网络+SGX 路径）⑤单次查询 10s
+/// 上限（对齐 libsignal 控制面 connect 预算，慢网不卡死正常发送）
+/// ⑥出口：vendor CDSI 批已让 discover_contacts 走 `ALL_PROXY`
+/// （socks5/http），引擎 `setup_proxy_env` 按账号落位——无需新改造
+/// ⑦探针 `engine.cds`（warn 级，engine 日志面只出 warn 的教训）。
+struct CdsGate {
+    enabled: bool,
+    negative: StdMutex<HashMap<String, std::time::Instant>>,
+    consecutive_failures: StdMutex<u32>,
+    open_until: StdMutex<Option<std::time::Instant>>,
+}
+
+/// 熔断阈值：连续失败 3 次开闸。
+const CDS_BREAKER_FAILURES: u32 = 3;
+/// 熔断 + 负缓存共用窗（秒）。
+const CDS_TTL_SECS: u64 = 300;
+/// 单次 CDS 查询上限（对齐 libsignal 控制面 connect 预算 10s）。
+const CDS_QUERY_TIMEOUT_SECS: u64 = 10;
+
+impl CdsGate {
+    fn from_env() -> Self {
+        Self {
+            enabled: std::env::var("KT_ENGINE_CDS_ENABLED")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
+            negative: StdMutex::new(HashMap::new()),
+            consecutive_failures: StdMutex::new(0),
+            open_until: StdMutex::new(None),
+        }
+    }
+
+    /// 纯决策（单测面）：本次 miss 后要不要发起 CDS。
+    fn should_query(&self, number: &str, now: std::time::Instant) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if let Some(open) = *self.open_until.lock().expect("cds breaker") {
+            if now < open {
+                return false;
+            }
+        }
+        match self.negative.lock().expect("cds negative").get(number) {
+            Some(until) => now >= *until,
+            None => true,
+        }
+    }
+
+    fn record_cds_miss(&self, number: &str, now: std::time::Instant) {
+        let until = now + std::time::Duration::from_secs(CDS_TTL_SECS);
+        self.negative
+            .lock()
+            .expect("cds negative")
+            .insert(number.to_string(), until);
+        *self.consecutive_failures.lock().expect("cds failures") = 0;
+    }
+
+    fn record_cds_failure(&self, now: std::time::Instant) {
+        let mut failures = self.consecutive_failures.lock().expect("cds failures");
+        *failures += 1;
+        if *failures >= CDS_BREAKER_FAILURES {
+            *self.open_until.lock().expect("cds breaker") =
+                Some(now + std::time::Duration::from_secs(CDS_TTL_SECS));
+            *failures = 0;
+        }
+    }
+
+    fn record_cds_success(&self, number: &str) {
+        self.negative.lock().expect("cds negative").remove(number);
+        *self.consecutive_failures.lock().expect("cds failures") = 0;
+    }
+}
+
+impl Service {
+    /// BUG-16 三级梯的发送侧入口：本地（UUID/本机号/contacts 数字位）
+    /// → CDS 线上发现（灰度/熔断/负缓存门后，单次 10s）→ 诚实失败。
+    /// UUID 形态与本机号首两臂永不进 CDS；本地命中也永不进 CDS——
+    /// 「只在本地解析 miss 后调一次」。
+    async fn resolve_recipient_for_send(
+        self: &Arc<Self>,
+        manager: &mut Manager<SqliteStore, Registered>,
+        recipient: &str,
+    ) -> Result<presage::libsignal_service::protocol::ServiceId, SendError> {
+        // 首臂：UUID 直解（与 resolve_recipient 同判据）。
+        if let Some(service_id) =
+            presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(
+                recipient.trim(),
+            )
+        {
+            return Ok(service_id);
+        }
+        // 本地梯（本机号 + contacts 数字位）。
+        if let Some(service_id) = resolve_recipient(manager, recipient).await {
+            return Ok(service_id);
+        }
+        // 裸号码 miss：CDS 门判（灰度关/熔断开/负缓存新鲜 → 本地语义
+        // 等价答 UnregisteredRecipient——灰度默认关时全程零行为变化）。
+        let now = std::time::Instant::now();
+        if !self.cds_gate.should_query(recipient, now) {
+            return Err(SendError::UnregisteredRecipient);
+        }
+        let started = std::time::Instant::now();
+        let lookup = tokio::time::timeout(
+            std::time::Duration::from_secs(CDS_QUERY_TIMEOUT_SECS),
+            manager.discover_contacts_by_phone_number([recipient]),
+        )
+        .await;
+        let outcome = match lookup {
+            // 查询自身超时：可重试面，不判未注册。
+            Err(_elapsed) => {
+                self.cds_gate.record_cds_failure(now);
+                tracing::warn!(
+                    target: "engine.cds",
+                    stage = "query",
+                    outcome = "timeout",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "CDS discovery timed out (retryable, never unregistered)"
+                );
+                return Err(SendError::CdsUnavailable);
+            }
+            Ok(Err(error)) => {
+                self.cds_gate.record_cds_failure(now);
+                tracing::warn!(
+                    target: "engine.cds",
+                    stage = "query",
+                    outcome = "error",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "CDS discovery failed (retryable, never unregistered)"
+                );
+                let _ = error;
+                return Err(SendError::CdsUnavailable);
+            }
+            Ok(Ok(rows)) => rows,
+        };
+        let service_id = outcome
+            .into_iter()
+            .find_map(|(_phone, service_id)| service_id);
+        match service_id {
+            Some(service_id) => {
+                self.cds_gate.record_cds_success(recipient);
+                tracing::warn!(
+                    target: "engine.cds",
+                    stage = "query",
+                    outcome = "hit",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "CDS discovery resolved the number to a Signal identity"
+                );
+                Ok(service_id)
+            }
+            None => {
+                // 服务端确证未注册：这才是 -32010 的名实相符面。
+                self.cds_gate.record_cds_miss(recipient, now);
+                tracing::warn!(
+                    target: "engine.cds",
+                    stage = "query",
+                    outcome = "cds_miss",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "CDS discovery confirms no Signal identity for this number"
+                );
+                Err(SendError::UnregisteredRecipient)
+            }
+        }
+    }
+}
+
 async fn resolve_recipient(
     manager: &Manager<SqliteStore, Registered>,
     recipient: &str,
@@ -16667,6 +16849,44 @@ mod tests {
     /// ACI）在首臂 parse 直解、不经号码臂（互斥由调用序保证，此处钉定
     /// parse 直解语义与本机 ACI 形态确实覆盖）。Manager 不可单测构造
     /// （RegistrationData 构造受限），判定逻辑以纯函数层验证。
+    /// BUG-16 CDS 门纯逻辑：灰度关全程不查；负缓存窗内不查；熔断开不查；
+    /// 窗过期/无记录才查。命中清负缓存与连败；miss 记负缓存；失败连败
+    /// 3 次开熔断 5 分钟。
+    #[test]
+    fn cds_gate_gating_and_bookkeeping() {
+        use std::time::{Duration, Instant};
+        let mut gate = CdsGate::from_env();
+        gate.enabled = true;
+        let t0 = Instant::now();
+
+        // 无记录 → 查。
+        assert!(gate.should_query("+15550000001", t0));
+        // miss → 负缓存 5 分钟内不再查。
+        gate.record_cds_miss("+15550000001", t0);
+        assert!(!gate.should_query("+15550000001", t0 + Duration::from_secs(60)));
+        assert!(gate.should_query("+15550000001", t0 + Duration::from_secs(301)));
+        // 命中 → 清负缓存,恢复可查。
+        gate.record_cds_success("+15550000001");
+        assert!(gate.should_query("+15550000001", t0));
+        // 连败 3 次 → 熔断开(任意号都不查),窗口过后恢复。
+        gate.record_cds_failure(t0);
+        gate.record_cds_failure(t0);
+        assert!(gate.should_query("+15550000002", t0));
+        gate.record_cds_failure(t0);
+        assert!(
+            !gate.should_query("+15550000002", t0),
+            "breaker open blocks"
+        );
+        assert!(
+            gate.should_query("+15550000002", t0 + Duration::from_secs(301)),
+            "breaker window expires"
+        );
+        // 灰度关(默认)→ 永不查(本地语义零变化)。
+        let mut off = CdsGate::from_env();
+        off.enabled = false;
+        assert!(!off.should_query("+15550000003", t0));
+    }
+
     #[test]
     fn self_recipient_resolution_arms() {
         // —— self-by-e164 臂 ——
