@@ -2467,7 +2467,9 @@ fn initial_sync_due(last_elapsed_ms: Option<u64>) -> bool {
 /// 短哈希（`probe_account8`），detail 只放枚举/布尔/计数——号码、名字、
 /// 消息正文一律不落。纯日志发射，不参与任何判定（零行为语义）。
 fn gate_trace(event: &str, account: &str, face: &str, detail: &str) {
-    tracing::warn!(
+    // 发布前收尾(台账 TODO):四跳探针降级 warn→debug,默认静默,
+    // devtools/日志开 verbose 才见;格式与账号投影零改动。
+    tracing::debug!(
         target: "engine.gate_trace",
         "[gate-trace] hop=engine event={} account={} face={} detail={}",
         event,
