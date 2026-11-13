@@ -105,6 +105,61 @@ pub struct MessageSender<S> {
     device_id: DeviceId,
 }
 
+impl<S> MessageSender<S>
+where
+    S: ProtocolStore + SenderKeyStore + SessionStoreExt + Sync + Clone,
+{
+    /// KT fork（BUG-16 proof 批，2026-11-13）：push 挑战求解对——
+    /// GET /v1/challenge/{aci}/{token} → challenge 串（零人工）→
+    /// PUT /v1/challenge（type="push"）回答。失败原样上抛（不吞）。
+    async fn solve_push_challenge(
+        service: &PushService,
+        aci: &str,
+        token: &str,
+    ) -> Result<(), ServiceError> {
+        #[derive(serde::Deserialize)]
+        struct ChallengeBody {
+            #[serde(default)]
+            challenge: String,
+        }
+        #[derive(serde::Serialize)]
+        struct PushAnswer<'a> {
+            #[serde(rename = "type")]
+            challenge_type: &'a str,
+            token: &'a str,
+            challenge: &'a str,
+        }
+        let challenge: ChallengeBody = service
+            .request(
+                reqwest::Method::GET,
+                crate::configuration::Endpoint::service(format!("/v1/challenge/{aci}/{token}")),
+                HttpAuthOverride::NoOverride,
+            )?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?
+            .json()
+            .await?;
+        service
+            .request(
+                reqwest::Method::PUT,
+                crate::configuration::Endpoint::service("/v1/challenge"),
+                HttpAuthOverride::NoOverride,
+            )?
+            .json(&PushAnswer {
+                challenge_type: "push",
+                token,
+                challenge: &challenge.challenge,
+            })
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?;
+        Ok(())
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum AttachmentUploadError {
     #[error("{0}")]
@@ -846,6 +901,9 @@ where
         let probe_is_typing =
             matches!(content_body, ContentBody::TypingMessage(_));
 
+        // KT fork（BUG-16 proof 批，2026-11-13）：push 挑战只自动求解一次
+        //（官方客户端同款上限——求解后的重发走既有 4 轮循环的下一轮）。
+        let mut push_challenge_solved = false;
         for _ in 0..4u8 {
             let Some(EncryptedMessages {
                 messages,
@@ -997,7 +1055,35 @@ where
                     }
                 },
                 Err(ServiceError::ProofRequiredError(ref p)) => {
-                    tracing::debug!("{:?}", p);
+                    // KT fork（BUG-16 proof 批，2026-11-13）：push 挑战
+                    // 全自动求解（GET /v1/challenge/{aci}/{token} → PUT
+                    // /v1/challenge type=push）后重试一轮；recaptcha 族
+                    // 需人工，原样上抛（engine/UX 批的确定性面）。单次
+                    // 上限（push_challenge_solved），求解失败不吞原错误。
+                    let wants_push = p
+                        .options
+                        .iter()
+                        .any(|option| option == "push" || option == "pushChallenge");
+                    if wants_push && !push_challenge_solved {
+                        push_challenge_solved = true;
+                        let aci = self.local_aci.service_id_string();
+                        match Self::solve_push_challenge(&self.service, &aci, &p.token).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    token = %p.token,
+                                    "push challenge auto-solved; retrying the send"
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    token = %p.token,
+                                    ?error,
+                                    "push challenge auto-solve failed; surfacing ProofRequired"
+                                );
+                            }
+                        }
+                    }
                     return Err(MessageSenderError::ProofRequired {
                         token: p.token.clone(),
                         options: p.options.clone(),

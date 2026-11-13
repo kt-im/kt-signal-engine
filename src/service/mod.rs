@@ -1175,9 +1175,19 @@ pub(crate) enum SendError {
         retry_after_secs: Option<u64>,
     },
     /// 服务端要求人机验证（HTTP 428 → ServiceError::ProofRequiredError；
-    /// send 链 sender 同因再包层 MessageSenderError::ProofRequired，
-    /// token/options 不出归型面）。不自动重试；错误面 -32603（compat §3）。
-    ProofRequired,
+    /// send 链 sender 同因再包层 MessageSenderError::ProofRequired）。
+    /// BUG-16 proof 批（2026-11-13）：token/options **透传**出归型面——
+    /// push 挑战（options 含 "pushChallenge"/"push"）可全自动求解
+    /// （GET+PUT /v1/challenge），recaptcha 需人工（UX 批的文案面）。
+    /// 不自动重试（自动求解在 send 管道内联做，此变体 = 求解不可达/失败
+    /// 的确定性终态）；错误面 -32603（compat §3，锚词 PROOF_REQUIRED）。
+    ProofRequired {
+        /// 428 应答的挑战 token（求解/UX 弹码的寻址键；缺席 = 归型点丢失
+        /// payload 的旧形态，仅诊断用途）。
+        token: Option<String>,
+        /// 挑战类型词表（"pushChallenge"/"push"/"recaptcha"…原样透传）。
+        options: Vec<String>,
+    },
     /// Signal 服务端不可用（HTTP 5xx → ServiceError::UnhandledResponseCode
     /// 兜底臂 status≥500；vendored 无独立 ServerError 变体）。建议可重试，
     /// 重试决策在 connector/desktop；错误面 -32603（compat §3）。
@@ -1309,7 +1319,10 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
             ServiceError::RateLimitExceeded { retry_after } => SendError::RateLimited {
                 retry_after_secs: retry_after.map(|d| d.num_seconds().max(0) as u64),
             },
-            ServiceError::ProofRequiredError(..) => SendError::ProofRequired,
+            ServiceError::ProofRequiredError(proof) => SendError::ProofRequired {
+                token: Some(proof.token.clone()),
+                options: proof.options.clone(),
+            },
             ServiceError::UnhandledResponseCode { status, .. } if status.as_u16() >= 500 => {
                 SendError::ServerUnavailable
             }
@@ -1359,7 +1372,10 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
             MessageSenderError::ServiceError(service_error) => {
                 service_error_face(service_error, "PresageError::MessageSenderError::")
             }
-            MessageSenderError::ProofRequired { .. } => SendError::ProofRequired,
+            MessageSenderError::ProofRequired { token, options } => SendError::ProofRequired {
+                token: Some(token),
+                options,
+            },
             // P9 身份拒发闸：sender 对 process_prekey_bundle 失败统一再包
             // UntrustedIdentity（vendor sender.rs），协议层拒发（旧钥会话/
             // 换钥 bundle）落到此臂；ProtocolError 面的裸
@@ -1601,7 +1617,7 @@ pub(crate) fn send_error_variant_face(error: &SendError) -> &'static str {
         SendError::AnnouncementsOnly => "SendError::AnnouncementsOnly",
         SendError::Unbound => "SendError::Unbound",
         SendError::RateLimited { .. } => "SendError::RateLimited",
-        SendError::ProofRequired => "SendError::ProofRequired",
+        SendError::ProofRequired { .. } => "SendError::ProofRequired",
         SendError::ServerUnavailable => "SendError::ServerUnavailable",
         SendError::IdentityUnverified => "SendError::IdentityUnverified",
         SendError::WsRejected => "SendError::WsRejected",
@@ -16995,17 +17011,21 @@ mod tests {
             }
         ));
 
-        // 人机验证 428：直接臂 + sender 再包层臂（token/options 不出归型面）。
+        // 人机验证 428：直接臂 + sender 再包层臂。BUG-16 proof 批起
+        // token/options **透传**出归型面（push 自动求解/UX 弹码的寻址键）。
         assert!(matches!(
             send_error_of(presage::Error::ServiceError(
                 ServiceError::ProofRequiredError(
                     presage::libsignal_service::push_service::ProofRequired {
-                        token: String::new(),
-                        options: Vec::new(),
+                        token: "direct-token".to_owned(),
+                        options: vec!["pushChallenge".to_owned()],
                     }
                 )
             )),
-            SendError::ProofRequired
+            SendError::ProofRequired {
+                token: Some(ref token),
+                ref options,
+            } if token == "direct-token" && options.as_slice() == ["pushChallenge"],
         ));
         assert!(matches!(
             send_error_of(presage::Error::MessageSenderError(Box::new(
@@ -17014,7 +17034,10 @@ mod tests {
                     options: vec!["captcha".to_owned()],
                 }
             ))),
-            SendError::ProofRequired
+            SendError::ProofRequired {
+                token: Some(ref token),
+                ref options,
+            } if token == "proof-token" && options.as_slice() == ["captcha"],
         ));
 
         // 服务端 5xx → ServerUnavailable；<500（如 400）不算不可用。
@@ -17150,7 +17173,10 @@ mod tests {
             SendError::RateLimited {
                 retry_after_secs: None,
             },
-            SendError::ProofRequired,
+            SendError::ProofRequired {
+                token: None,
+                options: Vec::new(),
+            },
             SendError::ServerUnavailable,
             SendError::IdentityUnverified,
             SendError::WsTimeout,

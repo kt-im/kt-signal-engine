@@ -5440,6 +5440,16 @@ fn send_error(id: &Value, error: crate::service::SendError) -> Value {
         crate::service::SendError::RateLimited {
             retry_after_secs: Some(secs),
         } => Some(json!({ "retryAfterSecs": secs })),
+        // BUG-16 proof 批（2026-11-13）：428 挑战 payload 上 wire 的 data
+        // 面——UX 批（send_proof_required 文案/后续 recaptcha 弹码）的
+        // 寻址键。缺席（token=None 的旧归型形态）不造键。
+        crate::service::SendError::ProofRequired {
+            token: Some(token),
+            options,
+        } if !options.is_empty() => Some(json!({
+            "token": token,
+            "options": options,
+        })),
         _ => None,
     };
     let rpc_error = match data {
@@ -5510,7 +5520,7 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
         SendError::AnnouncementsOnly => (-1, "SEND_TARGET_ANNOUNCEMENTS_ONLY"),
         SendError::Unbound => (-32603, USER_UNBOUND_MESSAGE),
         SendError::RateLimited { .. } => (-32603, RATE_LIMITED_MESSAGE),
-        SendError::ProofRequired => (-32603, PROOF_REQUIRED_MESSAGE),
+        SendError::ProofRequired { .. } => (-32603, PROOF_REQUIRED_MESSAGE),
         SendError::ServerUnavailable => (-32603, SERVER_UNAVAILABLE_MESSAGE),
         SendError::IdentityUnverified => (-32603, IDENTITY_UNVERIFIED_MESSAGE),
         // cause 类全覆盖批（2026-10-16，§5）六族：均 -32603 + 固定原文
@@ -5646,7 +5656,10 @@ mod tests {
             SendError::RateLimited {
                 retry_after_secs: None,
             },
-            SendError::ProofRequired,
+            SendError::ProofRequired {
+                token: None,
+                options: Vec::new(),
+            },
             SendError::ServerUnavailable,
             SendError::IdentityUnverified,
             SendError::WsRejected,
@@ -5775,7 +5788,10 @@ mod tests {
                 "(RateLimitExceeded)",
             ),
             (
-                crate::service::SendError::ProofRequired,
+                crate::service::SendError::ProofRequired {
+                    token: None,
+                    options: Vec::new(),
+                },
                 PROOF_REQUIRED_MESSAGE,
                 "(ProofRequiredException)",
             ),
