@@ -49,9 +49,14 @@ use crate::store_open::{self, StoreFileState, StoreOpenError};
 /// A1 per-account 观测面（稳定性批 2026-10-20）：接收在飞/延迟分位/建流
 /// 结局/崩溃计数，经既有 `engine.perfMetrics` 快照 additive 暴露。
 pub(crate) mod account_metrics;
+/// L1 AEP 获取（设备转移备份协议第一层，台账 §29.10/§29.10.1）：链接设备缺
+/// AccountEntropyPool 的索取（日级节律）与 keys sync 落库面，官方 ensureAEP
+/// 行为对齐（协议字面量/闸序/存储位见模块头）。
+pub(crate) mod aep;
 /// 附件上行全局闸（M5）：并发槽 + 转码字节预算，base64 decode 前预留。
 pub(crate) mod attachment_gate;
 pub(crate) mod avatar;
+pub(crate) mod backup_api;
 pub(crate) mod backup_task;
 pub(crate) mod call_links;
 /// 通话中继配置（calls.relays）：认证 GET /v2/calling/relays + 官方同口径
@@ -2623,6 +2628,14 @@ async fn pull_storage_manifest(
     // 记录缓存的唯一事件失效点（云上记录可能已被其他设备改写）；下一轮
     // storage.* 读懒回源，不主动预取、不在事件里刷新。
     service.storage_contexts.invalidate_records(account).await;
+    // 批 R 版本落账：任一腿 Ok 且读到 version ≥1 → 覆盖本地 manifest 状态
+    // 文件的 version（重连版本闸比对基线；其余字段沿用旧值）。落账 best-
+    // effort：账号解析缺席静默跳过（基线缺失只影响下次 skip 判定，探测
+    // fail-open 重拉幂等自愈）；并发写竞态下旧值覆盖同理自愈（服务器为
+    // 真相源）。version 0（fake 早退/无 storage 态）不落。
+    if let Some(version) = pulled_manifest_version(&contacts, &groups) {
+        record_pulled_manifest_version(service, account, version).await;
+    }
     service
         .notify(
             account,
@@ -2643,28 +2656,115 @@ async fn pull_storage_manifest(
     (contacts, groups)
 }
 
+/// 批 R 拉后版本裁定（纯函数）：contacts 腿 Ok 优先、groups 腿 Ok 兜底；
+/// 双腿 Err 或版本 0（fake 零汇总早退/服务器无 storage 态哨兵）→ None
+/// 不落账。
+fn pulled_manifest_version(
+    contacts: &Result<storage_merge::MergeOutcome, storage_sync::StorageSyncError>,
+    groups: &Result<storage_merge::GroupImportOutcome, storage_sync::StorageSyncError>,
+) -> Option<u64> {
+    let version = contacts
+        .as_ref()
+        .ok()
+        .map(|outcome| outcome.version)
+        .or_else(|| groups.as_ref().ok().map(|outcome| outcome.version))?;
+    (version > 0).then_some(version)
+}
+
+/// 批 R 版本落账单点：账号目录解析（UnknownAccount/目录缺席 → 跳过）→
+/// manifest 状态文件 version 覆盖（save_manifest_state 临时文件 + rename
+/// 原子写，accountItemKey/stickerItemKeys None 沿旧值）。
+async fn record_pulled_manifest_version(service: &Arc<Service>, account: &str, version: u64) {
+    let rel = {
+        let state = service.state.lock().await;
+        state.account_dir(account)
+    };
+    let Some(rel) = rel else {
+        return;
+    };
+    storage_sync::save_manifest_state(
+        &service.data_dir.join(rel),
+        &storage_sync::ManifestState {
+            version,
+            account_item_key: None,
+            sticker_item_keys: None,
+        },
+    );
+}
+
 /// manifest 拉取结果通知（T-9b，wire additive，`engine.storagePull`，
-/// compat §5 契约 1.141 由 connector 侧登记、形状以本仓为权威）：两触发
+/// compat §5 契约 1.141 由 connector 侧登记、形状以本仓为权威）：各触发
 /// 臂解析后恒发恰一条。params = account（通道惯例域，receive.emptied 同
-/// 款）/ trigger（login | fetchLatest，perf 触发键单射映射）/ contactsOk
-/// / groupsOk——两腿逐腿如实布尔（false = 该腿 Err，含未注册账号
+/// 款）/ trigger（login | fetchLatest | reconnect，perf 触发键单射映射
+/// ——reconnect 为批 R landing 版本闸触发臂 additive 值，消费方未知值
+/// 透传不受影响）/ contactsOk / groupsOk——两腿逐腿如实布尔（false = 该腿 Err，含未注册账号
 /// UnknownAccount），成功面与 conversationState 差分正交（manifest 无
 /// 变化零翻转也有本事件可等）。补 b719997 双信号缺口之第 1 缺：失败此前
 /// 只有内部打点（storage_manifest_pull_err），桌面不可观测。best-effort：
 /// notify fire-and-forget（receive.emptied/receive.clockskew 同款），发射
 /// 不连坐拉取结果、不重试；connector 显式 RPC 链（storage.mergeContacts
 /// /storage.importGroups 直调）不经本单点，零新增通知。
+/// trigger perf 键 → wire 名单射（T-9b 批 R additive：reconnect 为
+/// landing 版本闸触发臂；词表外键沿旧兜底 fetchLatest——未知值透传
+/// 不炸消费面，与 connector/desktop 消费臂的透传纪律同构）。
+fn storage_pull_trigger_name(trigger: &str) -> &'static str {
+    match trigger {
+        perf_metrics::keys::STORAGE_MANIFEST_PULL_LOGIN => "login",
+        perf_metrics::keys::STORAGE_MANIFEST_PULL_RECONNECT => "reconnect",
+        _ => "fetchLatest",
+    }
+}
+
+/// landing 版本轻检查让位裁定（纯函数）：登录腿已排程（首连 60s 窗开）
+/// → false——登录腿全量拉即版本处理超集，轻检查并行跑只剩双 GET；窗内
+/// 重连（登录腿被 60s 一次性闸压掉）→ true——本腿即官方「每次连接版本
+/// 比较处理增量」（background.preload.ts:1919-1924）的对位。
+fn landing_version_check_due(login_pull_scheduled: bool) -> bool {
+    !login_pull_scheduled
+}
+
+/// 批 R landing 版本轻检查 + 重连拉单腿（每次链路建立由 receive 臂
+/// spawn_local 调用，登录腿未排程时）：storage_sync::manifest_version_probe
+/// 条件 GET 落闸 → Skip 零流量恰跳过 / Pull（版本有差或探测不可判
+/// fail-open）全量拉（trigger=reconnect，经 pull_storage_manifest 单点：
+/// 两腿与版本落账照走、engine.storagePull 通知照发）。账号解析失败静默
+/// 早退（账号在收流建立后解绑，无 landing 语义可报）。
+async fn storage_reconnect_version_check(
+    service: &Arc<Service>,
+    account: &str,
+) -> Option<ManifestPullOutcome> {
+    let context = storage_context(service, account).await.ok()?;
+    let probe = storage_sync::manifest_version_probe(&context).await;
+    match storage_sync::manifest_version_gate(probe) {
+        storage_sync::VersionGateDecision::Skip => {
+            perf_metrics::add(perf_metrics::keys::STORAGE_RECONNECT_CHECK_SKIP, 1);
+            None
+        }
+        // Pull = 版本有差或探测不可判（fail-open）；后者加发探测失败计，
+        // 拉取面同臂（读面幂等，失败腿在 storagePull 事件如实位）。
+        storage_sync::VersionGateDecision::Pull => {
+            if probe == storage_sync::ManifestVersionProbe::Unavailable {
+                perf_metrics::add(perf_metrics::keys::STORAGE_RECONNECT_CHECK_ERR, 1);
+            }
+            Some(
+                pull_storage_manifest(
+                    service,
+                    account,
+                    perf_metrics::keys::STORAGE_MANIFEST_PULL_RECONNECT,
+                )
+                .await,
+            )
+        }
+    }
+}
+
 fn storage_pull_notification(
     account: &str,
     trigger: &str,
     contacts_ok: bool,
     groups_ok: bool,
 ) -> Value {
-    let trigger_name = if trigger == perf_metrics::keys::STORAGE_MANIFEST_PULL_LOGIN {
-        "login"
-    } else {
-        "fetchLatest"
-    };
+    let trigger_name = storage_pull_trigger_name(trigger);
     json!({
         "jsonrpc": "2.0",
         "method": "engine.storagePull",
@@ -2692,6 +2792,25 @@ fn initial_sync_complete_notification(
             "profilesOk": profiles_ok,
         },
     })
+}
+
+/// syncRequests 单请求构帧（P15c 项4，官方 getRequestConfigurationSyncMessage
+/// / getRequestBlockSyncMessage 同位，SendMessage.preload.ts:1685/:1654）：
+/// SyncMessage.content.Request{type}，padded sync message。
+///
+/// 合并注（2026-11-13）：远端把本函数从测试内提升为模块级（AEP 获取也复用它
+/// 构帧）；本分支测试里的同名私有版本已删除，测试直接解析到这里。
+fn build_sync_request(
+    r#type: presage::proto::sync_message::request::Type,
+) -> presage::proto::SyncMessage {
+    presage::proto::SyncMessage {
+        content: Some(presage::proto::sync_message::Content::Request(
+            presage::proto::sync_message::Request {
+                r#type: Some(r#type as i32),
+            },
+        )),
+        ..presage::proto::SyncMessage::with_padding(&mut rng())
+    }
 }
 
 /// 链接完成 sync 上行三请求（P15c 项4，官方 sendSyncRequests 同位，
@@ -3104,6 +3223,10 @@ pub mod cloud_backup;
 /// 云备份 upload 面（docs/cloud-backup-contract.md §6，二期：uploadToCloud/
 /// uploadStatus；装配段专用线程 + 上行段 LocalSet watcher）。
 pub(crate) mod cloud_upload;
+
+/// 会话 hidden 独立位存储面（S16，KT 扩展方法 setConversationHidden;
+/// connector 落位写引擎存储，listContacts 读投影按位收敛）。
+pub(crate) mod conversation_hidden;
 
 pub(crate) struct Service {
     data_dir: PathBuf,
@@ -4207,10 +4330,18 @@ impl Service {
             .unwrap_or(&record.store_dir)
             .to_string_lossy()
             .to_string();
-        self.state
+        // P0 重链孤儿批（2026-10-23）：注册表按号码唯一，写入新 dir 的同时
+        // 旧条目从表里消失。旧 store 目录随即成为「未登记目录」——启动清扫
+        // 会把它移进 `_quarantine`，隔离区非空又让引擎 fail-closed，桌面看到
+        // 的是「通道正在自恢复」死循环（真机：lk-7c63e095135726e1 因重链变
+        // 孤儿 → quarantine-log reason=unregistered_store_dir → 引擎拒绝启动，
+        // 手工归档才起来）。官方桌面重链 = 替换账号数据，无孤儿概念：收尾即
+        // 归档被取代目录（不删除凭证、不进隔离区），只有真异常残留才落隔离。
+        let superseded = self
+            .state
             .lock()
             .await
-            .add_account(number.clone(), Some(rel))
+            .add_account_superseding(number.clone(), Some(rel.clone()))
             .map_err(|_| LinkError::Internal)?;
         // add_account 成功 = 记录真正成为账号，提交位此刻置位；此前的任何
         // 路径（supersede/内部失败）都不得返回 Ok。
@@ -4265,9 +4396,20 @@ impl Service {
                 }
             }
         }
+        // 本分支多槽架构（links map，双槽 QR 轮换）：变量是 record 而非
+        // 远端的单槽 pending；合并时把远端两段逻辑移植到 record 上。
         force_initial_sync_on_next_stream(&number);
+        // ACI additive 投影（connector 契约 1.142，远端批）：链接已成功，
+        // 注册数据读取按 best-effort——宁缺勿炸，不连坐链接主结局。
+        let _aci = account_aci(&record.store_dir).await;
         self.spawn_pipeline(number.clone(), record.store_dir.clone())
             .await;
+        // 旧 store 归档（顺序结构性锁死，远端 P0 重链孤儿批）：必须晚于
+        // spawn_pipeline——它在内部先 stop_pipeline 并等旧管线收口（store
+        // drop → SQLite 刷盘），归档前不再有句柄写旧目录；也晚于 transfer 腿
+        // cancel。仍然引用的目录（极端：同 dir 被另一号码登记）不动；与本
+        // 次新 dir 相同的也不动。
+        self.archive_superseded_link_dir(superseded, &rel).await;
         // 批 W2（§29.73）：成功链接事件 = 旧孤儿可弃的定局信号（§29.72 硬闸
         // 待办闭环）。隔离区未完成注册件此刻自动清扫；含注册数据件保留并随
         // engine.quarantineDiscarded 待决明细上报（桌面「恢复/弃置」数据面，
@@ -4457,6 +4599,37 @@ impl Service {
         for sibling in siblings {
             self.finalize_retired_slot(sibling).await;
         }
+    }
+
+    /// 重链收尾归档单点（P0 重链孤儿批）：把被取代的旧 store 目录归档到
+    /// `accounts/_archive/<ts>/`，永不删除凭证、永不进隔离区（重链是正常
+    /// 生命周期动作，官方桌面同语义：重链即替换账号数据）。
+    ///
+    /// 零动作闸：无旧条目 / 旧条目无 dir（fake 账号）/ 旧 dir == 新 dir /
+    /// 仍有其它注册表条目引用该 dir。归档失败只落 warn：归档不是链接主结局
+    /// 的一部分，失败时目录原地保留，下次启动清扫按既有 fail-closed 语义处置
+    /// （闸门不放宽）。
+    async fn archive_superseded_link_dir(&self, superseded: Option<AccountEntry>, new_dir: &str) {
+        let Some(entry) = superseded else {
+            return;
+        };
+        let Some(old_dir) = entry.dir.as_deref() else {
+            return;
+        };
+        if old_dir == new_dir {
+            return;
+        }
+        let still_referenced = {
+            let state = self.state.lock().await;
+            state
+                .accounts()
+                .iter()
+                .any(|existing| existing.dir.as_deref() == Some(old_dir))
+        };
+        if still_referenced {
+            return;
+        }
+        let _ = crate::state::archive_superseded_account_dir(&self.data_dir, &entry, now_ms());
     }
 
     /// listAccounts 读投影（wire additive `aci` 键，connector 契约 1.142
@@ -6332,6 +6505,17 @@ impl Service {
     /// 表（`profiles.refreshContacts` 拉取落库面；键形状与 signal-cli 同形，
     /// connector supervisor 消费腿同形状）；名字键缺席纪律见
     /// `project_contact_entry`（no-null：非空才出现）。
+    ///
+    /// 请求判定来源（2026-10-24 消息请求 B 批，wire additive，§5 块）：
+    /// 条目 additive `isHidden` / `profileSharing`——官方
+    /// `isConversationAccepted` 的 `isInSystemContacts`（hidden 取反）与
+    /// `profileSharing` 两个 trusted-contact 因子在本引擎的诚实数据源。
+    /// contacts 表行 = 手机通讯录同步行 → `isHidden:false`；§29.4 非通讯录
+    /// profile 行 = 不在通讯录 → `isHidden:true`。`profileSharing` 读
+    /// Storage Service 联系人 whitelist 位（发送链同一份 map，TTL 缓存），
+    /// 记录缺席 = 键缺席（诚实未知，绝不发明 false）；读面失败空 map =
+    /// 全体键缺席（fail-open，connector 记 probed-absent 后不再反复探测）。
+    /// signal-cli 同名键逐字（connector `mrr_factors_stamp` 消费腿既有）。
     pub(crate) async fn list_contacts(
         self: &Arc<Self>,
         account: &str,
@@ -6339,6 +6523,9 @@ impl Service {
         if !self.real {
             return Ok(Vec::new());
         }
+        // P9 whitelist 读面先于 manager 锁：Storage 往返（冷缓存）不得
+        // 压在发送常驻管理器锁上；TTL 内命中零网络（发送链同源单点）。
+        let whitelist = profile_sharing_whitelist(self, account).await;
         let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
@@ -6361,7 +6548,22 @@ impl Service {
             let profile = profile
                 .as_ref()
                 .map(|(given, family)| (given.as_str(), family.as_deref()));
-            out.push(project_contact_entry(&number, &contact.name, profile));
+            let sharing = whitelist
+                .get(&contact.uuid.to_string().to_lowercase())
+                .copied();
+            // S16 hidden 独立位（setConversationHidden 落位）：有位用位，
+            // 无位维持反演近似（contacts 表行 = false）——读面键形零变化，
+            // 位值语义按存储收敛。
+            let hidden = conversation_hidden::hidden_of(manager.store(), &contact.uuid.to_string())
+                .await
+                .or(Some(false));
+            out.push(project_contact_entry(
+                &number,
+                &contact.name,
+                profile,
+                hidden,
+                sharing,
+            ));
         }
         // additive 投影（2026-10-23 目标集扩展批，台账 §29.4 剩余项②）：
         // profiles 表有名字材料的非通讯录对端作为 contact 条目（uuid +
@@ -6897,7 +7099,7 @@ impl Service {
             return Err(groups::TerminateError::InviteLinkUnset);
         }
         let context = storage_context(self, account).await?;
-        let group = groups::fetch_group_state(&context, master_key).await?;
+        let group = groups::fetch_group_state(&context, master_key, "invite_link").await?;
         if group.invite_link_password.is_empty() {
             return Err(groups::TerminateError::InviteLinkUnset);
         }
@@ -7267,8 +7469,26 @@ impl Service {
         if !self.real {
             return Ok(storage_merge::GroupImportOutcome::default());
         }
+        // P1 群状态链打点（§29.18）：链入口行——登录窗 manifest 自动拉、
+        // fetchLatest 消费臂、connector 显式 RPC 三链都经本单点。有入口行
+        // 才谈得上「链跑没跑」；无入口行 = 消费方从未调用（诊断分叉点）。
+        tracing::warn!(
+            target: "engine.groupstate",
+            stage = "import_groups_enter",
+            account = %crate::methods::probe_account8(Some(account)),
+            "group state import leg entered"
+        );
         let context = storage_context(self, account).await?;
-        let (outcome, observed) = storage_merge::import_groups(context).await?;
+        let result = storage_merge::import_groups(context).await;
+        if result.is_err() {
+            tracing::warn!(
+                target: "engine.groupstate",
+                stage = "import_groups_error",
+                account = %crate::methods::probe_account8(Some(account)),
+                "group state import leg failed"
+            );
+        }
+        let (outcome, observed) = result?;
         self.publish_conversation_state_observations(account, observed)
             .await;
         Ok(outcome)
@@ -7562,6 +7782,36 @@ impl Service {
         ));
         let _ = manager.send_message(own_aci, body, now_ms()).await;
         Ok(())
+    }
+
+    /// setConversationHidden（S16 引擎 hidden 半边，KT 扩展方法，wire
+    /// additive，compat §5 契约）：connector 落位 hidden 独立位写引擎存储
+    /// （kv per-peer 版本化键，幂等；存储面见 conversation_hidden 模块）。
+    /// peerAci 只收 ACI（1:1 会话键；PNI: 前缀拒绝，绝不按裸 UUID 误收
+    /// PNI）；写前归一化为标准字符串形（大小写不敏感输入收敛同键）。
+    /// 读投影臂 = listContacts isHidden 位按存储收敛（有位用位，无位维持
+    /// inSystemContacts 反演近似，§29.4 反演近似语义不动）。
+    pub(crate) async fn set_conversation_hidden(
+        self: &Arc<Self>,
+        account: &str,
+        peer_aci: &str,
+        hidden: bool,
+    ) -> Result<(), conversation_hidden::SetHiddenError> {
+        if !self.real {
+            return Ok(());
+        }
+        let peer = ServiceId::parse_from_service_id_string(peer_aci)
+            .ok_or(conversation_hidden::SetHiddenError::InvalidPeer)?;
+        if !matches!(peer, ServiceId::Aci(_)) {
+            return Err(conversation_hidden::SetHiddenError::InvalidPeer);
+        }
+        let shared = open_registered(self, account)
+            .await
+            .ok_or(conversation_hidden::SetHiddenError::UnknownAccount)?;
+        let manager = lock_registered_for_send(&shared).await;
+        conversation_hidden::set_hidden(manager.store(), &peer.service_id_string(), hidden)
+            .await
+            .map_err(|_| conversation_hidden::SetHiddenError::Store)
     }
 
     /// chatFolders.list（Storage 跨设备同步批）：ChatFolder 记录读投影
@@ -8538,6 +8788,69 @@ async fn storage_context(
 // ---------------------------------------------------------------------------
 // 接收管线与投影
 // ---------------------------------------------------------------------------
+
+/// S15 引擎 session reset 收侧投影（wire additive，compat §5 新增契约
+/// `engine.sessionReset`）：官方桌面两类 session-reset 事件的引擎收流投影。
+/// 词臂① "endSession" = 收到对端 END_SESSION 信封——线上形态是
+/// DataMessage.flags 的 END_SESSION 位（桌面 processDataMessage.preload.ts
+/// :605-624：flags 位判定后清 body/attachments 落 ResetSession 行；钉定
+/// rev proto 把该位标 reserved 无实名变体，按裸位 1 判）。词臂②
+/// "chatSessionRefresh" = 我方解密失败时刻——桌面
+/// handleRetry.preload.ts:706-748 startAutomaticSessionReset 同位（解密
+/// 失败 = 调度自动 session reset + 本地落 ChatSessionRefreshed 行的触发
+/// 时刻；引擎只投影事件，reset 发送面不在本批边界内）。形状：params
+/// {account, peerAci, word, sentAt}——sentAt = 发送方 client timestamp
+/// （解密失败臂未知时缺席键不在，additive 缺席纪律）；零内容泄漏（只有
+/// 对端服务标识与时刻，绝不带正文）。peerAci 值 = ServiceId 字符串
+/// （1:1 场景即 ACI UUID；PNI 路径按 service_id_string 原样 PNI: 前缀）。
+/// notify fire-and-forget（receive.emptied/engine.initialSyncComplete
+/// 同款）：零 stderr、发射不连坐结果、不重试、不阻塞收流循环。
+fn session_reset_notification(
+    account: &str,
+    word: &str,
+    peer: &ServiceId,
+    sent_at: Option<u64>,
+) -> Value {
+    let mut params = json!({
+        "account": account,
+        "peerAci": peer.service_id_string(),
+        "word": word,
+    });
+    if let Some(sent_at) = sent_at {
+        params["sentAt"] = json!(sent_at);
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "method": "engine.sessionReset",
+        "params": params,
+    })
+}
+
+/// S15：DataMessage END_SESSION 位判定（裸位 1，钉定 rev proto 该位标
+/// reserved——SignalService.proto DataMessage.Flags `reserved /*END_SESSION*/ 1`，
+/// prost 不生成变体；桌面 FLAGS.END_SESSION 同值同语义）。
+fn is_end_session_row(data_message: &presage::proto::DataMessage) -> bool {
+    const END_SESSION_FLAG: u32 = 1;
+    data_message
+        .flags
+        .is_some_and(|flags| flags & END_SESSION_FLAG != 0)
+}
+
+/// S15：收流体 session-reset 词提取——END_SESSION 位 dataMessage →
+/// "endSession"；其余体 None（"chatSessionRefresh" 由解密失败臂直发，
+/// 不经本判定）。
+fn session_reset_word_of(
+    content: &presage::libsignal_service::content::Content,
+) -> Option<&'static str> {
+    match &content.body {
+        presage::libsignal_service::content::ContentBody::DataMessage(data_message)
+            if is_end_session_row(data_message) =>
+        {
+            Some("endSession")
+        }
+        _ => None,
+    }
+}
 
 /// DecryptionError 结构化事件（止血批①：解密失败不再静默丢弃）。加面不改
 /// 既有投影字段；形状 = receive 事件族同构（{account, envelope:{...}}），
@@ -9902,6 +10215,28 @@ async fn serve_account_stream(
     // T-9 fetchLatest 消费臂防抖簿（触发位在 Received::Content 臂；
     // 500ms trailing 窗沿毫秒簿记，窗沿 select 臂执行拉取）。
     let mut manifest_debounce = ManifestPullDebounce::default();
+    // 批 R landing 版本轻检查（官方 background.preload.ts:1919-1924 每次
+    // 连接 enableStorageService + storage.preload.ts:1398-1424
+    // fetchManifest(greaterThanVersion) 版本比较语义的对位）：每次链路
+    // 建立无视 60s 窗裁定一腿——登录腿已排程（首连窗开）时让位
+    // （landing_version_check_due：登录全量拉即版本处理超集，并行轻
+    // 检查只剩双 GET）；窗内重连（登录腿被 60s 闸压掉）时本腿补官方
+    // 「重连版本比较处理增量」缺口——条件 GET 版本有差/探测不可判 →
+    // 全量拉（trigger=reconnect），同版本 → 零差零流量恰跳过。独立任务
+    // 不阻塞收流循环；探测+拉取幂等，失败由下次链路建立重补。
+    // 协议面记档（如实记档不做假实现）：服务器 storage 变更无独立 push
+    // 类型——Envelope.Type 枚举无该变体（SignalService.proto:14-71），Storage
+    // Service 纯 HTTP 无 watch/notification（WebAPI.preload.ts:1838 仅
+    // chatService 走 websocket；SignalStorage.proto 无 watch 消息），官方
+    // 实时增量同样只有 fetchLatest E2E 信封（已有消费臂）——trigger
+    // "push" 无 wire 面，不设空映射。
+    if landing_version_check_due(sync_pending.is_some()) {
+        let landing_service = Arc::clone(service);
+        let landing_account = number.to_owned();
+        tokio::task::spawn_local(async move {
+            let _ = storage_reconnect_version_check(&landing_service, &landing_account).await;
+        });
+    }
     // prekey 定时维护节律（B 批，2 天水位巡检 + 按龄轮换）：下一拍 = 书签
     // +2 天（书签在 store kv，跨重连/重启有效；首拍即到期立即巡检）。
     // tick 内部自读书签判到期，重连重开不重复轰服务器。
@@ -9960,6 +10295,27 @@ async fn serve_account_stream(
                         perf_metrics::keys::INITIAL_SYNC_REQUESTS,
                         sync_started.elapsed().as_micros() as u64,
                     );
+                    // L1 AEP 索取（设备转移备份协议第一层，台账 §29.10/
+                    // §29.10.1）：官方 afterEveryLinkedStartup → ensureAEP
+                    // 同位——链接启动（收流臂沉降时机）缺 AEP（链接期
+                    // provisioning 未带）时向主设备发 SyncMessage.Request
+                    // {KEYS}，日级书签节律防重（aep 模块头载协议面）。独立
+                    // 超时预算不阻塞收流；发送失败静默（零 stderr），书签
+                    // 未落、下轮臂即重试。
+                    if tokio::time::timeout(
+                        RECEIVE_JOB_TIMEOUT,
+                        aep::ensure_aep(&mut manager, number),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!(
+                            target: "engine.receive",
+                            stage = "aep_request_timeout",
+                            account = %account_hash,
+                            "aep request timed out; receive loop stays live"
+                        );
+                    }
                     // T-9 登录期 manifest 自动拉（官方 afterFirstAuthSocket
                     // Connect 同位——首连授权 socket 建立即重读 manifest；
                     // 会话列表完整性含无消息群会话依赖它，正是「群会话登录
@@ -10356,6 +10712,24 @@ async fn serve_account_stream(
                         .notify(
                             number,
                             decryption_error_notification(number, &sender, timestamp),
+                        )
+                        .await;
+                    // S15 "chatSessionRefresh" 词臂（wire additive，
+                    // `engine.sessionReset`）：解密失败 = 官方
+                    // startAutomaticSessionReset 的触发时刻（桌面
+                    // handleRetry.preload.ts:706-748 同位——调度自动 session
+                    // reset + 落 ChatSessionRefreshed 行）；引擎 additive
+                    // 投影事件，decryptionError 事件照旧并存，零重试零
+                    // 阻塞（receive.emptied 同款纪律）。
+                    service
+                        .notify(
+                            number,
+                            session_reset_notification(
+                                number,
+                                "chatSessionRefresh",
+                                &sender,
+                                timestamp,
+                            ),
                         )
                         .await;
                     if !service.flush_barrier(number).await {
@@ -11011,6 +11385,32 @@ async fn project_content_inner(
             });
         }
         ContentBody::SynchronizeMessage(sync) => {
+            // L1 AEP 响应臂（设备转移备份协议第一层，台账 §29.10.1；aep
+            // 模块头载协议面）：官方分发序同位——stickerPackOperation 直挂
+            // 词条先于 content.keys（#handleSyncMessage if 链序），带词条
+            // 信封照走下方既有贴纸臂（臂内早退）。无词条的 keys 信封先过
+            // 官方闸序（own-ACI → 自设备 echo → primary）+ onKeysSync 落/
+            // 删库（AEP + SVR 派生 masterKey）；闸失败整封吞（官方 throw
+            // 丢封同语义），通过则放行下方既有 keys 投影臂（P14 组 6
+            // mediaRootBackupKey + accountEntropyPoolPresent 布尔，形状
+            // 零变化，AEP 材料照旧不出引擎边界）。
+            if sync.sticker_pack_operation.is_empty() {
+                if let Some(presage::proto::sync_message::Content::Keys(keys)) =
+                    sync.content.as_ref()
+                {
+                    if !aep::on_keys_envelope(
+                        store,
+                        keys,
+                        &content.metadata.sender,
+                        u32::from(content.metadata.sender_device),
+                        account,
+                    )
+                    .await
+                    {
+                        return Vec::new();
+                    }
+                }
+            }
             // stickerPackSync 收投影臂（接收完整性批③，N1 缺口闭合，compat
             // §3）：`syncMessage.stickerPackOperation` repeated 直挂字段独占
             // 分发（官方 #handleStickerPackOperation 词条同形，
@@ -11238,7 +11638,8 @@ async fn project_content_inner(
                 // 因子权重（messageRequestResponseType === ACCEPT）的引擎侧
                 // 真数据面。
                 Some(presage::proto::sync_message::Content::MessageRequestResponse(mrr)) => {
-                    let Some(projection) = project_message_request_response(mrr) else {
+                    let Some(projection) = project_message_request_response(mrr, envelope_ts)
+                    else {
                         return Vec::new();
                     };
                     envelope["syncMessage"] = json!({ "messageRequestResponse": projection });
@@ -11718,6 +12119,18 @@ async fn project_content_inner(
             &aci,
         ));
     }
+    // S15 session reset 收侧投影（wire additive，`engine.sessionReset`）：
+    // END_SESSION 位 dataMessage additive 上抛 session-reset 事件——既有
+    // dataMessage 信封投影零变化（旧宿主行为不动），系统行由 connector
+    // 按官方 ResetSession 语义落（桌面 wire 键已备，数据到手即亮）。
+    if let Some(word) = session_reset_word_of(content) {
+        notifications.push(session_reset_notification(
+            account,
+            word,
+            &content.metadata.sender,
+            Some(envelope_ts),
+        ));
+    }
     notifications.push(json!({
         "jsonrpc": "2.0",
         "method": "receive",
@@ -11900,6 +12313,7 @@ async fn project_sync_read_entries<T>(
 /// （桌面 conversationAttrs.messageRequestResponseType 同位，ACCEPT=1）。
 fn project_message_request_response(
     mrr: &presage::proto::sync_message::MessageRequestResponse,
+    timestamp: u64,
 ) -> Option<Value> {
     use base64::Engine as _;
     use presage::proto::sync_message::message_request_response::Type;
@@ -11920,6 +12334,15 @@ fn project_message_request_response(
             .r#type
             .and_then(|value| Type::try_from(value).ok())
             .unwrap_or(Type::Unknown) as i32,
+        // sync 时刻 additive 投影（batch X · S7②，compat §5）：官方 MRR_SYNC
+        // 行的 `sent_at = responseInfo.timestamp`（background.preload.ts:3803
+        // sentAt → models/conversations.preload.ts:2513-2518）= sync 信封自身
+        // 的发送时刻，官方 proto 本体不携（MessageRequestResponse 只带
+        // thread/groupId/type）。本端 sync 信封时刻 = content.metadata.
+        // client_timestamp（随信封到投影点），additive 键投影给消费方作镜像
+        // 行 sent_at 基准；缺席键容忍（旧引擎 pre-1.258 无此键，消费方本地
+        // 时钟退化不变）。
+        "timestamp": timestamp,
     });
     if let Some(aci) = thread_aci {
         out["threadAci"] =
@@ -14049,47 +14472,10 @@ const TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS: u64 = 60;
 /// 见 [`TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS`]（总预算 ≈1h 的轮数臂）。
 const TRANSFER_ARCHIVE_MAX_POLLS: u32 = 60;
 
-/// transfer_archive 200 响应体四分类。官方契约是 union（Signal-Desktop
-/// WebAPI.preload.ts `TransferArchiveSchema`，行为对齐零拷贝）：既有
-/// `{cdn,key}` 档案就绪分支之外，还有 `{error:"RELINK_REQUESTED"}`
-/// （手机端要求重新扫码，原迁移作废）与 `{error:"CONTINUE_WITHOUT_UPLOAD"}`
-/// （手机端放弃迁移继续使用）——消费语义见 backups/index.preload.ts
-/// （RelinkRequestedError / 记日志后按无档案收尾）。
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TransferArchiveBody {
-    /// 手机端档案已就绪：去 CDN 拉。
-    Ready { cdn: u32, key: String },
-    /// 手机端要求重新扫码迁移。
-    RelinkRequested,
-    /// 手机端放弃迁移继续使用（无档案可拉）。
-    ContinueWithoutUpload,
-    /// 官方 union 两分支均不匹配（非法 JSON/未知 error 码/形状不符）。
-    Malformed,
-}
-
-/// 200 体解析纯函数（零 I/O 单测面）：分支序对齐官方 zod union——先试
-/// `{cdn,key}` 分支（齐且型对即 `Ready`，多余字段官方 strip 掉不碍事），
-/// 再试 `{error}` 分支（恰为官方两字面量之一），都不匹配落 `Malformed`
-/// （含非法 JSON、error 非 String/未知值、cdn 非 u64、key 非 String）。
-fn parse_transfer_archive_body(body: &[u8]) -> TransferArchiveBody {
-    let value: Value = match serde_json::from_slice(body) {
-        Ok(value) => value,
-        Err(_) => return TransferArchiveBody::Malformed,
-    };
-    if let (Some(cdn), Some(key)) = (
-        value["cdn"]
-            .as_u64()
-            .and_then(|cdn| u32::try_from(cdn).ok()),
-        value["key"].as_str().map(str::to_owned),
-    ) {
-        return TransferArchiveBody::Ready { cdn, key };
-    }
-    match value["error"].as_str() {
-        Some("RELINK_REQUESTED") => TransferArchiveBody::RelinkRequested,
-        Some("CONTINUE_WITHOUT_UPLOAD") => TransferArchiveBody::ContinueWithoutUpload,
-        _ => TransferArchiveBody::Malformed,
-    }
-}
+// transfer_archive 200 体解析（`TransferArchiveBody` +
+// `parse_transfer_archive_body`）已上收 `service::backup_api` 单点（L3 客户端
+// 模块，长轮询/CDN/gRPC 同仓同面），此处按分类处置进度终态。
+use backup_api::TransferArchiveBody;
 
 /// 轮询循环 200 体处置：`Ready` 放行 (cdn, key) 进 CDN 段；两 error 变体
 /// 各落 `relink_requested`/`continue_without_upload` 终态，`Malformed`
@@ -14157,62 +14543,70 @@ async fn download_transfer_archive(
     use transfer_progress::failure;
     transfer_progress.begin(&account, None);
     let push = PushService::new(SignalServers::Production, Some(credentials), USER_AGENT);
+    // D0 真机重验观测面（台账 §29.10.2 未知项①）：长轮询/下载/导出全程
+    // info 级打点——此前链路日志零证据，真机重验无法复盘 204 轮数/200 体
+    // 形状/失败档位。账号一律哈希形（probe_account8），key 值/明文材料
+    // 不落日志。
+    let account_hash = crate::methods::probe_account8(Some(&account));
 
     let (cdn, key) = {
         let mut polls = 0u32;
         loop {
-            let path =
-                format!("v1/devices/transfer_archive?timeout={TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS}");
-            let response = match push.request(
-                Method::GET,
-                Endpoint::service(&path),
-                HttpAuthOverride::NoOverride,
-            ) {
-                Ok(builder) => builder,
-                Err(_) => {
-                    transfer_progress.fail(&account, failure::NETWORK);
-                    return;
-                }
-            };
-            let response = match response.send().await {
-                Ok(response) => response,
-                Err(_) => {
-                    transfer_progress.fail(&account, failure::NETWORK);
-                    return;
-                }
-            };
-            match response.status().as_u16() {
-                200 => {
-                    let bytes = match response.bytes().await {
-                        Ok(bytes) => bytes,
-                        Err(_) => {
-                            transfer_progress.fail(&account, failure::NETWORK);
-                            return;
-                        }
-                    };
-                    // 200 体官方契约除 {cdn,key} 外还有手机端主动通知两态
-                    // （要求重扫码/放弃迁移）：分类后各落其位，不再一律
-                    // 误报 decode_failed。
-                    match handle_transfer_archive_body(
-                        &transfer_progress,
-                        &account,
-                        parse_transfer_archive_body(&bytes),
-                    ) {
+            // 单轮长轮询客户端（backup_api 单点：请求/解析与 L3 客户端面同
+            // 仓同形）；200 体官方契约除 {cdn,key} 外还有手机端主动通知两态
+            // （要求重扫码/放弃迁移）：分类后各落其位，不再一律误报
+            // decode_failed。
+            match backup_api::poll_transfer_archive_round(&push, TRANSFER_ARCHIVE_POLL_TIMEOUT_SECS)
+                .await
+            {
+                Ok(backup_api::PollRound::Body(body)) => {
+                    // 200 体到达打点（分类终态另有进度快照面；这里只记
+                    // 到达与是否档案就绪，key/cdn 形状在 archive_ready 点）。
+                    tracing::info!(
+                        target: "engine.transfer",
+                        stage = "poll_200",
+                        account = %account_hash,
+                        ready = matches!(
+                            body,
+                            backup_api::TransferArchiveBody::Ready { .. }
+                        ),
+                        "transfer_archive poll returned 200 body"
+                    );
+                    match handle_transfer_archive_body(&transfer_progress, &account, body) {
                         Some(pair) => break pair,
                         None => return,
                     }
                 }
-                204 if polls + 1 >= TRANSFER_ARCHIVE_MAX_POLLS => {
-                    // 手机端没有可传档案：独立信息态（官方行为基准，非故障），
-                    // 快照同样终态保留供桌面诚实呈现。
-                    transfer_progress.fail(&account, failure::NO_ARCHIVE);
-                    return;
-                }
-                204 => {
+                Ok(backup_api::PollRound::Retry) => {
+                    // 204 单轮打点：真机重验复盘手机端上传就绪节奏的直接
+                    // 证据（轮序/预算上限）。
+                    tracing::info!(
+                        target: "engine.transfer",
+                        stage = "poll_204",
+                        account = %account_hash,
+                        round = polls + 1,
+                        max_polls = TRANSFER_ARCHIVE_MAX_POLLS,
+                        "transfer_archive poll 204; phone side not ready yet"
+                    );
+                    if polls + 1 >= TRANSFER_ARCHIVE_MAX_POLLS {
+                        // 手机端没有可传档案：独立信息态（官方行为基准，
+                        // 非故障），快照同样终态保留供桌面诚实呈现。
+                        transfer_progress.fail(&account, failure::NO_ARCHIVE);
+                        return;
+                    }
                     polls += 1;
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
-                _ => {
+                Err(error) => {
+                    // 错误打点：rpc 词表 log-safe（detail 不含账号材料）。
+                    tracing::info!(
+                        target: "engine.transfer",
+                        stage = "poll_error",
+                        account = %account_hash,
+                        code = error.rpc_code(),
+                        retryable = error.retryable(),
+                        "transfer_archive poll failed"
+                    );
                     transfer_progress.fail(&account, failure::NETWORK);
                     return;
                 }
@@ -14220,6 +14614,15 @@ async fn download_transfer_archive(
         }
     };
 
+    // 档案就绪打点：200 体 Ready 臂的 cdn/key 形状（key 只记长度不记值）。
+    tracing::info!(
+        target: "engine.transfer",
+        stage = "archive_ready",
+        account = %account_hash,
+        cdn,
+        key_len = key.len(),
+        "transfer archive ready; downloading from cdn"
+    );
     // CDN 拉档案（下载面 download_request：档案体可达 GB 级，无总超时 +
     // 读停滞判死——65s 控制面预算会把健康慢流掐断误报 cdn_unreachable）。
     let response = match push.download_request(
@@ -14268,6 +14671,14 @@ async fn download_transfer_archive(
         }
     }
 
+    // 下载完成打点（字节数 = 真机档案体量第一手证据）。
+    tracing::info!(
+        target: "engine.transfer",
+        stage = "download_done",
+        account = %account_hash,
+        bytes = archive_bytes.len(),
+        "transfer archive downloaded"
+    );
     let archive_path = store_dir.join("transfer-archive.bin");
     if std::fs::write(&archive_path, &archive_bytes).is_err() {
         transfer_progress.fail(&account, failure::IO);
@@ -14294,6 +14705,29 @@ async fn download_transfer_archive(
         crate::history::export_archive(&archive_path, aci, backup_key, &mut writer).await;
     let _ = std::io::Write::flush(&mut writer);
     drop(writer);
+    // 导出结局打点（帧/缺席计数 = L5 映射面的真机第一手证据；失败带
+    // Display 词表）。
+    match &exported {
+        Ok(stats) => tracing::info!(
+            target: "engine.transfer",
+            stage = "export_done",
+            account = %account_hash,
+            frames = stats.frames,
+            messages = stats.messages,
+            update_events = stats.update_events,
+            skipped_polls = stats.skipped_polls,
+            skipped_gift_badges = stats.skipped_gift_badges,
+            skipped_payments = stats.skipped_payments,
+            "transfer archive exported to ndjson"
+        ),
+        Err(error) => tracing::info!(
+            target: "engine.transfer",
+            stage = "export_failed",
+            account = %account_hash,
+            error = %error,
+            "transfer archive export failed"
+        ),
+    }
     if exported.is_err() {
         let _ = std::fs::remove_file(&ndjson_path);
         transfer_progress.fail(&account, failure::DECODE_FAILED);
@@ -14808,10 +15242,17 @@ async fn non_contact_profile_entries(
                     .map(|(given, family)| (given.to_owned(), family.map(str::to_owned)))
             });
         if let Some((given, family)) = material {
+            // S16 hidden 独立位（setConversationHidden 落位）：有位用位，
+            // 无位维持反演近似（非通讯录 profile 行 = true）。
+            let hidden = conversation_hidden::hidden_of(store, &uuid.to_string())
+                .await
+                .unwrap_or(true);
             out.push(project_contact_entry(
                 &uuid.to_string(),
                 "",
                 Some((&given, family.as_deref())),
+                Some(hidden),
+                None,
             ));
         }
     }
@@ -14823,10 +15264,24 @@ async fn non_contact_profile_entries(
 /// `{givenName?, familyName?}`——两件全空 = 整键不在，单件空 = 该键不在
 /// （no-null 纪律，缺席与 null 折叠同一无键态）；键名与 signal-cli 同形
 /// （connector supervisor 消费腿 profile.givenName/familyName 同形状）。
-fn project_contact_entry(number: &str, name: &str, profile: Option<(&str, Option<&str>)>) -> Value {
+/// 请求判定面（2026-10-24 消息请求 B 批）：`isHidden` / `profileSharing`
+/// 两键仅在调用方持有真实材料时出现（None = 键缺席，绝不发明 false）。
+fn project_contact_entry(
+    number: &str,
+    name: &str,
+    profile: Option<(&str, Option<&str>)>,
+    hidden: Option<bool>,
+    profile_sharing: Option<bool>,
+) -> Value {
     let mut entry = json!({ "number": number });
     if !name.is_empty() {
         entry["name"] = json!(name);
+    }
+    if let Some(hidden) = hidden {
+        entry["isHidden"] = json!(hidden);
+    }
+    if let Some(profile_sharing) = profile_sharing {
+        entry["profileSharing"] = json!(profile_sharing);
     }
     if let Some((given, family)) = profile {
         let given_non_empty = !given.is_empty();
@@ -17232,6 +17687,129 @@ mod tests {
         dir
     }
 
+    /// P0 重链孤儿批端到端钉形（2026-10-23 真机事故）：
+    /// 同号重链写新 dir → 被取代的旧目录归档 → 启动清扫零隔离 → 注册表可
+    /// 重载。对照组（下一例）证明旧语义确实会隔离并造成启动 fail-closed——
+    /// 差异来自「重链收尾归档」而非清扫放宽。
+    #[tokio::test]
+    async fn relink_archives_superseded_store_dir_and_avoids_quarantine() {
+        use tokio::sync::Mutex as AsyncMutex;
+
+        const OBSERVED: u64 = 1_700_000_000_777;
+        let root = sweep_sandbox("relink-archive");
+        let accounts = root.join(ACCOUNTS_DIR);
+        // 先 load（空 accounts = 首次运行）再建 store：注册表缺失 + store 在场
+        // 是 P0-B 的 fail-closed 面。
+        let mut state = crate::state::EngineState::load(&root).expect("state");
+        write_store_file(&accounts, "lk-old");
+        write_store_file(&accounts, "lk-new");
+        state
+            .add_account(
+                "+15550001111".to_owned(),
+                Some("accounts/lk-old".to_owned()),
+            )
+            .expect("register old");
+        let state = Arc::new(AsyncMutex::new(state));
+        let (outbound, _rx) = crate::service::outbound::test_hub();
+        let service = Service::new(root.clone(), Arc::clone(&state), outbound);
+
+        // finish_link 同序：注册表先原子换新条目并把旧条目交回，再归档。
+        let superseded = state
+            .lock()
+            .await
+            .add_account_superseding(
+                "+15550001111".to_owned(),
+                Some("accounts/lk-new".to_owned()),
+            )
+            .expect("relink");
+        assert_eq!(
+            superseded.as_ref().and_then(|entry| entry.dir.as_deref()),
+            Some("accounts/lk-old")
+        );
+        service
+            .archive_superseded_link_dir(superseded, "accounts/lk-new")
+            .await;
+
+        assert!(
+            !accounts.join("lk-old").try_exists().unwrap(),
+            "被取代目录必须搬离 accounts/ 直接子目录（否则下次清扫当孤儿）"
+        );
+        let manifest =
+            std::fs::read_to_string(accounts.join("_archive").join("link-superseded-log.jsonl"))
+                .expect("archive manifest");
+        let record: serde_json::Value =
+            serde_json::from_str(manifest.lines().next().expect("one line")).expect("json");
+        assert_eq!(record["reason"], "superseded_by_relink");
+        assert_eq!(record["from"], "accounts/lk-old");
+        let to = record["to"].as_str().expect("to").to_owned();
+        assert_eq!(
+            std::fs::read(root.join(&to).join("store.db")).unwrap(),
+            b"credential-bytes".as_slice(),
+            "归档保留凭证字节（不是删除/截断）"
+        );
+
+        let referenced: HashSet<String> = state
+            .lock()
+            .await
+            .accounts()
+            .iter()
+            .filter_map(|entry| entry.dir.clone())
+            .collect();
+        let report = sweep_orphan_store_dirs_at(&root, &referenced, OBSERVED);
+        assert_eq!(report.quarantined, 0, "重链后不得产生隔离条目");
+        assert_eq!(report.failed, 0);
+        assert!(
+            !accounts.join(QUARANTINE_DIR).exists(),
+            "隔离区必须保持空（非空 = 待决区废件，批 W2 §29.73.1 起 warn 不拒启）"
+        );
+        crate::state::EngineState::load(&root).expect("engine starts after relink");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 对照组：不归档的旧语义（= 修复前的重链收尾）——旧目录成孤儿，清扫
+    /// 隔离它。批 W2（§29.73.1）之前隔离区非空使下一次启动 fail closed
+    /// （「通道正在自恢复」死循环的机制）；§29.73.1 起隔离区降级为待决区
+    /// （QuarantinePending warn，注册件原位保留），启动不再被废件绑架。
+    /// 本用例钉住机制两段：隔离仍发生（清扫面零放宽），且隔离非空不再拒启。
+    #[tokio::test]
+    async fn relink_without_archive_quarantines_and_pends_next_start() {
+        const OBSERVED: u64 = 1_700_000_000_888;
+        let root = sweep_sandbox("relink-legacy");
+        let accounts = root.join(ACCOUNTS_DIR);
+        let mut state = crate::state::EngineState::load(&root).expect("state");
+        write_store_file(&accounts, "lk-old");
+        write_store_file(&accounts, "lk-new");
+        state
+            .add_account(
+                "+15550002222".to_owned(),
+                Some("accounts/lk-old".to_owned()),
+            )
+            .expect("register old");
+        // 修复前：注册表只换条目，旧目录原地留下。
+        state
+            .add_account(
+                "+15550002222".to_owned(),
+                Some("accounts/lk-new".to_owned()),
+            )
+            .expect("relink");
+
+        let referenced: HashSet<String> = state
+            .accounts()
+            .iter()
+            .filter_map(|entry| entry.dir.clone())
+            .collect();
+        let report = sweep_orphan_store_dirs_at(&root, &referenced, OBSERVED);
+        assert_eq!(report.quarantined, 1, "旧语义下旧目录被隔离");
+        // 批 W2（§29.73.1，88302bf）：reject_quarantined 废除 →
+        // note_quarantined 落 QuarantinePending warn；fail-closed 面收窄至
+        // 注册数据本身不可信，隔离区非空只进待决区、照常启动。
+        assert!(
+            crate::state::EngineState::load(&root).is_ok(),
+            "隔离区非空 → 待决区 warn（QuarantinePending），不再拒启"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ---- 批 W2（§29.73）隔离区自动弃置四象限 ----
     //
     // 语义：启动面隔离件原位保留（待决区，state.rs 侧已钉①②两象限的
@@ -19429,6 +20007,9 @@ mod tests {
     /// P14 组 6：Keys 整臂收投影——mediaRootBackupKey 标准 base64（非空才
     /// 投，官方 Bytes.isNotEmpty 同口径）；accountEntropyPool 密钥材料不投
     /// （键不在，§5 组 6 块）；键全缺照投空对象（信号面即事件）。
+    /// L1 AEP 批闸序对齐：官方 #handleSyncMessage keys 只认 own ACI 非
+    /// echo（:2979）——夹具播种 own 注册数据使既有投影断言过闸（落库副作用
+    /// 见 service::aep 测试面）。
     #[tokio::test]
     async fn keys_projection_carries_media_root_backup_key() {
         use base64::Engine as _;
@@ -19439,7 +20020,34 @@ mod tests {
             "kt-engine-keys-face-{:016x}",
             mix_seed_step(mix_seed())
         ));
-        let store = open_store(&store_dir).await.unwrap();
+        let mut store = open_store(&store_dir).await.unwrap();
+        {
+            use presage::libsignal_service::utils::TryIntoE164 as _;
+            let e164 = "+15551234567".try_into_e164().expect("e164");
+            let registration: RegistrationData = serde_json::from_str(
+                &json!({
+                    "signal_servers": "Production",
+                    "device_name": "KT Signal Engine",
+                    "phone_number": serde_json::to_value(
+                        phonenumber_from_signal(&e164)
+                    )
+                    .expect("phone serializes"),
+                    "uuid": "11111111-2222-4333-8444-555555555555",
+                    "pni": "7b3dc19e-11f2-4c5a-9d0e-2f6a8b4c1d3e",
+                    "password": "abcdefghijklmnopqrstuvwx",
+                    "device_id": Some(2u32),
+                    "registration_id": 1234u32,
+                    "pni_registration_id": Some(5678u32),
+                    "profile_key": base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
+                })
+                .to_string(),
+            )
+            .expect("registration data parses");
+            store
+                .save_registration_data(&registration)
+                .await
+                .expect("registration stored");
+        }
         let registry = groups::TerminatedGroups::new();
         let sender =
             ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
@@ -23652,6 +24260,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// S15 session reset 收侧投影触发面（wire additive）：END_SESSION 位
+    /// dataMessage → `engine.sessionReset` 通知 additive 上抛（词臂
+    /// endSession，peerAci/word/sentAt 逐键钉），既有 dataMessage 信封行
+    /// 照投（双通知并存，旧宿主零变化）；非 END_SESSION dataMessage 零
+    /// sessionReset 通知（flags 缺席/EXPIRATION_TIMER_UPDATE 位负例）。
+    #[tokio::test]
+    async fn receive_end_session_data_message_projects_session_reset() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "kt-engine-endsession-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store = open_store(&store_dir).await.unwrap();
+        let registry = groups::TerminatedGroups::new();
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let metadata = Metadata {
+            sender,
+            destination: sender,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+
+        // 词臂①：flags = END_SESSION 裸位 1（钉定 rev proto reserved 无
+        // 实名变体，桌面 FLAGS.END_SESSION 同值）。
+        let content = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                flags: Some(1),
+                ..Default::default()
+            }),
+            metadata.clone(),
+        );
+        let notifications = project_content("acct", &store, &content, &registry, None).await;
+        assert_eq!(
+            notifications.len(),
+            2,
+            "endSession: envelope + sessionReset"
+        );
+        let reset = notifications
+            .iter()
+            .find(|notification| notification["method"] == "engine.sessionReset")
+            .expect("sessionReset projected");
+        assert_eq!(reset["jsonrpc"], json!("2.0"));
+        assert_eq!(reset["params"]["account"], json!("acct"));
+        assert_eq!(
+            reset["params"]["peerAci"],
+            json!("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(reset["params"]["word"], json!("endSession"));
+        assert_eq!(reset["params"]["sentAt"], json!(1_700_000_000_000_u64));
+        // additive：既有 dataMessage 信封行照投（零变化）。
+        assert!(notifications.iter().any(|notification| {
+            notification["method"] == "receive"
+                && notification["params"]["envelope"]
+                    .get("dataMessage")
+                    .is_some()
+        }));
+
+        // 负例：flags 缺席 → 零 sessionReset 通知。
+        let plain = Content::from_body(
+            ContentBody::DataMessage(DataMessage::default()),
+            metadata.clone(),
+        );
+        let notifications = project_content("acct", &store, &plain, &registry, None).await;
+        assert!(
+            notifications
+                .iter()
+                .all(|notification| notification["method"] != "engine.sessionReset"),
+            "plain dataMessage must not project sessionReset"
+        );
+
+        // 负例：EXPIRATION_TIMER_UPDATE 位（2）不触发。
+        let expiration = Content::from_body(
+            ContentBody::DataMessage(DataMessage {
+                flags: Some(2),
+                ..Default::default()
+            }),
+            metadata,
+        );
+        let notifications = project_content("acct", &store, &expiration, &registry, None).await;
+        assert!(
+            notifications
+                .iter()
+                .all(|notification| notification["method"] != "engine.sessionReset"),
+            "expiration-timer flag must not project sessionReset"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     /// P15a 项3 contacts sync 投影（vendored ContactSync 载体）：records 逐
     /// 条 aci/number/name/expireTimer 族（0 值不投、空名不投）、complete
     /// 旗标、信封公共位（sourceUuid/sourceDevice/timestamp）、空记录照投
@@ -26264,6 +26978,9 @@ mod tests {
         let projection = &envelope["syncMessage"]["messageRequestResponse"];
         assert_eq!(projection["threadAci"], json!(thread));
         assert_eq!(projection["messageRequestResponseType"], json!(1));
+        // S7② additive：投影 timestamp = sync 信封时刻（envelope timestamp
+        // 同源——官方 MRR_SYNC 行 sent_at = sync sentAt 的本端真数据面）。
+        assert_eq!(projection["timestamp"], envelope["timestamp"]);
 
         // 拒绝（DELETE=2）对称：同形状，枚举值 2（不做任何 ACCEPT 化变换）。
         let notifications = project_content(
@@ -26656,6 +27373,12 @@ mod tests {
         use presage::proto::sync_message::{message_request_response, MessageRequestResponse};
         let thread = "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae";
 
+        /// 测试替身：sync 时刻注入固定值（S7② additive timestamp 键钉形）。
+        const SYNC_TS: u64 = 1_700_000_000_000;
+        fn mrr_face(mrr: &MessageRequestResponse) -> Option<Value> {
+            project_message_request_response(mrr, SYNC_TS)
+        }
+
         // 六枚举值全部原值往返（数字 = 官方因子词汇，无字符串映射发明）。
         for (value, wire) in [
             (message_request_response::Type::Unknown, 0),
@@ -26666,7 +27389,7 @@ mod tests {
             (message_request_response::Type::Spam, 5),
             (message_request_response::Type::BlockAndSpam, 6),
         ] {
-            let out = project_message_request_response(&MessageRequestResponse {
+            let out = mrr_face(&MessageRequestResponse {
                 r#type: Some(value as i32),
                 thread_aci: Some(thread.to_owned()),
                 thread_aci_binary: None,
@@ -26679,7 +27402,7 @@ mod tests {
         }
 
         // thread 双形：string-only / binary-only 都投影（binary 优先）。
-        let out = project_message_request_response(&MessageRequestResponse {
+        let out = mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: Some(thread.to_owned()),
             thread_aci_binary: Some(uuid_bytes(thread)),
@@ -26687,7 +27410,7 @@ mod tests {
         })
         .expect("dual form parses");
         assert_eq!(out["threadAci"], json!(thread));
-        let out = project_message_request_response(&MessageRequestResponse {
+        let out = mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: None,
             thread_aci_binary: Some(uuid_bytes(thread)),
@@ -26698,7 +27421,7 @@ mod tests {
 
         // 线程双缺但有合法群：只投 groupId + type（官方两形态各自路由同构）。
         let group_key = [0x88u8; 32];
-        let out = project_message_request_response(&MessageRequestResponse {
+        let out = mrr_face(&MessageRequestResponse {
             r#type: None,
             thread_aci: None,
             thread_aci_binary: None,
@@ -26713,7 +27436,7 @@ mod tests {
         assert_eq!(out["messageRequestResponseType"], json!(0));
 
         // 枚举外数值（未来枚举 99）→ UNKNOWN=0 不丢弃。
-        let out = project_message_request_response(&MessageRequestResponse {
+        let out = mrr_face(&MessageRequestResponse {
             r#type: Some(99),
             thread_aci: Some(thread.to_owned()),
             thread_aci_binary: None,
@@ -26724,14 +27447,14 @@ mod tests {
 
         // 丢弃面：群长度非法（31B/33B）整事件丢弃（官方 removeFromCache 同果
         // ——即使线程可解析也不路由）。
-        assert!(project_message_request_response(&MessageRequestResponse {
+        assert!(mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: Some(thread.to_owned()),
             thread_aci_binary: None,
             group_id: Some(vec![0x99u8; 31]),
         })
         .is_none());
-        assert!(project_message_request_response(&MessageRequestResponse {
+        assert!(mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: None,
             thread_aci_binary: Some(uuid_bytes(thread)),
@@ -26740,20 +27463,35 @@ mod tests {
         .is_none());
 
         // 丢弃面：线程不可解析（binary 坏 + string 缺/坏）且无群。
-        assert!(project_message_request_response(&MessageRequestResponse {
+        assert!(mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: Some("not-a-uuid".to_owned()),
             thread_aci_binary: Some(vec![0xde, 0xad]),
             group_id: None,
         })
         .is_none());
-        assert!(project_message_request_response(&MessageRequestResponse {
+        assert!(mrr_face(&MessageRequestResponse {
             r#type: Some(1),
             thread_aci: None,
             thread_aci_binary: None,
             group_id: None,
         })
         .is_none());
+
+        // S7② additive：timestamp 键逐字通过（sync 信封时刻，消费方镜像行
+        // sent_at 基准）；同一 face 换时刻键值随之（非常量烙死）。
+        let out = project_message_request_response(
+            &MessageRequestResponse {
+                r#type: Some(message_request_response::Type::Accept as i32),
+                thread_aci: Some(thread.to_owned()),
+                thread_aci_binary: None,
+                group_id: None,
+            },
+            1_700_000_000_123,
+        )
+        .expect("timestamped face projects");
+        assert_eq!(out["timestamp"], json!(1_700_000_000_123u64));
+        assert_eq!(out["messageRequestResponseType"], json!(1));
     }
 
     /// 消息请求写面 type 词汇表全口径：六值驼峰词逐一映射 proto 枚举序数
@@ -27019,6 +27757,75 @@ mod tests {
             json!("11111111-2222-4333-8444-555555555555")
         );
         assert_eq!(envelope["decryptionError"], json!({}));
+    }
+
+    /// `engine.sessionReset` 通知帧消费方测试替身（S15 session reset 收侧
+    /// 投影 wire additive）：方法名入词表、词表恰二词 strict-parse、
+    /// params 键形逐键验型（sentAt 已知四键/未知三键缺席），坏形状整拒
+    /// ——engine.initialSyncComplete 同款验收纪律，connector/desktop
+    /// 转发链照此对账。
+    #[test]
+    fn session_reset_notification_shape_pins_wire_contract() {
+        fn strict_parse(value: &Value) -> Option<(String, String, String, Option<u64>)> {
+            if value["method"] != "engine.sessionReset" || value["jsonrpc"] != "2.0" {
+                return None;
+            }
+            let params = value["params"].as_object()?;
+            let expected_len = if params.contains_key("sentAt") { 4 } else { 3 };
+            if params.len() != expected_len {
+                return None;
+            }
+            let word = params["word"].as_str()?;
+            if word != "endSession" && word != "chatSessionRefresh" {
+                return None;
+            }
+            Some((
+                params["account"].as_str()?.to_owned(),
+                params["peerAci"].as_str()?.to_owned(),
+                word.to_owned(),
+                params.get("sentAt").and_then(|value| value.as_u64()),
+            ))
+        }
+
+        let peer = ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+            .expect("peer aci");
+
+        // 词臂① endSession：sentAt 恒在（dataMessage client timestamp）。
+        let end_session =
+            session_reset_notification("acct", "endSession", &peer, Some(1_700_000_000_000));
+        assert_eq!(
+            strict_parse(&end_session),
+            Some((
+                "acct".to_owned(),
+                "11111111-2222-4333-8444-555555555555".to_owned(),
+                "endSession".to_owned(),
+                Some(1_700_000_000_000),
+            )),
+        );
+
+        // 词臂② chatSessionRefresh：sentAt 未知 → 缺席键不在（恰三键）。
+        let refresh = session_reset_notification("acct", "chatSessionRefresh", &peer, None);
+        assert_eq!(
+            strict_parse(&refresh),
+            Some((
+                "acct".to_owned(),
+                "11111111-2222-4333-8444-555555555555".to_owned(),
+                "chatSessionRefresh".to_owned(),
+                None,
+            )),
+        );
+        assert!(refresh["params"].get("sentAt").is_none());
+
+        // 词表外词整拒（consumer 侧 default 臂语义）。
+        assert!(strict_parse(&session_reset_notification(
+            "acct",
+            "sessionRestart",
+            &peer,
+            None
+        ))
+        .is_none());
+        // 词表外方法名整拒。
+        assert!(strict_parse(&json!({"method": "receive", "params": {}})).is_none());
     }
 
     /// G3 排空通知形状面：`receive.emptied` 独立方法（非 envelope 载体——
@@ -27566,9 +28373,10 @@ mod tests {
         assert!(rx.try_recv().is_err(), "无其他帧");
     }
 
-    /// T-9b 结果事件面（契约 1.141 引擎腿）：两触发臂各发恰一条，trigger
+    /// T-9b 结果事件面（契约 1.141 引擎腿）：三触发臂各发恰一条，trigger
     /// wire 名与 perf 触发键单射（storage_manifest_pull → fetchLatest、
-    /// storage_manifest_pull_login → login），腿位如实，通道无残余帧。
+    /// storage_manifest_pull_login → login、storage_manifest_pull_reconnect
+    /// → reconnect 批 R additive），腿位如实，通道无残余帧。
     #[tokio::test]
     async fn storage_pull_result_event_fires_per_trigger_with_truthy_legs() {
         let data_dir = std::env::temp_dir().join(format!(
@@ -27597,6 +28405,16 @@ mod tests {
         )
         .await;
         expect_storage_pull_notice(&mut rx, "+15550000001", "fetchLatest", legs_ok, legs_ok);
+
+        // 批 R：重连版本闸触发臂（landing 轻检查裁定拉取 → trigger
+        // reconnect additive 值）。
+        let _ = pull_storage_manifest(
+            &service,
+            "+15550000001",
+            perf_metrics::keys::STORAGE_MANIFEST_PULL_RECONNECT,
+        )
+        .await;
+        expect_storage_pull_notice(&mut rx, "+15550000001", "reconnect", legs_ok, legs_ok);
 
         assert!(rx.try_recv().is_err(), "每拉恰一帧，无其他通知");
     }
@@ -27641,8 +28459,74 @@ mod tests {
             strict_parse(&fetch),
             Some(("acct".to_owned(), "fetchLatest".to_owned(), false, true))
         );
+        // 批 R：reconnect additive 触发词（landing 版本闸臂）。
+        let reconnect = storage_pull_notification(
+            "acct",
+            perf_metrics::keys::STORAGE_MANIFEST_PULL_RECONNECT,
+            true,
+            true,
+        );
+        assert_eq!(
+            strict_parse(&reconnect),
+            Some(("acct".to_owned(), "reconnect".to_owned(), true, true))
+        );
         // 词表外方法名整拒（consumer 侧 default 臂语义）。
         assert!(strict_parse(&json!({"method": "receive", "params": {}})).is_none());
+    }
+
+    /// 批 R landing 版本轻检查让位裁定钉形：登录腿排程 = 首连窗开，登录
+    /// 全量拉即版本处理超集，轻检查让位（防同 landing 双 GET 双拉）；登录
+    /// 腿被 60s 一次性闸压掉（重连）= 轻检查登场（官方重连版本比较对位）。
+    #[test]
+    fn landing_version_check_yields_to_login_pull() {
+        assert!(
+            !landing_version_check_due(true),
+            "登录腿排程时让位（首连全量拉为超集）"
+        );
+        assert!(
+            landing_version_check_due(false),
+            "窗内重连（登录腿缺席）时轻检查登场"
+        );
+    }
+
+    /// 批 R 拉后版本裁定钉形：contacts 腿 Ok 优先、groups 腿 Ok 兜底、
+    /// 双腿 Err → None、version 0（fake 零汇总早退/服务器无 storage 态
+    /// 哨兵）→ None 不落账。
+    #[test]
+    fn pulled_manifest_version_prefers_contacts_then_groups() {
+        let contacts_ok = |version: u64| {
+            Ok(storage_merge::MergeOutcome {
+                version,
+                ..storage_merge::MergeOutcome::default()
+            })
+        };
+        let groups_ok = |version: u64| {
+            Ok(storage_merge::GroupImportOutcome {
+                version,
+                ..storage_merge::GroupImportOutcome::default()
+            })
+        };
+        let err = || storage_sync::StorageSyncError::UnknownAccount;
+        assert_eq!(
+            pulled_manifest_version(&contacts_ok(7), &groups_ok(9)),
+            Some(7),
+            "contacts 腿 Ok 优先"
+        );
+        assert_eq!(
+            pulled_manifest_version(&Err(err()), &groups_ok(9)),
+            Some(9),
+            "contacts Err → groups 腿兜底"
+        );
+        assert_eq!(
+            pulled_manifest_version(&Err(err()), &Err(err())),
+            None,
+            "双腿 Err 不落账"
+        );
+        assert_eq!(
+            pulled_manifest_version(&contacts_ok(0), &Err(err())),
+            None,
+            "version 0 哨兵不落账"
+        );
     }
 
     /// `engine.initialSyncComplete` 通知帧消费方测试替身（收件箱闸批①
@@ -29529,19 +30413,6 @@ mod tests {
         }
     }
 
-    fn build_sync_request(
-        request_type: presage::proto::sync_message::request::Type,
-    ) -> presage::proto::SyncMessage {
-        presage::proto::SyncMessage {
-            content: Some(presage::proto::sync_message::Content::Request(
-                presage::proto::sync_message::Request {
-                    r#type: Some(request_type.into()),
-                },
-            )),
-            ..Default::default()
-        }
-    }
-
     /// P15c 项4 syncRequests 单请求构帧：SyncMessage.content.Request{type}
     /// 枚举直通（CONFIGURATION=4/BLOCKED=3，官方
     /// getRequestConfigurationSyncMessage/getRequestBlockSyncMessage 同位）。
@@ -30668,56 +31539,8 @@ mod tests {
         );
     }
 
-    /// 200 体四分类钉形（官方 TransferArchiveSchema union 对齐，行为对齐
-    /// 零拷贝）：{cdn,key} 即 Ready（两分支字段并存时官方 zod union 先试
-    /// {cdn,key} 分支，多余字段 strip——同形序）；error 恰为官方两字面量
-    /// 之一对应对应变体；其余（非法 JSON/未知 error/cdn·key 缺失或型不对）
-    /// 一律 Malformed。
-    #[test]
-    fn transfer_archive_body_classification() {
-        assert_eq!(
-            parse_transfer_archive_body(br#"{"cdn":3,"key":"manifold://cb#k"}"#),
-            TransferArchiveBody::Ready {
-                cdn: 3,
-                key: "manifold://cb#k".to_owned()
-            }
-        );
-        assert_eq!(
-            parse_transfer_archive_body(br#"{"cdn":0,"key":"k","error":"RELINK_REQUESTED"}"#),
-            TransferArchiveBody::Ready {
-                cdn: 0,
-                key: "k".to_owned()
-            },
-            "官方 zod union 分支序：{{cdn,key}} 齐 = Ready 赢"
-        );
-        assert_eq!(
-            parse_transfer_archive_body(br#"{"error":"RELINK_REQUESTED"}"#),
-            TransferArchiveBody::RelinkRequested
-        );
-        assert_eq!(
-            parse_transfer_archive_body(br#"{"error":"CONTINUE_WITHOUT_UPLOAD"}"#),
-            TransferArchiveBody::ContinueWithoutUpload
-        );
-        let malformed_bodies: [&[u8]; 9] = [
-            b"not json",
-            br#"{}"#,
-            br#"{"cdn":3}"#,
-            br#"{"key":"k"}"#,
-            br#"{"cdn":"3","key":"k"}"#,
-            br#"{"cdn":3.5,"key":"k"}"#,
-            br#"{"error":"SOMETHING_ELSE"}"#,
-            br#"{"error":123}"#,
-            br#"{"error":"relink_requested"}"#,
-        ];
-        for body in malformed_bodies {
-            assert_eq!(
-                parse_transfer_archive_body(body),
-                TransferArchiveBody::Malformed,
-                "「{}」应判 Malformed",
-                String::from_utf8_lossy(body)
-            );
-        }
-    }
+    // 200 体四分类钉形已随解析面上收 `backup_api::tests`
+    // （transfer_archive_body_classification），此处只钉处置终态路径。
 
     /// 轮询循环 200 体处置终态路径：两 error 变体各落 `relink_requested`/
     /// `continue_without_upload` 终态（不再误报 decode_failed），`Malformed`
@@ -30961,44 +31784,62 @@ mod tests {
     /// listContacts 条目投影（profile 名字刷新批 additive 面，纯函数）：
     /// number 恒在；name/profile 两键非空才出现（no-null）；profile 内
     /// givenName/familyName 单件空 = 该键不在；两件全空 = profile 整键
-    /// 不在；键集形状钉定（不得发明）。
+    /// 不在；键集形状钉定（不得发明）。请求判定面（消息请求 B 批）：
+    /// isHidden/profileSharing 仅在调用方持有材料时出现，None = 键缺席。
     #[test]
     fn project_contact_entry_shapes() {
         // 仅 number（未刷新库零变化：应答逐字节同形）。
         assert_eq!(
-            project_contact_entry("+15551234567", "", None),
+            project_contact_entry("+15551234567", "", None, None, None),
             json!({
                 "number": "+15551234567",
+            })
+        );
+
+        // contacts 行：通讯录同步行 isHidden=false；whitelist 位在手才出。
+        assert_eq!(
+            project_contact_entry("+15551234567", "", None, Some(false), Some(true)),
+            json!({
+                "number": "+15551234567",
+                "isHidden": false,
+                "profileSharing": true,
             })
         );
 
         // contacts 名照旧；profile 材料在 → givenName/familyName 全出。
         assert_eq!(
-            project_contact_entry("+15551234567", "Alice", Some(("Ada", Some("Lee")))),
+            project_contact_entry(
+                "+15551234567",
+                "Alice",
+                Some(("Ada", Some("Lee"))),
+                Some(false),
+                None,
+            ),
             json!({
                 "number": "+15551234567",
                 "name": "Alice",
                 "profile": { "givenName": "Ada", "familyName": "Lee" },
+                "isHidden": false,
             })
         );
 
         // 单件空：given 缺 / family 缺（no-null，缺席键不在）。
         assert_eq!(
-            project_contact_entry("+15551234567", "", Some(("", Some("Lee")))),
+            project_contact_entry("+15551234567", "", Some(("", Some("Lee"))), None, None),
             json!({
                 "number": "+15551234567",
                 "profile": { "familyName": "Lee" },
             })
         );
         assert_eq!(
-            project_contact_entry("+15551234567", "", Some(("Ada", None))),
+            project_contact_entry("+15551234567", "", Some(("Ada", None)), None, None),
             json!({
                 "number": "+15551234567",
                 "profile": { "givenName": "Ada" },
             })
         );
         assert_eq!(
-            project_contact_entry("+15551234567", "", Some(("Ada", Some("")))),
+            project_contact_entry("+15551234567", "", Some(("Ada", Some(""))), None, None),
             json!({
                 "number": "+15551234567",
                 "profile": { "givenName": "Ada" },
@@ -31007,12 +31848,23 @@ mod tests {
 
         // 两件全空 = profile 整键不在（服务器侧空 profile 名不算材料）。
         assert_eq!(
-            project_contact_entry("+15551234567", "", Some(("", None))),
+            project_contact_entry("+15551234567", "", Some(("", None)), None, None),
             json!({ "number": "+15551234567" })
         );
         assert_eq!(
-            project_contact_entry("+15551234567", "", Some(("", Some("")))),
+            project_contact_entry("+15551234567", "", Some(("", Some(""))), None, None),
             json!({ "number": "+15551234567" })
+        );
+
+        // 非通讯录 profile 行：isHidden=true，未见 whitelist 记录 = 键缺席
+        // （诚实未知，绝不发明 false）。
+        assert_eq!(
+            project_contact_entry("uuid-peer", "", Some(("Dave", None)), Some(true), None),
+            json!({
+                "number": "uuid-peer",
+                "profile": { "givenName": "Dave" },
+                "isHidden": true,
+            })
         );
     }
 
