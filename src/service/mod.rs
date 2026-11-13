@@ -13805,7 +13805,10 @@ async fn link_flow(
                     // 一段——QR 交付 → 手机扫码/确认/密钥交换/注册消息上传
                     // 完成真机实测 42s 级（108 次样本），本段拆出「用户+上游」
                     // 与本机 commit 的占比。纯日志，零行为。
-                    tracing::info!(
+                    // ENGINE-15: engine stderr 文件级只收 WARN（与 send_latency_probe
+                    // 同款先例），info 级在这条链上是不可见的——分段计时必须用 warn
+                    // 才能落盘，否则 42s 永远是黑盒。
+                    tracing::warn!(
                         target: "engine.link",
                         stage = "provisioning-wait",
                         qr_to_registration_ms = url_delivered_at.elapsed().as_millis() as u64,
@@ -13958,7 +13961,7 @@ async fn link_flow(
     // 非 Send（上游 FramesReader 持 Rc 状态），spawn 仍在 LocalSet 承载。
     // BUG-5 尾巴（link 分段计时 · 2026-11-13）：第二段终点——与第一段
     // provisioning-wait 相加即 finish 全程，42s 黑盒从此有账可查。纯日志。
-    tracing::info!(
+    tracing::warn!(
         target: "engine.link",
         stage = "registration-commit",
         commit_ms = commit_started_at.elapsed().as_millis() as u64,
