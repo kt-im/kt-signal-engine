@@ -41,11 +41,17 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    # SQLCipher 的 bundled-sqlcipher-vendored-openssl 在 Linux 上编出的 OpenSSL
+    # 是 1.1.x，缺 EVP_MAC_*（OpenSSL 3 API，boring/libsignal 侧要用）→
+    # cargo test 链接期 undefined symbol。系统 OpenSSL 3 已有这些符号，Linux
+    # 走系统的即可；Windows job 保持 vendored（那边没有系统 OpenSSL）。
+    env:
+      OPENSSL_NO_VENDOR: "1"
     steps:
       - uses: actions/checkout@v7
 
-      - name: install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: install protoc and libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
