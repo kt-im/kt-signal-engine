@@ -8,6 +8,7 @@
 //! 落调度日志。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex as AsyncMutex;
@@ -25,6 +26,16 @@ use crate::state::EngineState;
 
 /// 上游对非法 deviceLinkUri 的错误原文（夹具逐字对齐）。
 const UNKNOWN_LINK_URI: &str = "Unknown device link uri.";
+
+/// finishLink 链接会话 lost 的确定性错误码（-1，引擎结构化错误风格，
+/// B1/issue #951）：URL 交付后 provisioning WS 关闭/超时/流结束 = QR 必死。
+/// 不折叠成 -32603——connector 需要把「会话已死」与引擎内部故障分开。
+const LINK_LOST: &str = "LINK_LOST";
+
+/// rotateLink 的 attemptId 不存在（已被新 startLink 顶掉 / 已随提交收口）：
+/// 确定性契约错误（-1 + 本码位），不折叠成 -32603——轮换失败要能被连接器
+/// 直接判定为「这次 attempt 作废，重新 startLink」，而不是引擎故障重试。
+const LINK_ATTEMPT_NOT_FOUND: &str = "LINK_ATTEMPT_NOT_FOUND";
 
 /// 解绑态错误原文（上游把 AuthorizationFailedException 包进
 /// UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。
@@ -56,6 +67,9 @@ const IDENTITY_UNVERIFIED_MESSAGE: &str =
 /// WS 请求被服务器明确拒绝——确定未送达（508/499/send 面 413/404 未注册/
 /// 其余 4xx 应答拒绝）。
 const WS_REJECTED_MESSAGE: &str = "Failed to send message: Request rejected. (WsRejectedException)";
+/// 客户端版本过旧（HTTP 499）：不自动重试，需升级。
+const APP_EXPIRED_MESSAGE: &str =
+    "Failed to send message: Client version expired. (AppExpiredException)";
 /// WS 响应未达/等响应期断流——未知结局，绝不自动重试（重试可能重复投递）。
 const WS_TIMEOUT_MESSAGE: &str =
     "Failed to send message: Timed out waiting for the response. (WsTimeoutException)";
@@ -71,6 +85,14 @@ const SESSION_BUILD_MESSAGE: &str =
 /// 附件/贴纸图/预览图上行失败——上传先于发送，消息未离站。
 const ATTACHMENT_UPLOAD_MESSAGE: &str =
     "Failed to send message: Attachment upload failed. (AttachmentUploadException)";
+/// 附件上行全局并发槽等待超时（M5）：上行尚未开始，确定
+/// 未投递，可重试；wire 字面量与 connector 分类器配套。
+const ATTACHMENT_BUSY_MESSAGE: &str =
+    "Failed to send message: Attachment upload slot busy. (AttachmentBusyException)";
+/// 附件上行全局字节预算不足（M5）：base64 decode 前拒绝，
+/// 整批未上行；单请求可能永远超预算，不自动重试。
+const ATTACHMENT_BUDGET_MESSAGE: &str =
+    "Failed to send message: Attachment byte budget exhausted. (AttachmentBudgetException)";
 /// 群腿零收件人（群成员过滤自身后目标集为空）——请求从未构造收件人面，
 /// 确定未送达（2026-10-16 群腿零收件人防御批，wire 字面量与锚词
 /// `(NoRecipientsException)`；群发送系与群 typing 共用，compat §3/§5）。
@@ -86,86 +108,187 @@ pub(crate) enum Inbound {
     Overlong { bytes: u64 },
 }
 
-/// 调度日志大媒体载荷摘要化（帧帽对齐批 companion）：`send` 的
-/// `attachments[]`、`sendStory` 的 `attachment` 以及两族的 `previewImage`
-/// 都是内联 data URI。帧帽 1 MiB→160 MiB 后这些键可以承载多 MB 明文媒体，
-/// 原样落盘会把引擎变成媒体明文落库点（违反「消息内容只经内存转发」边界），
-/// 并把未轮转的 `engine-send-log.jsonl` 撑爆。
-///
-/// 闸位刻意取旧帧帽 1 MiB：**旧帧帽下可达的请求逐字节保持原日志面**
-/// （既有契约「参数形状逐字保留」对小型附件不变，connector 侧断言零冲击），
-/// 只有帧帽对齐后才新可达的大载荷换成字节数摘要（形状与 updateGroup 的
-/// avatar 键同款 `[<key> data uri: N bytes]`）。大值按长度直接造摘要、
-/// 不先 clone 再覆盖——避免在峰值路径上多复制一整份 base64 字符串。
-const DISPATCH_MEDIA_DIGEST_BYTES: usize = 1024 * 1024;
-
-fn redacted_dispatch_params(method: &str, params: &Map<String, Value>) -> Map<String, Value> {
-    let digest = |key: &str, uri: &str| {
-        if uri.len() > DISPATCH_MEDIA_DIGEST_BYTES {
-            Some(json!(format!("[{key} data uri: {} bytes]", uri.len())))
-        } else {
-            None
+impl Inbound {
+    /// 该帧占用的入站队列字节预算（Overlong 帧不保留内容，计 0）。
+    pub(crate) fn queued_bytes(&self) -> usize {
+        match self {
+            Inbound::Line(line) => line.len(),
+            Inbound::Overlong { .. } => 0,
         }
-    };
-    let mut logged = Map::with_capacity(params.len());
-    for (key, value) in params {
-        let redacted = match (method, key.as_str()) {
-            ("send", "attachments") => match value {
-                Value::Array(entries) => Some(Value::Array(
-                    entries
-                        .iter()
-                        .map(|entry| {
-                            match entry.as_str().and_then(|uri| digest("attachment", uri)) {
-                                Some(digest) => digest,
-                                None => entry.clone(),
-                            }
-                        })
-                        .collect(),
-                )),
-                _ => None,
-            },
-            ("send" | "sendStory", "attachment" | "previewImage") => {
-                value.as_str().and_then(|uri| digest(key, uri))
-            }
-            _ => None,
-        };
-        logged.insert(key.clone(), redacted.unwrap_or_else(|| value.clone()));
     }
-    logged
 }
 
-pub(crate) async fn respond(
-    inbound: &Inbound,
+// 调度日志的脱敏与按账号分文件收口在 `state::append_dispatch`（M5 多账号
+// 批）：正文/号码/大媒体一律在写入前处理，dispatch 层只传原始 params；每个
+// 方法只在参数校验通过后调用（被拒请求不写日志）。
+
+/// 入站帧的解析结果（M4 稳定性批）：分帧只做一次——超时预算分类、busy
+/// 应答 id 提取与 dispatch 共用同一份解析结果，避免 160MiB 帧被重复解析
+/// 或为了判类型再复制一份 params。
+pub(crate) enum Prepared {
+    Overlong { bytes: u64 },
+    Malformed(Value),
+    Request(Request),
+}
+
+/// 普通请求预算（M5）：无附件上行面的请求 60s 内必须收敛，超时即取消。
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// 附件请求预算（M5）：含附件/预览图/贴纸/头像上行面的请求给 120s。
+pub(crate) const ATTACHMENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// finishLink 预算：等待手机确认是协议内长任务，connector 侧
+/// `LINK_FINISH_TIMEOUT` = 5 min（kt-signal-connector supervisor.rs:77）。
+/// 引擎内建上限必须晚于 connector 的取消点，否则会在手机仍可确认时先
+/// 砍掉链接会话（connector 重试会变成第二次设备授权）。只作最后兜底。
+pub(crate) const LINK_FINISH_TIMEOUT: Duration = Duration::from_secs(360);
+
+/// 引擎级错误码（JSON-RPC 保留区外的实现错误）：busy/超时共用 -32000，
+/// 结构化原因放 error.data.reason（connector 可按 reason 区分背压与超时）。
+const ENGINE_UNAVAILABLE: i64 = -32000;
+
+pub(crate) const ENGINE_BUSY_MESSAGE: &str =
+    "Engine busy: in-flight request limit reached. (EngineBusyException)";
+
+pub(crate) const ENGINE_TIMEOUT_MESSAGE: &str =
+    "Request timed out and was cancelled by the engine. (EngineTimeoutException)";
+
+/// 帧 → 解析结果（一次性）。`Inbound::Overlong` 不解析内容，只保留字节数。
+pub(crate) fn prepare(inbound: &Inbound) -> Prepared {
+    match inbound {
+        Inbound::Overlong { bytes } => Prepared::Overlong { bytes: *bytes },
+        Inbound::Line(line) => match jsonrpc::parse_line(line) {
+            ParseOutcome::Malformed(id) => Prepared::Malformed(id),
+            ParseOutcome::Request(request) => Prepared::Request(request),
+        },
+    }
+}
+
+/// 应答 id（busy/超时错误面用；id 只会是字符串/数字/null，clone 成本可忽
+/// 略——params 不入这条路径）。
+pub(crate) fn prepared_id(prepared: &Prepared) -> Value {
+    match prepared {
+        Prepared::Overlong { .. } => Value::Null,
+        Prepared::Malformed(id) => id.clone(),
+        Prepared::Request(request) => request.id.clone(),
+    }
+}
+
+/// 方法名（超时日志用；Malformed/Overlong 无方法名）。
+pub(crate) fn prepared_method(prepared: &Prepared) -> Option<&str> {
+    match prepared {
+        Prepared::Request(request) => Some(request.method.as_str()),
+        _ => None,
+    }
+}
+
+/// 请求超时预算分类（M5）：附件上行面 120s、finishLink 360s、其余 60s。
+pub(crate) fn request_timeout_budget(prepared: &Prepared) -> Duration {
+    let Prepared::Request(request) = prepared else {
+        return REQUEST_TIMEOUT;
+    };
+    if request.method == "finishLink" {
+        return LINK_FINISH_TIMEOUT;
+    }
+    if carries_attachment_upload(request) {
+        ATTACHMENT_REQUEST_TIMEOUT
+    } else {
+        REQUEST_TIMEOUT
+    }
+}
+
+/// 请求是否含附件上行面：只按公开参数键判定，宽松命中（多给 120s 无害，
+/// 少给会让大附件请求在 CDN 上行中途被取消）。
+fn carries_attachment_upload(request: &Request) -> bool {
+    let params = &request.params;
+    let non_empty_uri = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    match request.method.as_str() {
+        "send" => {
+            matches!(params.get("attachments"), Some(Value::Array(entries)) if !entries.is_empty())
+                || non_empty_uri("previewImage")
+                || params.get("sticker").is_some_and(|value| !value.is_null())
+        }
+        "sendStory" => non_empty_uri("attachment") || non_empty_uri("previewImage"),
+        "sendContact" | "setProfile" => non_empty_uri("avatar"),
+        "createGroup" | "updateGroup" | "migrateGroup" => non_empty_uri("avatar"),
+        _ => false,
+    }
+}
+
+/// 在飞上限拒绝面（M4）：立即结构化回错，不排队膨胀、不静默丢。
+pub(crate) fn busy_response(prepared: &Prepared) -> Value {
+    jsonrpc::error_response(
+        &prepared_id(prepared),
+        &RpcError::with_data(
+            ENGINE_UNAVAILABLE,
+            ENGINE_BUSY_MESSAGE,
+            json!({
+                "reason": "ENGINE_BUSY",
+                "retryable": true,
+                "inFlightLimit": crate::INFLIGHT_REQUEST_LIMIT,
+            }),
+        ),
+    )
+}
+
+/// 超时取消面（M5）：dispatch future 已被 drop（取消），回结构化超时错误。
+pub(crate) fn timeout_response(id: &Value, budget: Duration) -> Value {
+    jsonrpc::error_response(
+        id,
+        &RpcError::with_data(
+            ENGINE_UNAVAILABLE,
+            ENGINE_TIMEOUT_MESSAGE,
+            json!({
+                "reason": "REQUEST_TIMEOUT",
+                // 超时崩带的 dispatch future 可能已写出请求（send 类
+                // mutating 面），结局未知：不声称可重试。
+                "retryable": false,
+                "timeoutMs": budget.as_millis() as u64,
+            }),
+        ),
+    )
+}
+
+/// 已解析帧的 dispatch（respond 的解析后半段；main 只在 timeout 包裹内
+/// 调用它）。`prepared` 按值消费：Request 的 params 直接进入 dispatch，
+/// 原始 160MiB 帧缓冲可在调用前释放。
+pub(crate) async fn respond_prepared(
+    prepared: Prepared,
     state: Arc<AsyncMutex<EngineState>>,
     service: Arc<Service>,
 ) -> Value {
-    match inbound {
-        Inbound::Overlong { bytes } => {
+    match prepared {
+        Prepared::Overlong { bytes } => {
             // 超帽帧以前完全静默（只有 id 为 null 的 parse error），connector
             // 侧把无 id 应答判为协议故障并杀掉引擎时，engine-stderr 没有任何
             // 线索。这里落一条 warn：帧字节数 + 上限，零内容字节。
             tracing::warn!(
-                frame_bytes = *bytes,
+                frame_bytes = bytes,
                 frame_limit = crate::MAX_LINE_BYTES,
                 "inbound frame exceeds the line limit; answered with a parse error"
             );
             jsonrpc::parse_error_response(Value::Null)
         }
-        Inbound::Line(line) => match jsonrpc::parse_line(line) {
-            ParseOutcome::Malformed(id) => jsonrpc::parse_error_response(id),
-            ParseOutcome::Request(request) => {
-                // S2a 打点：JSON-RPC 请求分派整体耗时（单点包裹，控制流
-                // 零变化；dispatch 臂内多 `return` 故不在其内部计时）。
-                let dispatch_started = std::time::Instant::now();
-                let response = dispatch(&request, state, service).await;
-                crate::service::perf_metrics::record_us(
-                    crate::service::perf_metrics::keys::RPC_DISPATCH,
-                    dispatch_started.elapsed().as_micros() as u64,
-                );
-                log_rpc_error_face(&request, &response);
-                response
-            }
-        },
+        Prepared::Malformed(id) => jsonrpc::parse_error_response(id),
+        Prepared::Request(request) => {
+            // S2a 打点：JSON-RPC 请求分派整体耗时（单点包裹，控制流
+            // 零变化；dispatch 臂内多 `return` 故不在其内部计时）。
+            let dispatch_started = std::time::Instant::now();
+            // dispatch 的 async 状态机覆盖全部方法分支（M5 每条校验后
+            // append 又扩了一圈），debug 构建下内联进 input loop 会顶爆
+            // 测试线程 2MiB 栈；Box::pin 把状态机放到堆上（每请求一次
+            // 分配，远小于帧/附件分配）。
+            let response = Box::pin(dispatch(&request, state, service)).await;
+            crate::service::perf_metrics::record_us(
+                crate::service::perf_metrics::keys::RPC_DISPATCH,
+                dispatch_started.elapsed().as_micros() as u64,
+            );
+            log_rpc_error_face(&request, &response);
+            response
+        }
     }
 }
 
@@ -200,10 +323,26 @@ async fn dispatch(
     let Request { id, method, params } = request;
     // S2a 打点在 respond 单点包裹（本函数臂内多 `return`，不在此计时）。
     match method.as_str() {
+        // startLink：旧端只读 deviceLinkUri（= 第 0 槽），linkAttemptId +
+        // slots 是双槽 QR 轮换的 additive 键（compat §3）。
         "startLink" => match service.start_link().await {
-            Ok(uri) => jsonrpc::success_response(id, json!({ "deviceLinkUri": uri })),
+            Ok(started) => jsonrpc::success_response(id, started.to_json()),
             Err(_) => internal_error(id),
         },
+        // rotateLink：同一 attempt 铸新槽（live 槽上限 2，超出收回最旧）。
+        // attempt 缺失 = 确定性错误码，不是内部错误。
+        "rotateLink" => {
+            let attempt_id = params.get("linkAttemptId").and_then(Value::as_str);
+            match attempt_id {
+                Some(attempt_id) => match service.rotate_link(attempt_id).await {
+                    Ok(rotated) => jsonrpc::success_response(id, rotated.to_json()),
+                    Err(error) => rotate_link_error(id, error),
+                },
+                // 参数缺失按「attempt 不存在」fail-closed（同 finishLink 的参数
+                // 纪律：坏会话形状不触网）。
+                None => jsonrpc::error_response(id, &RpcError::new(-1, LINK_ATTEMPT_NOT_FOUND)),
+            }
+        }
         "finishLink" => {
             let uri = params.get("deviceLinkUri").and_then(Value::as_str);
             let name = params.get("deviceName").and_then(Value::as_str);
@@ -219,10 +358,7 @@ async fn dispatch(
                         }
                         jsonrpc::success_response(id, Value::Object(row))
                     }
-                    Err(LinkError::UnknownUri) => {
-                        jsonrpc::error_response(id, &RpcError::new(-1, UNKNOWN_LINK_URI))
-                    }
-                    Err(LinkError::Internal) => internal_error(id),
+                    Err(error) => finish_link_error(id, error),
                 },
                 // 参数缺失按非法链接会话处理（上游 fail-closed 同口径）。
                 _ => jsonrpc::error_response(id, &RpcError::new(-1, UNKNOWN_LINK_URI)),
@@ -310,10 +446,6 @@ async fn dispatch(
             }
         }
         "send" => {
-            state
-                .lock()
-                .await
-                .append_dispatch(method, &redacted_dispatch_params(method, params));
             let account = params.get("account").and_then(Value::as_str);
             let message = params.get("message").and_then(Value::as_str);
             let group = params.get("groupId").and_then(Value::as_str);
@@ -625,10 +757,15 @@ async fn dispatch(
             {
                 return internal_error(id);
             }
+            let dispatch_id = params.get("dispatchId").and_then(Value::as_str);
+            if let Some(dispatch_id) = dispatch_id {
+                crate::dispatch_model::prepare_dispatch(dispatch_id);
+            }
             match (account, message, group, recipients_of(params)) {
                 (Some(account), message, Some(group), _)
                     if sticker.is_some() || message.is_some() || view_once =>
                 {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_text_group(
                             account,
@@ -646,6 +783,9 @@ async fn dispatch(
                         .await
                     {
                         Ok((timestamp, results)) => {
+                            if let Some(dispatch_id) = dispatch_id {
+                                crate::dispatch_model::mark_dispatch_sent(dispatch_id);
+                            }
                             tracing::warn!(
                                 target: "send_latency_probe",
                                 stage = "engine.send-done",
@@ -662,6 +802,9 @@ async fn dispatch(
                             )
                         }
                         Err(error) => {
+                            if let Some(dispatch_id) = dispatch_id {
+                                crate::dispatch_model::mark_dispatch_failed(dispatch_id);
+                            }
                             let (face, _) = send_error_face(&error);
                             tracing::warn!(
                                 target: "send_latency_probe",
@@ -680,6 +823,7 @@ async fn dispatch(
                 (Some(account), message, None, Ok(recipients))
                     if sticker.is_some() || message.is_some() || view_once =>
                 {
+                    state.lock().await.append_dispatch(method, params);
                     // S2a 打点：直聊族发送整体耗时（成败两臂各自落计数）。
                     let send_started = std::time::Instant::now();
                     match service
@@ -699,6 +843,9 @@ async fn dispatch(
                         .await
                     {
                         Ok((timestamp, results, failures)) => {
+                            if let Some(dispatch_id) = dispatch_id {
+                                crate::dispatch_model::mark_dispatch_sent(dispatch_id);
+                            }
                             perf_metrics::add(perf_metrics::keys::SEND_TEXT_OK, 1);
                             perf_metrics::record_us(
                                 perf_metrics::keys::SEND_TEXT_TOTAL,
@@ -723,6 +870,9 @@ async fn dispatch(
                             jsonrpc::success_response(id, payload)
                         }
                         Err(error) => {
+                            if let Some(dispatch_id) = dispatch_id {
+                                crate::dispatch_model::mark_dispatch_failed(dispatch_id);
+                            }
                             perf_metrics::add(perf_metrics::keys::SEND_TEXT_ERR, 1);
                             perf_metrics::record_us(
                                 perf_metrics::keys::SEND_TEXT_TOTAL,
@@ -754,7 +904,6 @@ async fn dispatch(
         // base64）同置/都缺/任一腿形状非法全拒。24h 窗口/次数闸是官方 UI 层
         // 闸，wire 面不设（§5 登记）。
         "editMessage" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let message = params
                 .get("message")
@@ -789,6 +938,7 @@ async fn dispatch(
             };
             match (account, message, target, recipient, group) {
                 (Some(account), Some(message), Some(target), None, Some(Some(group))) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_edit_message_group(account, group, target, message)
                         .await
@@ -801,6 +951,7 @@ async fn dispatch(
                     }
                 }
                 (Some(account), Some(message), Some(target), Some(Some(recipients)), None) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_edit_message(account, &recipients, target, message)
                         .await
@@ -821,7 +972,6 @@ async fn dispatch(
         // fail-closed——sendCallMessage 群腿同源口径），eraId 必填非空（官方
         // eraId 字符串即 era 标识）。
         "sendGroupCallUpdate" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let group = params
                 .get("groupId")
@@ -833,6 +983,7 @@ async fn dispatch(
                 .filter(|era| !era.is_empty());
             match (account, group, era_id) {
                 (Some(account), Some(group), Some(era_id)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service.send_group_call_update(account, group, era_id).await {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
                         Err(error) => send_error(id, error),
@@ -842,12 +993,12 @@ async fn dispatch(
             }
         }
         "remoteDelete" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
             let group = params.get("groupId").and_then(Value::as_str);
             match (account, target, group, recipients_of(params)) {
                 (Some(account), Some(target), Some(group), _) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_remote_delete_group(account, group, target)
                         .await
@@ -857,6 +1008,7 @@ async fn dispatch(
                     }
                 }
                 (Some(account), Some(target), None, Ok(recipients)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_remote_delete(account, &recipients, target)
                         .await
@@ -869,7 +1021,6 @@ async fn dispatch(
             }
         }
         "sendReaction" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target_author = params.get("targetAuthor").and_then(Value::as_str);
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
@@ -891,6 +1042,7 @@ async fn dispatch(
                     Some(remove),
                     _,
                 ) if params.get("groupId").is_some() => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_reaction_group(
                             account,
@@ -917,6 +1069,7 @@ async fn dispatch(
                     Some(remove),
                     Ok(recipients),
                 ) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_reaction(account, &recipients, target_author, target, emoji, remove)
                         .await
@@ -940,7 +1093,6 @@ async fn dispatch(
         // 「story 通道 groupV2 形态」措辞失真随本批订正），应答加性
         // group:{groupId, timestamp}。
         "sendStoryReaction" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params
                 .get("account")
                 .and_then(Value::as_str)
@@ -973,6 +1125,7 @@ async fn dispatch(
                     //（open_group_sender + dispatch_group）；错误走结构化
                     // 面同群发送（send_error 单点，-1 词族）。
                     Some(group_id) => {
+                        state.lock().await.append_dispatch(method, params);
                         match service
                             .send_story_reaction_group(account, group_id, author, target, emoji)
                             .await
@@ -983,6 +1136,7 @@ async fn dispatch(
                     }
                     // 1:1 作者直发腿（S4 现状，逐字节零变化）。
                     None => {
+                        state.lock().await.append_dispatch(method, params);
                         match service
                             .send_story_reaction(account, author, target, emoji)
                             .await
@@ -1004,7 +1158,6 @@ async fn dispatch(
         // storyMessageRecipients 扇出名单展开形态。应答 {timestamp}（DOE
         // 信封 ts）。
         "deleteStoryForEveryone" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params
                 .get("account")
                 .and_then(Value::as_str)
@@ -1070,6 +1223,7 @@ async fn dispatch(
                 });
             match (account, target, recipients, updated) {
                 (Some(account), Some(target), Some(recipients), Some(updated)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_story_delete_for_everyone(account, target, &recipients, &updated)
                         .await
@@ -1084,7 +1238,6 @@ async fn dispatch(
             }
         }
         "sendPinMessage" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target_author = params.get("targetAuthor").and_then(Value::as_str);
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
@@ -1107,6 +1260,7 @@ async fn dispatch(
                 recipients_of(params),
             ) {
                 (Some(account), Some(author), Some(target), Some(duration), Some(group), _) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_pin_message_group(account, group, author, target, duration)
                         .await
@@ -1123,6 +1277,7 @@ async fn dispatch(
                     None,
                     Ok(recipients),
                 ) if !recipients.is_empty() => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_pin_message(account, &recipients, author, target, duration)
                         .await
@@ -1135,13 +1290,13 @@ async fn dispatch(
             }
         }
         "sendUnpinMessage" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target_author = params.get("targetAuthor").and_then(Value::as_str);
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
             let group = params.get("groupId").and_then(Value::as_str);
             match (account, target_author, target, group, recipients_of(params)) {
                 (Some(account), Some(author), Some(target), Some(group), _) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_unpin_message_group(account, group, author, target)
                         .await
@@ -1153,6 +1308,7 @@ async fn dispatch(
                 (Some(account), Some(author), Some(target), None, Ok(recipients))
                     if !recipients.is_empty() =>
                 {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_unpin_message(account, &recipients, author, target)
                         .await
@@ -1165,7 +1321,6 @@ async fn dispatch(
             }
         }
         "sendAdminDelete" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target_author = params.get("targetAuthor").and_then(Value::as_str);
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
@@ -1174,6 +1329,7 @@ async fn dispatch(
             // fail-closed。
             match (account, target_author, target, group) {
                 (Some(account), Some(author), Some(target), Some(group)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_admin_delete_group(account, group, author, target)
                         .await
@@ -1199,7 +1355,6 @@ async fn dispatch(
         // 长度计数 chars 而非 graphemes（无分割依赖，合成序列计数更大、
         // 超限更保守——偏差记档 §5）。
         "sendPollCreate" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let group = params
                 .get("groupId")
@@ -1213,6 +1368,7 @@ async fn dispatch(
             };
             match (account, group, question, options, allow_multiple) {
                 (Some(account), Some(group), Some(question), Some(options), Some(allow)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_poll_create_group(account, group, &question, &options, allow)
                         .await
@@ -1225,7 +1381,6 @@ async fn dispatch(
             }
         }
         "sendPollVote" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let group = params
                 .get("groupId")
@@ -1256,6 +1411,7 @@ async fn dispatch(
                     Some(indexes),
                     Some(count),
                 ) if target > 0 => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_poll_vote_group(account, group, author, target, &indexes, count)
                         .await
@@ -1268,7 +1424,6 @@ async fn dispatch(
             }
         }
         "sendPollTerminate" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let group = params
                 .get("groupId")
@@ -1277,6 +1432,7 @@ async fn dispatch(
             let target = params.get("targetTimestamp").and_then(Value::as_u64);
             match (account, group, target) {
                 (Some(account), Some(group), Some(target)) if target > 0 => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_poll_terminate_group(account, group, target)
                         .await
@@ -1289,12 +1445,12 @@ async fn dispatch(
             }
         }
         "updateContact" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let recipient = params.get("recipient").and_then(Value::as_str);
             let name = params.get("name").and_then(Value::as_str);
             match (account, recipient, name) {
                 (Some(account), Some(recipient), Some(name)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service.update_contact(account, recipient, name).await {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
                         Err(error) => send_error(id, error),
@@ -1304,7 +1460,6 @@ async fn dispatch(
             }
         }
         "sendTyping" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let stop = params.get("stop").and_then(Value::as_bool);
             let group = params.get("groupId").and_then(Value::as_str);
@@ -1320,6 +1475,7 @@ async fn dispatch(
             );
             match (account, stop, group, recipients_of(params)) {
                 (Some(account), Some(stop), Some(group), _) => {
+                    state.lock().await.append_dispatch(method, params);
                     // 失败显形批（2026-10-16，wire additive，compat §3/§5）：
                     // 三态 1:1 投影——全败 = 失败面（词条计数）；零收件人
                     // 已在服务层转 NoRecipients 错误；部分失败/全成功 =
@@ -1335,6 +1491,7 @@ async fn dispatch(
                     }
                 }
                 (Some(account), Some(stop), None, Ok(recipients)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service.send_typing(account, &recipients, stop).await {
                         Ok(()) => jsonrpc::success_response(id, json!({})),
                         Err(error) => send_error(id, error),
@@ -1347,7 +1504,6 @@ async fn dispatch(
         // recipient 为单字符串（原消息作者；官方按作者分组直发，不整组
         // 广播）；timestamps 非空数字数组，元素非数字 fail-closed。
         "sendDeliveryReceipt" | "sendReadReceipt" | "sendViewedReceipt" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let recipient = params.get("recipient").and_then(Value::as_str);
             let timestamps = params
@@ -1366,6 +1522,7 @@ async fn dispatch(
             };
             match (account, recipient, timestamps) {
                 (Some(account), Some(recipient), Some(Some(timestamps))) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_receipt(account, recipient, &timestamps, kind)
                         .await
@@ -1383,12 +1540,12 @@ async fn dispatch(
         // 与 sendViewedReceipt（作者面 VIEWED 回执）双通道独立。senderAci
         // 号码/UUID 双形态（reaction targetAuthor 同解析口径）。
         "sendViewOnceOpen" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let sender = params.get("senderAci").and_then(Value::as_str);
             let timestamp = params.get("timestamp").and_then(Value::as_u64);
             match (account, sender, timestamp) {
                 (Some(account), Some(sender), Some(timestamp)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_view_once_open(account, sender, timestamp)
                         .await
@@ -1412,7 +1569,6 @@ async fn dispatch(
         // 100 条/chunk 分信封（官方 syncHelpers CHUNK_SIZE=100 同构）；
         // 成功答空结果对象（写面惯例）；协议上行面落调度日志（send 系同纪律）。
         "markRead" | "markViewed" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let list_key = if method == "markRead" {
                 "reads"
@@ -1432,6 +1588,7 @@ async fn dispatch(
             });
             match (account, entries) {
                 (Some(account), Some(Some(entries))) if !entries.is_empty() => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .mark_read_state(account, method == "markViewed", entries)
                         .await
@@ -1462,7 +1619,6 @@ async fn dispatch(
                 Recipient(&'a str),
                 Group(&'a str),
             }
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let legacy = parse_legacy_call_face(params.get("legacy"));
             let data = params
@@ -1545,23 +1701,27 @@ async fn dispatch(
                     Some(CallTarget::Recipient(recipient)),
                     Some(face),
                     Some(destination),
-                ) => match service
-                    .send_call_message(
-                        account,
-                        recipient,
-                        crate::service::SendCallMessage {
-                            face,
-                            destination_device_id: destination,
-                        },
-                    )
-                    .await
-                {
-                    Ok(timestamp) => {
-                        jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                ) => {
+                    state.lock().await.append_dispatch(method, params);
+                    match service
+                        .send_call_message(
+                            account,
+                            recipient,
+                            crate::service::SendCallMessage {
+                                face,
+                                destination_device_id: destination,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(timestamp) => {
+                            jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                        }
+                        Err(error) => send_error(id, error),
                     }
-                    Err(error) => send_error(id, error),
-                },
+                }
                 (Some(account), Some(CallTarget::Group(group_id)), Some(face), _) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_call_message_group(
                             account,
@@ -1593,11 +1753,11 @@ async fn dispatch(
         // 正整数 u64。成功 `{timestamp}`（信封时间戳，sendCallMessage 同
         // 款）；事件源接线（connector 每事件即调）归 connector 批。
         "sendCallEvent" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let event = crate::service::parse_call_event(params);
             match (account, event) {
                 (Some(account), Some(event)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service.send_call_event(account, event).await {
                         Ok(timestamp) => {
                             jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
@@ -1626,19 +1786,6 @@ async fn dispatch(
                 Recipient(String),
                 Group(String),
             }
-            // 调度日志先落（send 系同款：被拒调用同样记录派发）；
-            // contact.avatar 键落盘前形状摘要化（头像 data URI 载荷零字
-            // 节进日志——setProfile/updateGroup「调度零头像字节」同纪律，
-            // 摘要以 URI 字符串长度记量级），contact 其余键逐字保留（名
-            // 片文本面是调用方自有数据，非 bulk 载荷）。
-            let mut logged_params = params.clone();
-            if let Some(Value::Object(contact)) = logged_params.get_mut("contact") {
-                if let Some(Value::String(uri)) = contact.get_mut("avatar") {
-                    let digest = format!("[avatar data uri: {} bytes]", uri.len());
-                    contact.insert("avatar".into(), json!(digest));
-                }
-            }
-            state.lock().await.append_dispatch(method, &logged_params);
             let account = params.get("account").and_then(Value::as_str);
             let contact = parse_send_contact(params.get("contact"));
             let recipient = match params.get("recipient") {
@@ -1672,6 +1819,7 @@ async fn dispatch(
             };
             match (account, target, contact) {
                 (Some(account), Some(ContactTarget::Recipient(recipient)), Some(payload)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service.send_contact(account, &recipient, &payload).await {
                         Ok(timestamp) => {
                             jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
@@ -1680,6 +1828,7 @@ async fn dispatch(
                     }
                 }
                 (Some(account), Some(ContactTarget::Group(group_id)), Some(payload)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_contact_group(account, &group_id, &payload)
                         .await
@@ -1736,10 +1885,6 @@ async fn dispatch(
         // 1059-1061）。attachment 缺席 = text story 现状零变化；group 与
         // 内容两腿正交（官方群 story text/media 双臂同源 getStoryMessage）。
         "sendStory" => {
-            state
-                .lock()
-                .await
-                .append_dispatch(method, &redacted_dispatch_params(method, params));
             let account = params
                 .get("account")
                 .and_then(Value::as_str)
@@ -1935,6 +2080,7 @@ async fn dispatch(
             }
             match (account, message, attachment) {
                 (Some(account), Some(message), None) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_story(
                             account,
@@ -1984,6 +2130,7 @@ async fn dispatch(
                 // 指针互异分键）；text 腿/发送失败键缺席（组装单点
                 // send_story_success_body，缺席绝不序列化）。
                 (Some(account), None, Some(attachment)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_story(
                             account,
@@ -2030,7 +2177,6 @@ async fn dispatch(
         //（send 系同纪律）；成功答空结果对象（上游同款）；未知结局不重试
         // 纪律由写调用结果即返回值承载（connector §4.56 对齐）。
         "sendMessageRequestResponse" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let request_type = params
                 .get("type")
@@ -2068,6 +2214,7 @@ async fn dispatch(
             };
             match (account, target, request_type) {
                 (Some(account), Some(target), Some(request_type)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .send_message_request_response(account, target, request_type)
                         .await
@@ -2093,7 +2240,6 @@ async fn dispatch(
         // （-32603）；协议上行面落调度日志（send 系同纪律）；成功答空结果
         // 对象；未知结局不重试。
         "requestAttachmentBackfill" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let author = params
                 .get("author")
@@ -2134,6 +2280,7 @@ async fn dispatch(
             };
             match (account, target, author, sent_timestamp) {
                 (Some(account), Some(target), Some(author), Some(sent_timestamp)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .request_attachment_backfill(account, target, author, sent_timestamp)
                         .await
@@ -2242,7 +2389,6 @@ async fn dispatch(
         // timestamp 正整数；任一条目形状错整拒 -32603 不发半批。协议上行
         // 面落调度日志（send 系同纪律）。
         "deleteForMeConversation" => {
-            state.lock().await.append_dispatch(method, params);
             let Some(account) = params.get("account").and_then(Value::as_str) else {
                 return internal_error(id);
             };
@@ -2270,6 +2416,7 @@ async fn dispatch(
             {
                 return internal_error(id);
             }
+            state.lock().await.append_dispatch(method, params);
             match service
                 .send_delete_for_me_conversation(
                     account,
@@ -2296,7 +2443,6 @@ async fn dispatch(
         // 拒 -32603 不发半批。协议上行面落调度日志（send 系同纪律；无消息
         // 正文/媒体内容）。fake：成功 {status:"sent"} 形状桩。
         "deleteForMeMessages" => {
-            state.lock().await.append_dispatch(method, params);
             let Some(account) = params.get("account").and_then(Value::as_str) else {
                 return internal_error(id);
             };
@@ -2309,6 +2455,7 @@ async fn dispatch(
             if entries.is_empty() || entries.len() > MAX_DELETE_FOR_ME_MESSAGES {
                 return internal_error(id);
             }
+            state.lock().await.append_dispatch(method, params);
             match service
                 .send_delete_for_me_messages(account, conversation, entries)
                 .await
@@ -2340,7 +2487,6 @@ async fn dispatch(
         // recipient/expirationInSeconds 缺失或形状错（负数/小数/超 u32），
         // 未注册联系人与发送失败同码 -32603 折叠。
         "setExpirationTimer" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let recipient = params.get("recipient").and_then(Value::as_str);
             let timer = params
@@ -2349,6 +2495,7 @@ async fn dispatch(
                 .and_then(|seconds| u32::try_from(seconds).ok());
             match (account, recipient, timer) {
                 (Some(account), Some(recipient), Some(timer)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .set_expiration_timer(account, recipient, timer)
                         .await
@@ -3062,6 +3209,36 @@ async fn dispatch(
                 Err(error) => phone_lookup_error(id, &error),
             }
         }
+        // receive.confirm（KT 扩展，phase2 兼容面）：kt_outbox 已随迁移
+        // DROP，confirm 是幂等 no-op；账号已知返回 true，wire 形状不变。
+        // connector 零调用，保留一版供回滚窗口。
+        "receive.confirm" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(key) = params.get("dedupeKey").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let confirmed = service.confirm_duplicate(account, key).await;
+            jsonrpc::success_response(id, Value::Bool(confirmed))
+        }
+        // receive.replay（KT 扩展，phase2 兼容面）：dedupe key 只解析成
+        // sender+client_timestamp，按 thread_messages 重建 Content 并投影；
+        // kt_outbox 已 DROP，没有第二份拷贝可读。
+        "receive.replay" => {
+            let Some(account) = params.get("account").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            let Some(key) = params.get("dedupeKey").and_then(Value::as_str) else {
+                return internal_error(id);
+            };
+            match service.replay_duplicate(account, key).await {
+                Ok(Some(rows)) => jsonrpc::success_response(id, Value::Array(rows)),
+                // 唯二可达的 miss/失败面（确认无行 / 读面无法确认）wire 形状
+                // 不变：同折叠 -32603，不向 connector 发明新错误码。
+                Ok(None) | Err(_) => internal_error(id),
+            }
+        }
         // profiles.refreshContacts（联系人 profile 名字材料刷新，KT 扩展
         // 方法，2026-10-16 profile 名字刷新批，wire additive，engine-compat，
         // §5 块）：params `{account}`（无逐联系人物品参数——目标集恒由
@@ -3225,7 +3402,6 @@ async fn dispatch(
         // set 臂三 flag 全缺（或全 null）= 无写意图整拒；写后返回目标三
         // flag 读投影（getConversationState 同形状）。
         "getConversationState" => {
-            state.lock().await.append_dispatch(method, params);
             let Some(account) = params.get("account").and_then(Value::as_str) else {
                 return internal_error(id);
             };
@@ -3235,6 +3411,7 @@ async fn dispatch(
             ) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service.conversation_state(account, conversation).await {
                 Ok(state) => jsonrpc::success_response(id, conversation_state_payload(&state)),
                 Err(storage_sync::StorageSyncError::UnknownAccount) => internal_error(id),
@@ -3242,7 +3419,6 @@ async fn dispatch(
             }
         }
         "setConversationState" => {
-            state.lock().await.append_dispatch(method, params);
             let Some(account) = params.get("account").and_then(Value::as_str) else {
                 return internal_error(id);
             };
@@ -3283,6 +3459,7 @@ async fn dispatch(
                 // 三 flag 全缺 = 无写意图（updateGroup 全缺整拒同纪律）。
                 return internal_error(id);
             }
+            state.lock().await.append_dispatch(method, params);
             match service
                 .set_conversation_state(account, conversation, intent)
                 .await
@@ -3299,7 +3476,6 @@ async fn dispatch(
         //（setAccountConfiguration 零可写字段先例）。token 只能是
         // string|null|缺省；部分失败诚实投影（failures 逐条带状态码）。
         "reportSpam" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let target_aci = params.get("targetAci").and_then(Value::as_str).and_then(
                 presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string,
@@ -3332,6 +3508,7 @@ async fn dispatch(
             }
             match (account, target_aci) {
                 (Some(account), Some(target_aci)) => {
+                    state.lock().await.append_dispatch(method, params);
                     match service
                         .report_spam(account, target_aci, server_guids, token.map(str::to_owned))
                         .await
@@ -3651,12 +3828,6 @@ async fn dispatch(
         // key 标准 base64), revision: 0}（avatar data URI 臂失败同
         // updateGroup 两臂纪律）。
         "createGroup" => {
-            let mut logged_params = params.clone();
-            if let Some(Value::String(uri)) = logged_params.get_mut("avatar") {
-                let digest = format!("[avatar data uri: {} bytes]", uri.len());
-                *logged_params.get_mut("avatar").expect("avatar slot") = json!(digest);
-            }
-            state.lock().await.append_dispatch(method, &logged_params);
             let account = params.get("account").and_then(Value::as_str);
             let title = match params.get("title") {
                 Some(Value::String(title)) if !title.is_empty() => title.to_owned(),
@@ -3703,6 +3874,7 @@ async fn dispatch(
             let Some(account) = account else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service
                 .create_group(account, &title, expiration, avatar, &members)
                 .await
@@ -3763,12 +3935,6 @@ async fn dispatch(
         // fake 模式形状桩 {groupId(随机 master key 标准 base64),
         // revision: 0}（avatar data URI 臂失败同 createGroup 两臂纪律）。
         "migrateGroup" => {
-            let mut logged_params = params.clone();
-            if let Some(Value::String(uri)) = logged_params.get_mut("avatar") {
-                let digest = format!("[avatar data uri: {} bytes]", uri.len());
-                *logged_params.get_mut("avatar").expect("avatar slot") = json!(digest);
-            }
-            state.lock().await.append_dispatch(method, &logged_params);
             let account = params.get("account").and_then(Value::as_str);
             let legacy_id = match params.get("groupId") {
                 Some(Value::String(text)) if !text.is_empty() => {
@@ -3821,6 +3987,7 @@ async fn dispatch(
             let Some(account) = account else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service
                 .migrate_group(
                     account,
@@ -3877,7 +4044,6 @@ async fn dispatch(
         // 网络面 → -1 STORAGE_UNAVAILABLE（STORAGE 族 retryable 语义）；
         // fake 模式成功 {status:"terminated"}。
         "terminateGroup" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let master_key = params
                 .get("groupId")
@@ -3886,6 +4052,7 @@ async fn dispatch(
             let (Some(account), Some(master_key)) = (account, master_key) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service.terminate_group(account, master_key).await {
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "terminated" })),
                 Err(crate::service::groups::TerminateError::UnknownAccount)
@@ -3949,16 +4116,6 @@ async fn dispatch(
         // STORAGE_UNAVAILABLE；fake 两臂：缺省/null 臂成功 {status:"sent"}、
         // data URI 臂失败 GROUP_AVATAR_UPLOAD_FAILED（§5 fake 两臂纪律）。
         "updateGroup" => {
-            // 调度日志先落（mutating 面同款：被拒调用同样记录派发）；
-            // avatar 键落盘前形状摘要化（头像 data URI/base64 载荷零字节
-            // 进日志，setProfile「调度零头像字节」同纪律；摘要以 URI 字符
-            // 串长度记量级）。groupId/account/expiration 键照旧逐字保留。
-            let mut logged_params = params.clone();
-            if let Some(Value::String(uri)) = logged_params.get_mut("avatar") {
-                let digest = format!("[avatar data uri: {} bytes]", uri.len());
-                *logged_params.get_mut("avatar").expect("avatar slot") = json!(digest);
-            }
-            state.lock().await.append_dispatch(method, &logged_params);
             let account = params.get("account").and_then(Value::as_str);
             let master_key = params
                 .get("groupId")
@@ -4126,6 +4283,7 @@ async fn dispatch(
             let (Some(account), Some(master_key)) = (account, master_key) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             let write = crate::service::groups::GroupUpdateWrite {
                 expiration_secs: expiration,
                 title: title.map(str::to_owned),
@@ -4190,7 +4348,6 @@ async fn dispatch(
         // STORAGE_UNAVAILABLE；fake 成功 {status:"left"} 形状桩（§5 fake 两
         // 臂纪律）。
         "leaveGroup" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let master_key = params
                 .get("groupId")
@@ -4199,6 +4356,7 @@ async fn dispatch(
             let (Some(account), Some(master_key)) = (account, master_key) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service.leave_group(account, master_key).await {
                 Ok(()) => jsonrpc::success_response(id, json!({ "status": "left" })),
                 Err(crate::service::groups::TerminateError::UnknownAccount)
@@ -4374,8 +4532,6 @@ async fn dispatch(
             }
         }
         "joinGroupViaLink" => {
-            // 写面落调度日志（mutating 面先落后被拒同样记录派发）。
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let parsed = params
                 .get("inviteLink")
@@ -4384,6 +4540,7 @@ async fn dispatch(
             let (Some(account), Some(parsed)) = (account, parsed) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service
                 .join_group_via_link(account, parsed.master_key, parsed.password)
                 .await
@@ -4424,7 +4581,6 @@ async fn dispatch(
         //（管理员有群态读面）。服务器拒绝 → GROUP_UPDATE_FAILED +
         // data.status；网络面 STORAGE_UNAVAILABLE；参数/本地闸面 -32603。
         "cancelJoinRequest" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let parsed = params
                 .get("inviteLink")
@@ -4433,6 +4589,7 @@ async fn dispatch(
             let (Some(account), Some(parsed)) = (account, parsed) else {
                 return internal_error(id);
             };
+            state.lock().await.append_dispatch(method, params);
             match service
                 .cancel_join_request_via_link(account, parsed.master_key, parsed.password)
                 .await
@@ -4464,7 +4621,6 @@ async fn dispatch(
             }
         }
         "approveJoinRequest" => {
-            state.lock().await.append_dispatch(method, params);
             let account = params.get("account").and_then(Value::as_str);
             let master_key = params
                 .get("groupId")
@@ -4479,6 +4635,7 @@ async fn dispatch(
             if recipient.trim().is_empty() {
                 return internal_error(id);
             }
+            state.lock().await.append_dispatch(method, params);
             match service
                 .approve_join_request(account, master_key, recipient)
                 .await
@@ -4664,6 +4821,25 @@ async fn dispatch(
         // 稳定性批（2026-10-20，A1）additive：追加 `accounts`（逐账号接收
         // 在飞/分位延迟/建流结局/崩溃）与 `outbound`（全局 + 逐账号在途）。
         "engine.perfMetrics" => jsonrpc::success_response(id, service.perf_metrics_snapshot()),
+        // getSyncState（阶段 1-1，SIGNAL-STAGE1-DESIGN §二 P-B-3；compat §3 行 +
+        // §5 块）：只读查询面——登录窗 sync 臂三件套的当前投影
+        // `{contacts, storage, profile, sinceMs}`（词表 idle|inflight|done|failed；
+        // sinceMs = 当前窗口开窗时刻，供消费方判新鲜度）。纯读：不触网、不落
+        // 调度日志、不建簿，重复调用逐字节一致（幂等验收）。数据源见
+        // `sync_state` 模块头注（注册表窗口簿 + storagePull 登录拉结果事件 +
+        // initialSyncComplete 两腿 join 面 + contacts 持久化完成位）。未登记/
+        // 已摘除账号 -32603（读面惯例折叠）；fake 模式无真实同步臂，恒答
+        // idle（fake 面 = 进程真实态，不伪装在飞）。
+        "getSyncState" => {
+            let account = params
+                .get("account")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match crate::sync_state::snapshot(account) {
+                Some(face) => jsonrpc::success_response(id, face),
+                None => internal_error(id),
+            }
+        }
         // engine.deviceCapabilities（D5 设备面能力注册）：PUT
         // /v1/devices/capabilities（官方 registerCapabilities 同端点）并回
         // 读上传面。触网方法（fake 恒已注册，getUserStatus 同款）；仅 401
@@ -4734,12 +4910,19 @@ async fn dispatch(
 }
 
 /// version 元方法应答体：上游 signal-cli JSON-RPC 的 `{name, version}`
-/// 双字符串键形状（connector 原样透传，键集即契约，不自造字段——libsignal
+/// 双字符串键形状（connector 原样透传，旧键集即契约、只增不改——libsignal
 /// 基线是 `engine.protocolCapabilities.baseline` 的面，不混装）。身份诚实
 /// 自报引擎本名与本仓版本，不冒充上游名——doctor 面向桌面呈现的就是这份
 /// 原文，冒名将制造「signal-cli 版本 0.1.0」式误读。
+///
+/// O1 握手引擎腿（2026-11-10，wire additive【engine-compat】）：additive
+/// `contractRevision` 键，值取 [`crate::contract::CONTRACT_REVISION`] 单源
+/// （connector `src/engine_contract.rs` 接受 version 面作能力面的回退面）。
+/// 旧双键 `{name, version}` 零变化——新增键只增不改，doctor 原样透传面
+/// 对旧消费方仍是同形前缀。
 fn version_payload() -> Value {
     json!({
+        "contractRevision": crate::contract::CONTRACT_REVISION,
         "name": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
     })
@@ -5165,6 +5348,29 @@ fn internal_error(id: &Value) -> Value {
     jsonrpc::error_response(id, &RpcError::new(-32603, "Internal error"))
 }
 
+/// finishLink 错误面归型（B1/issue #951）：Lost 是 URL 交付后会话死亡的
+/// 确定性错误（-1 LINK_LOST），不是引擎内部错误 -32603；UnknownUri 保持
+/// 上游原文逐字兼容。
+fn finish_link_error(id: &Value, error: LinkError) -> Value {
+    match error {
+        LinkError::UnknownUri => jsonrpc::error_response(id, &RpcError::new(-1, UNKNOWN_LINK_URI)),
+        LinkError::Lost => jsonrpc::error_response(id, &RpcError::new(-1, LINK_LOST)),
+        // finishLink 不走 attempt 键查找；归型保持内部错误（防御臂，不可达）。
+        LinkError::AttemptNotFound | LinkError::Internal => internal_error(id),
+    }
+}
+
+/// rotateLink 错误面归型：attempt 不存在是确定性契约错误（-1 +
+/// LINK_ATTEMPT_NOT_FOUND），其余一律折叠 -32603（细节不外泄）。
+fn rotate_link_error(id: &Value, error: LinkError) -> Value {
+    match error {
+        LinkError::AttemptNotFound => {
+            jsonrpc::error_response(id, &RpcError::new(-1, LINK_ATTEMPT_NOT_FOUND))
+        }
+        LinkError::UnknownUri | LinkError::Lost | LinkError::Internal => internal_error(id),
+    }
+}
+
 /// calls.* 材料字节 → 标准 base64（凭据/presentation 字节面统一编码点；
 /// 字节内容零日志零落盘纪律不变，此处只编码出 RPC 响应）。
 fn calls_b64(bytes: &[u8]) -> String {
@@ -5318,6 +5524,16 @@ fn send_error(id: &Value, error: crate::service::SendError) -> Value {
         crate::service::SendError::RateLimited {
             retry_after_secs: Some(secs),
         } => Some(json!({ "retryAfterSecs": secs })),
+        // BUG-16 proof 批（2026-11-13）：428 挑战 payload 上 wire 的 data
+        // 面——UX 批（send_proof_required 文案/后续 recaptcha 弹码）的
+        // 寻址键。缺席（token=None 的旧归型形态）不造键。
+        crate::service::SendError::ProofRequired {
+            token: Some(token),
+            options,
+        } if !options.is_empty() => Some(json!({
+            "token": token,
+            "options": options,
+        })),
         _ => None,
     };
     let rpc_error = match data {
@@ -5376,21 +5592,32 @@ fn send_story_success_body(
 pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'static str) {
     use crate::service::SendError;
     match error {
+        // BUG-16 刀2b 上移批（2026-11-13）：号码寻址本地解析 miss 的专用
+        // 面——-32010 数字码（不与 -1 通用 upstream 面撞码），connector 只
+        // 映射这一个码，-32603 全透传（boot_send_integrity 契约保持）。
+        SendError::UnregisteredRecipient => (-32010, "UNREGISTERED_RECIPIENT"),
+        // BUG-16 2a 终极批：CDS 自身失败的可重试专用面——connector 未知
+        // 此码自然折叠通用 upstream（retryable=true 进自动重试），绝不落
+        // 「未注册」文案；后续文案契约可按码收窄。
+        SendError::CdsUnavailable => (-32011, "CDS_UNAVAILABLE"),
         SendError::TargetTerminated => (-1, "SEND_TARGET_TERMINATED"),
         SendError::AnnouncementsOnly => (-1, "SEND_TARGET_ANNOUNCEMENTS_ONLY"),
         SendError::Unbound => (-32603, USER_UNBOUND_MESSAGE),
         SendError::RateLimited { .. } => (-32603, RATE_LIMITED_MESSAGE),
-        SendError::ProofRequired => (-32603, PROOF_REQUIRED_MESSAGE),
+        SendError::ProofRequired { .. } => (-32603, PROOF_REQUIRED_MESSAGE),
         SendError::ServerUnavailable => (-32603, SERVER_UNAVAILABLE_MESSAGE),
         SendError::IdentityUnverified => (-32603, IDENTITY_UNVERIFIED_MESSAGE),
         // cause 类全覆盖批（2026-10-16，§5）六族：均 -32603 + 固定原文
         //（锚词括注异常类名，connector 分类器按 message 命中）。
         SendError::WsRejected => (-32603, WS_REJECTED_MESSAGE),
+        SendError::AppExpired => (-32603, APP_EXPIRED_MESSAGE),
         SendError::WsTimeout => (-32603, WS_TIMEOUT_MESSAGE),
         SendError::WsTransport => (-32603, WS_TRANSPORT_MESSAGE),
         SendError::PreKey => (-32603, PRE_KEY_MESSAGE),
         SendError::SessionBuild => (-32603, SESSION_BUILD_MESSAGE),
         SendError::AttachmentUpload => (-32603, ATTACHMENT_UPLOAD_MESSAGE),
+        SendError::AttachmentBusy => (-32603, ATTACHMENT_BUSY_MESSAGE),
+        SendError::AttachmentBudgetExceeded => (-32603, ATTACHMENT_BUDGET_MESSAGE),
         SendError::NoRecipients => (-32603, NO_RECIPIENTS_MESSAGE),
         // 群取回分型降级（接收完整性批②，compat §3）：-1 同目标终止族
         // （目标群态不可用即不应再发），data.count 由 send_error 单点附加。
@@ -5402,6 +5629,63 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B1（issue #951）：finishLink 会话 lost 必须是 -1 + LINK_LOST
+    /// （确定性错误码），不能折叠成 -32603 内部错误；UnknownUri 原文不变。
+    #[test]
+    fn finish_link_error_faces_pin_link_lost_and_unknown_uri() {
+        let lost = finish_link_error(&Value::from(7), LinkError::Lost);
+        assert_eq!(lost["id"], json!(7));
+        assert_eq!(lost["error"]["code"], json!(-1));
+        assert_eq!(lost["error"]["message"], json!("LINK_LOST"));
+
+        let unknown = finish_link_error(&Value::from(8), LinkError::UnknownUri);
+        assert_eq!(unknown["error"]["code"], json!(-1));
+        assert_eq!(unknown["error"]["message"], json!(UNKNOWN_LINK_URI));
+
+        let internal = finish_link_error(&Value::from(9), LinkError::Internal);
+        assert_eq!(internal["error"]["code"], json!(-32603));
+        assert_eq!(internal["error"]["message"], json!("Internal error"));
+    }
+
+    /// BUG-16 刀2b 上移：号码寻址本地解析 miss 必须是 -32010 +
+    /// UNREGISTERED_RECIPIENT（确定性专用面），不能折叠 -32603——connector
+    /// 只按这个数字码分类，-32603 保持通用内部错误全透传。
+    #[test]
+    fn send_error_face_pins_unregistered_recipient() {
+        let (code, message) = send_error_face(&crate::service::SendError::UnregisteredRecipient);
+        assert_eq!(code, -32010);
+        assert_eq!(message, "UNREGISTERED_RECIPIENT");
+    }
+
+    /// BUG-16 2a 终极批：CDS 自身失败面 -32011（可重试）——与 -32010
+    /// （服务端确证未注册）严格分家。
+    #[test]
+    fn send_error_face_pins_cds_unavailable() {
+        let (code, message) = send_error_face(&crate::service::SendError::CdsUnavailable);
+        assert_eq!(code, -32011);
+        assert_eq!(message, "CDS_UNAVAILABLE");
+    }
+
+    /// 双槽 QR 轮换（engine 侧 additive，2026-11-11 批）：rotateLink 的
+    /// attemptId 不存在必须是 -1 + LINK_ATTEMPT_NOT_FOUND（确定性契约错误，
+    /// 连接器据此重新 startLink），其余错误仍折叠 -32603。
+    #[test]
+    fn rotate_link_error_faces_pin_attempt_not_found() {
+        let not_found = rotate_link_error(&Value::from(11), LinkError::AttemptNotFound);
+        assert_eq!(not_found["id"], json!(11));
+        assert_eq!(not_found["error"]["code"], json!(-1));
+        assert_eq!(
+            not_found["error"]["message"],
+            json!("LINK_ATTEMPT_NOT_FOUND")
+        );
+
+        for folded in [LinkError::UnknownUri, LinkError::Lost, LinkError::Internal] {
+            let response = rotate_link_error(&Value::from(12), folded);
+            assert_eq!(response["error"]["code"], json!(-32603));
+            assert_eq!(response["error"]["message"], json!("Internal error"));
+        }
+    }
 
     /// setConversationHidden 参数词表 strict-parse 面（S16）：恰三键
     /// account/peerAci/hidden 逐键验型；缺键/坏型/多余键整拒（fail-closed
@@ -5505,7 +5789,10 @@ mod tests {
             SendError::RateLimited {
                 retry_after_secs: None,
             },
-            SendError::ProofRequired,
+            SendError::ProofRequired {
+                token: None,
+                options: Vec::new(),
+            },
             SendError::ServerUnavailable,
             SendError::IdentityUnverified,
             SendError::WsRejected,
@@ -5514,6 +5801,8 @@ mod tests {
             SendError::PreKey,
             SendError::SessionBuild,
             SendError::AttachmentUpload,
+            SendError::AttachmentBusy,
+            SendError::AttachmentBudgetExceeded,
             SendError::NoRecipients,
             SendError::GroupSyncFailed { count: 2 },
             SendError::Internal,
@@ -5592,17 +5881,17 @@ mod tests {
         assert_eq!(counts["NetworkFailure"], json!(1));
     }
 
-    /// version 元方法应答体形状面：恰 `{name, version}` 双字符串键（上游
-    /// signal-cli JSON-RPC 形状，connector runtime.doctor 原样透传——键集
-    /// 即契约，改动即断）；name = 引擎本名（诚实自报，不冒充上游），
-    /// version = 本仓版本非空。
+    /// version 元方法应答体形状面：旧 `{name, version}` 双字符串键不回归
+    /// （上游 signal-cli JSON-RPC 形状，connector runtime.doctor 原样透传
+    /// ——键集即契约，改动即断；name = 引擎本名诚实自报，version = 本仓
+    /// 版本非空），additive `contractRevision` = 单源常量（O1 握手引擎腿）。
     #[test]
     fn version_payload_shape() {
         let payload = version_payload();
         let obj = payload.as_object().expect("payload object");
         assert_eq!(
             obj.keys().collect::<Vec<_>>().as_slice(),
-            ["name", "version"]
+            ["contractRevision", "name", "version"]
         );
         assert_eq!(obj["name"], json!(env!("CARGO_PKG_NAME")));
         assert_eq!(obj["name"], json!("kt-signal-engine"));
@@ -5611,6 +5900,11 @@ mod tests {
             !obj["version"].as_str().expect("version string").is_empty(),
             "version 非空"
         );
+        assert_eq!(
+            obj["contractRevision"],
+            json!(crate::contract::CONTRACT_REVISION)
+        );
+        assert_eq!(obj["contractRevision"], json!("1.285"));
     }
 
     /// 发送链结构化三面（限流/人机验证/服务端不可用）wire 形状：均
@@ -5627,7 +5921,10 @@ mod tests {
                 "(RateLimitExceeded)",
             ),
             (
-                crate::service::SendError::ProofRequired,
+                crate::service::SendError::ProofRequired {
+                    token: None,
+                    options: Vec::new(),
+                },
                 PROOF_REQUIRED_MESSAGE,
                 "(ProofRequiredException)",
             ),
@@ -5797,76 +6094,5 @@ mod tests {
         // 无键态）。
         let text = serde_json::to_string(&bare).expect("serialize");
         assert!(!text.contains("null"), "no-null：{text}");
-    }
-
-    /// 调度日志大媒体摘要面（帧帽对齐批 companion）：>1MiB（旧帧帽闸位）的
-    /// data URI 落盘前换成字节数摘要（形状同 updateGroup avatar），小载荷与
-    /// 其余键逐字保留（connector 侧既有断言零冲击）；非 send 系方法零变化。
-    #[test]
-    fn dispatch_log_large_media_payloads_are_digested_small_ones_verbatim() {
-        // 小载荷（旧帧帽下可达）：逐字保留。
-        let small_video = "data:video/mp4;base64,AAAA";
-        let small_image = "data:image/png;base64,BBBB";
-        let send = json!({
-            "account": "+15550000000",
-            "message": "hi",
-            "attachments": [small_video, 42],
-            "previewImage": small_image,
-        });
-        let logged = redacted_dispatch_params("send", send.as_object().expect("object"));
-        assert_eq!(logged["attachments"], json!([small_video, 42]));
-        assert_eq!(logged["previewImage"], json!(small_image));
-        assert_eq!(logged["message"], json!("hi"));
-        assert_eq!(logged["account"], json!("+15550000000"));
-
-        // 大载荷（>1MiB，帧帽对齐后才可达）：摘要化（非字符串条目原样）。
-        let big_video = format!("data:video/mp4;base64,{}", "A".repeat(1024 * 1024));
-        let big_image = format!("data:image/png;base64,{}", "B".repeat(1024 * 1024));
-        let send = json!({
-            "account": "+15550000000",
-            "message": "hi",
-            "attachments": [big_video, 42],
-            "previewImage": big_image,
-        });
-        let logged = redacted_dispatch_params("send", send.as_object().expect("object"));
-        assert_eq!(
-            logged["attachments"],
-            json!([
-                format!("[attachment data uri: {} bytes]", big_video.len()),
-                42
-            ])
-        );
-        assert_eq!(
-            logged["previewImage"],
-            json!(format!(
-                "[previewImage data uri: {} bytes]",
-                big_image.len()
-            ))
-        );
-
-        let story = json!({
-            "account": "+15550000000",
-            "attachment": big_video,
-            "previewImage": big_image,
-        });
-        let logged = redacted_dispatch_params("sendStory", story.as_object().expect("object"));
-        assert_eq!(
-            logged["attachment"],
-            json!(format!("[attachment data uri: {} bytes]", big_video.len()))
-        );
-        assert_eq!(
-            logged["previewImage"],
-            json!(format!(
-                "[previewImage data uri: {} bytes]",
-                big_image.len()
-            ))
-        );
-
-        let other = json!({
-            "account": "+15550000000",
-            "attachment": big_video,
-        });
-        let logged = redacted_dispatch_params("sendReaction", other.as_object().expect("object"));
-        assert_eq!(json!(logged), other, "非 send 系方法零变化");
     }
 }

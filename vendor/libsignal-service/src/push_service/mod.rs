@@ -106,12 +106,19 @@ fn pinned_client_builder(
     ca_pem: &str,
     user_agent: &str,
 ) -> reqwest::ClientBuilder {
-    reqwest::ClientBuilder::new()
+    let builder = reqwest::ClientBuilder::new()
         .tls_certs_only([
             reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap()
         ])
         .user_agent(user_agent)
-        .http1_only()
+        .http1_only();
+    // Local debugging only: TLS-terminating proxies present a private CA that
+    // the pinned Signal root cannot verify. Opt in explicitly, never default.
+    if std::env::var("KT_SIGNAL_INSECURE_TLS").ok().as_deref() == Some("1") {
+        builder.danger_accept_invalid_certs(true)
+    } else {
+        builder
+    }
 }
 
 impl PushService {
@@ -212,6 +219,13 @@ impl PushService {
         additional_headers: &[(&'static str, &str)],
         credentials: Option<ServiceCredentials>,
     ) -> Result<SignalWebSocket<C>, ServiceError> {
+        #[cfg(feature = "cdsi")]
+        if std::env::var("KT_WS_TRANSPORT").as_deref() != Ok("legacy") {
+            if let Some(credentials) = credentials.clone() {
+                return self.ws_official::<C>(credentials).await;
+            }
+        }
+
         let span = debug_span!("websocket");
 
         let mut url = Endpoint::service(path).into_url(&self.cfg)?;
@@ -440,5 +454,113 @@ mod upgrade_classify_tests {
         ] {
             assert!(classify_upgrade_response(status).is_ok());
         }
+    }
+}
+
+#[cfg(feature = "cdsi")]
+impl PushService {
+    /// Opens one official chat connection. This is the only place that maps
+    /// existing Signal credentials to libsignal-net headers.
+    pub async fn ws_official<C: WebSocketType>(
+        &mut self,
+        credentials: ServiceCredentials,
+    ) -> Result<SignalWebSocket<C>, ServiceError> {
+        use std::collections::HashMap;
+
+        use libsignal_net::chat::{
+            AuthenticatedChatHeaders, ChatHeaders, LanguageList, ReceiveStories,
+        };
+        use libsignal_net::connect_state::{
+            ConnectState, ConnectionResources, DefaultConnectorFactory,
+            PreconnectingFactory, SUGGESTED_CONNECT_CONFIG,
+        };
+        use libsignal_net::env::{StaticIpOrder, UserAgent};
+        use libsignal_net::infra::route::{
+            DirectOrProxyMode, DirectOrProxyProvider,
+        };
+        use libsignal_net::infra::{
+            EnableDomainFronting, OverrideNagleAlgorithm,
+        };
+        use libsignal_net_infra::dns::DnsResolver;
+        use libsignal_net_infra::utils::no_network_change_events;
+
+        let aci = credentials.aci.ok_or(ServiceError::WsClosing {
+            reason: "official transport requires an ACI",
+        })?;
+        let device_id = credentials.device_id.ok_or(ServiceError::WsClosing {
+            reason: "official transport requires a device id",
+        })?;
+        let password = credentials.password.clone().ok_or(ServiceError::WsClosing {
+            reason: "official transport requires a password",
+        })?;
+
+        let env: libsignal_net::env::Env<'_> = self.servers.into();
+        let connect = ConnectState::new_with_transport_connector(
+            SUGGESTED_CONNECT_CONFIG,
+            PreconnectingFactory::new(DefaultConnectorFactory, Duration::ZERO),
+        );
+        let network = no_network_change_events();
+        let dns = DnsResolver::new_with_static_fallback(
+            HashMap::from([env
+                .chat_domain_config
+                .static_fallback(StaticIpOrder::HARDCODED)]),
+            &network,
+        );
+        let resources = ConnectionResources {
+            connect_state: &connect,
+            dns_resolver: &dns,
+            network_change_event: &network,
+            confirmation_header_name: env
+                .chat_domain_config
+                .connect
+                .confirmation_header_name
+                .map(reqwest::header::HeaderName::from_static),
+        };
+        let route = DirectOrProxyProvider {
+            inner: env.chat_domain_config.connect.route_provider(
+                EnableDomainFronting::No,
+                OverrideNagleAlgorithm::UseSystemDefault,
+            ),
+            mode: DirectOrProxyMode::maybe_proxy(
+                crate::websocket::directory::proxy_from_environment(),
+            ),
+        };
+        let headers = ChatHeaders::Auth(AuthenticatedChatHeaders {
+            aci: libsignal_core::Aci::from(aci),
+            device_id,
+            password,
+            receive_stories: ReceiveStories::from(false),
+            languages: LanguageList::default(),
+        });
+        let user_agent =
+            UserAgent::with_libsignal_version("KT-Signal-Engine");
+        let socket = crate::websocket::chat_adapter::connect_socket(
+            resources,
+            env.chat_domain_config.connect.service,
+            route,
+            &user_agent,
+            headers,
+        )
+        .await
+        .map_err(|error| match error {
+            libsignal_net::chat::ConnectError::DeviceDeregistered => {
+                ServiceError::Unauthorized
+            }
+            _ => ServiceError::WsClosing {
+                reason: "official chat connect failed",
+            },
+        })?;
+
+        let unidentified_push_service = PushService {
+            servers: self.servers,
+            cfg: self.cfg.clone(),
+            credentials: None,
+            client: self.client.clone(),
+            download_client: self.download_client.clone(),
+        };
+        let (ws, task) =
+            SignalWebSocket::new_official(socket, unidentified_push_service);
+        tokio::task::spawn(task);
+        Ok(ws)
     }
 }

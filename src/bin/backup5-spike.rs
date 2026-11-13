@@ -7,6 +7,27 @@
 //! 的 store 落在临时目录，仅证明流程可用）。证据仅三点：信封是否携带 key、
 //! transfer_archive 是否可取、档案字节数。跑完后请在手机端删除该关联设备。
 
+// M6 P0 编译期能力门禁（与 `src/main.rs` 同一条门，设计：
+// docs/plan/engine-store-encryption.md §7 P0）。bin target 各自独立编译，
+// `main.rs` 顶部的 `compile_error!` 覆盖不到这里；本 bin 同样会
+// `SqliteStore::open`（临时目录、无 key），漏开 feature 时磁盘上就是明文库，
+// 所以门要各写一份：`cargo build --no-default-features --bin backup5-spike`
+// 必须直接编译失败（exit 101）。
+#[cfg(not(feature = "sqlcipher"))]
+compile_error!(
+    "engine requires the sqlcipher feature: PRAGMA key is a silent no-op on plain SQLite (backup5-spike bin)"
+);
+
+/// M6 P0 运行时能力门（评审第 3 条：spike 打开库的路径必须经**同一条**门）。
+///
+/// 本 crate 是独立 bin（无 `lib.rs`），共享实现的唯一姿势是 `#[path]` 同源
+/// 引入——`src/store_cipher.rs` 不引用 `crate::` 下的模块，可以被两个 bin
+/// 各编一份。`allow(dead_code)`：主 bin 才用得到的启动证据/断言辅助面在本
+/// crate 里用不上。
+#[allow(dead_code)]
+#[path = "../store_cipher.rs"]
+mod store_cipher;
+
 use std::time::Duration;
 
 use futures::channel::mpsc;
@@ -31,6 +52,13 @@ const DEVICE_NAME: &str = "KT backup5 spike";
 
 #[tokio::main]
 async fn main() {
+    // 能力门在**任何磁盘动作之前**（评审第 3 条）：缺 SQLCipher 能力时连临时
+    // 目录都不建、也不进 `SqliteStore::open`（它会 create_if_missing 建明文
+    // 库）。失败证据行由门的 `report_denial_once` 落一条，这里不再重复打印，
+    // 只把退出码交代清楚。
+    if store_cipher::ensure_cipher_capable().await.is_err() {
+        std::process::exit(1);
+    }
     let spike_dir = std::env::temp_dir().join("kt-backup5-spike-store");
     let _ = std::fs::remove_dir_all(&spike_dir);
     std::fs::create_dir_all(&spike_dir).expect("create temp dir");

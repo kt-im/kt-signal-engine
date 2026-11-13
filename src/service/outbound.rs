@@ -60,6 +60,12 @@ impl OutboundHub {
     /// writer 写出），再入全局有界队列。返回时帧已在全局队列中（行序
     /// 与既有实现一致）；出口已死返回 false。
     pub(crate) async fn notify(&self, account: &str, value: Value) -> bool {
+        // 阶段 1-1（SIGNAL-STAGE1-DESIGN §二 P-B-3）：通知出口是 `getSyncState`
+        // 投影簿的唯一观测点。纯观测、零语义变化——只解析两个低频事件
+        // （`engine.storagePull` / `engine.initialSyncComplete`），逐消息的
+        // `receive` 通知在这里只比一次方法名；背压等待之前落簿，状态不因
+        // 出口慢而滞后。
+        crate::sync_state::observe_notification(account, &value);
         let Ok(permit) = self.account_semaphore(account).acquire_owned().await else {
             return false;
         };

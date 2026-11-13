@@ -13,16 +13,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use presage::libsignal_service::configuration::{Endpoint, ServiceCredentials, SignalServers};
-use presage::libsignal_service::content::ContentBody;
+use presage::libsignal_service::content::{Content, ContentBody};
 use presage::libsignal_service::prelude::PushService;
+use presage::libsignal_service::prelude::ServiceError as ProvisioningServiceError;
 use presage::libsignal_service::protocol::{IdentityKeyPair, ServiceId};
 use presage::libsignal_service::provisioning::{
-    link_device, NewDeviceRegistration, SecondaryDeviceProvisioning,
+    link_device, NewDeviceRegistration, ProvisioningError, SecondaryDeviceProvisioning,
 };
 use presage::libsignal_service::push_service::HttpAuthOverride;
 use presage::libsignal_service::utils::phonenumber_from_signal;
@@ -37,9 +39,12 @@ use rand::rng;
 use rand::Rng;
 use reqwest::Method;
 use serde_json::{json, Value};
-use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify};
+use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify, OnceCell};
 
 use crate::state::{AccountEntry, EngineState, ACCOUNTS_DIR, QUARANTINE_DIR, QUARANTINE_LOG};
+use crate::store_cipher;
+use crate::store_key::StoreKeyState;
+use crate::store_open::{self, StoreFileState, StoreOpenError};
 
 /// A1 per-account 观测面（稳定性批 2026-10-20）：接收在飞/延迟分位/建流
 /// 结局/崩溃计数，经既有 `engine.perfMetrics` 快照 additive 暴露。
@@ -48,6 +53,8 @@ pub(crate) mod account_metrics;
 /// AccountEntropyPool 的索取（日级节律）与 keys sync 落库面，官方 ensureAEP
 /// 行为对齐（协议字面量/闸序/存储位见模块头）。
 pub(crate) mod aep;
+/// 附件上行全局闸（M5）：并发槽 + 转码字节预算，base64 decode 前预留。
+pub(crate) mod attachment_gate;
 pub(crate) mod avatar;
 pub(crate) mod backup_api;
 pub(crate) mod backup_task;
@@ -91,6 +98,9 @@ pub(crate) mod stickers;
 pub(crate) mod storage_call_link;
 pub(crate) mod storage_merge;
 pub(crate) mod storage_records;
+/// BUG-6 收尾：storage 记录按账号缓存（sticker/folders/pinned 三类读面的
+/// 网络税消除；失效只认 storage-pull-settled + 60s TTL 下限，见模块头）。
+pub(crate) mod storage_records_cache;
 pub(crate) mod storage_sticker;
 pub(crate) mod storage_sync;
 /// F 链路入站观测面（模块头注载语义/帽/取舍纪律）：Storage 合并驱动的会话
@@ -106,6 +116,13 @@ pub(crate) mod username;
 /// 官方 AttachmentPointer.audioWaveform/audioDurationSeconds 算法对齐，
 /// 模块头注载 wire 形状/失败姿态/解码覆盖矩阵）。
 pub(crate) mod voice_note;
+/// profileSharing 闸 whitelist 位 map 磁盘层（发送长尾修4，模块头注载落盘
+/// 形状/拒集压缩/失败不毒缓存纪律）：冷启动/TTL 过期后的发送路径零 Storage
+/// 网络读，过期只做后台 best-effort 刷新。
+pub(crate) mod whitelist_store;
+/// 只读延迟探针（WebSocket 收帧 → receive loop）：区分服务端晚到与本地排队，
+/// 固定采样门槛、零账号/正文、失败静默。
+pub(crate) mod ws_latency;
 pub(crate) mod zkgroup_consts;
 
 /// C 批群发提速：sender-key + 单请求 MRM 发送链（vendored 逐收件人路径
@@ -654,6 +671,12 @@ const ATTACHMENT_MAX_COUNT: usize = 32;
 /// 单附件字节上限：官方桌面 100MB CDN 上限同源，超出 fail-closed。
 const ATTACHMENT_MAX_BYTES: usize = 100_000_000;
 
+/// 出向声明尺寸上限（BUG-11 wire 批）：一张图片/视频的像素边长上界，
+/// 与 connector `MAX_ATTACHMENT_DIMENSION_PX` 同值（16 384 = 现阶段任何
+/// 官方 Signal 客户端上传的最大纹理边）。超出按形状坏 fail-closed，绝不
+/// 把渲染面用不上的数字写进指针（connector 侧同名常量同轮）。
+pub(crate) const MAX_ATTACHMENT_DIMENSION_PX: u32 = 16_384;
+
 struct ParsedAttachment {
     spec: presage::libsignal_service::sender::AttachmentSpec,
     bytes: Vec<u8>,
@@ -661,6 +684,13 @@ struct ParsedAttachment {
     /// 不能走 spec 面；由 upload_attachments_for_send 在上传后按本位对返回
     /// 指针置 Flags.GIF（官方消息组装期置位同构，见 apply_outgoing_gif_flag）。
     is_gif: bool,
+    /// `;width=<px>;height=<px>` 出向声明尺寸（BUG-11 wire 批）：connector
+    /// 把桌面测量到的图片/视频自然尺寸带在上行 data URI 上，上传返回后按
+    /// GIF 旗标同款「指针后置位」写 AttachmentPointer.width/height（proto
+    /// 9/10 位，官方发送侧携带位）——接收投影 project_attachment_pointer
+    /// 同位读回，接收侧首帧即终态盒，桌面测量链降级为纯兜底。双参同进退：
+    /// 解析面半边在场即整条形状坏（见 parse_attachment_meta）。
+    dimensions: Option<(u32, u32)>,
 }
 
 /// 出向 GIF 旗标单点：官方 GIF 消息 = 普通附件 DataMessage.attachments[].flags
@@ -686,6 +716,52 @@ fn apply_outgoing_voice_metadata(
     pointer.audio_duration_seconds = Some(metadata.duration_seconds);
 }
 
+/// 上传返回指针的客户端陈述面（parsed 序对齐）：GIF 旗标、语音元数据、
+/// 声明尺寸三通道；None = 该条不带该陈述（普通文件/预览图/旧形状）。
+type OutgoingAttachmentFace = (
+    bool,
+    Option<voice_note::VoiceAudioMetadata>,
+    Option<(u32, u32)>,
+);
+
+/// 逐条置位上行走廊的客户端陈述（GIF/语音/尺寸三通道单点）：上传返回序
+/// 与 parsed 序一一对应（presage join_all 保序），任一通道缺省 = 该字段
+/// 不置位（旧形状逐字节不变）。三条通道各自独立字段，互不挤占。
+fn apply_outgoing_attachment_faces(
+    pointers: &mut [presage::proto::AttachmentPointer],
+    faces: &[OutgoingAttachmentFace],
+) {
+    for (pointer, (is_gif, voice_metadata, dimensions)) in pointers.iter_mut().zip(faces) {
+        if *is_gif {
+            apply_outgoing_gif_flag(pointer);
+        }
+        if let Some(metadata) = voice_metadata {
+            apply_outgoing_voice_metadata(pointer, metadata);
+        }
+        if let Some(dimensions) = dimensions {
+            apply_outgoing_dimensions(pointer, *dimensions);
+        }
+    }
+}
+
+/// 出向声明尺寸置位单点（BUG-11 wire 批）：普通附件 data URI 的
+/// `;width=<px>;height=<px>` 两参数在上传返回后落到
+/// `AttachmentPointer.width=9`/`height=10`（vendored proto 两位，官方
+/// uploadAttachment 组装的发送态指针同一对字段）。与 GIF 旗标/语音元数据
+/// 同款「上传后置位」：尺寸是发送侧的测量陈述，CDN 上行面零涉及（加密/
+/// padding/digest 全官方原语），上传返回指针直接置位与官方消息组装期置位
+/// 同构。返回值随 DataMessage 出站后，收端 project_attachment_pointer
+/// 直接读出 width/height（该两位自 P14 起已在收投影面），接收侧首帧即
+/// 终态盒——桌面「声明→测量缓存→盘面探针→兜底」链降级为纯兜底。重复置位
+/// 幂等（纯赋值）。
+fn apply_outgoing_dimensions(
+    pointer: &mut presage::proto::AttachmentPointer,
+    dimensions: (u32, u32),
+) {
+    pointer.width = Some(dimensions.0);
+    pointer.height = Some(dimensions.1);
+}
+
 /// 出向 caption 置位单点（2026-10-15 媒体 story caption 批）：caption 走
 /// presage spec 上行面直通——vendored `AttachmentSpec.caption`（官方
 /// `MAX_BODY_ATTACHMENT_BYTE_LENGTH` 帽闸在 methods 参数面）由
@@ -703,17 +779,52 @@ fn apply_outgoing_caption(parsed: &mut [ParsedAttachment], caption: Option<&str>
     }
 }
 
-/// send 附件条目解析：data URI 唯一形状 = connector 上游形状
-/// `data:<mediatype>[;filename=<percent-encoded>][;voice=true][;gif=true];base64,<payload>`
+/// send 附件条目 metadata（M5 二段式解析第一段）：只做 data URI 形状/
+/// 参数解析与 payload 定位，不分配解码字节。payload_len 是解码字节的
+/// 保守上界（base64 解出 ≤ 3/4 payload），供全局字节预算在 decode **之前**
+/// 预留——32×100MB 的整批请求在解码前就被拒，而不是先吃满内存。
+///
+/// data URI 唯一形状 = connector 上游形状
+/// `data:<mediatype>[;filename=<percent-encoded>][;voice=true][;gif=true][;width=<px>;height=<px>];base64,<payload>`
 /// （RFC 2397 扩展 filename 参数同款；voice 参数映射官方 VOICE_MESSAGE
 /// flags，presage voice_note→AttachmentPointer.flags 官方同构；gif 参数映射
 /// 官方 Flags.GIF=8 位，参数面无 mediatype 闸——官方 Tenor GIF 即
-/// video/mp4 载体带 GIF 位，媒体类自判归消费方，收投影 isGif 同口径）。
-/// mediatype 缺省 application/octet-stream；非 base64 / 坏 percent / 坏
-/// base64 / 坏 voice/gif 值 / 超上限一律 None（fail-closed）。
-fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
+/// video/mp4 载体带 GIF 位，媒体类自判归消费方，收投影 isGif 同口径；
+/// width/height 参数（BUG-11 wire 批）是发送侧测量到的自然像素尺寸，上传
+/// 返回后置位指针同名字段，双参同进退——半边在场即整条形状坏，半对尺寸
+/// 对渲染面零信息量且会让收端拿到不可用的声明）。
+/// mediatype 缺省 application/octet-stream；非 base64 / 坏 percent /
+/// 坏 voice/gif/width/height 值一律 None（fail-closed）。
+struct AttachmentMeta {
+    content_type: String,
+    filename: Option<String>,
+    is_voice: bool,
+    is_gif: bool,
+    /// 出向声明尺寸（`;width=`/`;height=` 双参）：None = 未声明（普通
+    /// 旧形状零变化），Some = 两参俱在且各自在 1..=MAX_ATTACHMENT_DIMENSION_PX。
+    dimensions: Option<(u32, u32)>,
+    payload_offset: usize,
+    payload_len: usize,
+}
+
+impl AttachmentMeta {
+    /// 全局字节预算预留口径：payload 长度（解码字节上界）。
+    fn decoded_upper_bound(&self) -> u64 {
+        self.payload_len as u64
+    }
+}
+
+/// payload 长度是否已确定超出解码上限（base64 解码
+/// ≥ L/4*3 - 2；尾部 padding 最多 2 字节）。单项测试可拿小数字钉
+/// 定边界，不必分配 100MB 字符串。
+fn payload_exceeds_decoded_cap(payload_len: usize, max_bytes: usize) -> bool {
+    (payload_len as u64 / 4 * 3) > max_bytes as u64 + 2
+}
+
+fn parse_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
     let rest = uri.strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
+    let payload_offset = uri.len().checked_sub(payload.len())?;
     let mut parts = meta.split(';');
     let declared = parts.next().unwrap_or_default();
     let content_type = if declared.is_empty() {
@@ -725,6 +836,8 @@ fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
     let mut is_base64 = false;
     let mut is_voice = false;
     let mut is_gif = false;
+    let mut width = None;
+    let mut height = None;
     for param in parts {
         if param.eq_ignore_ascii_case("base64") {
             is_base64 = true;
@@ -746,11 +859,57 @@ fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
                 "false" => {}
                 _ => return None,
             }
+        } else if let Some(value) = param.strip_prefix("width=") {
+            width = Some(parse_outgoing_dimension(value)?);
+        } else if let Some(value) = param.strip_prefix("height=") {
+            height = Some(parse_outgoing_dimension(value)?);
         }
     }
+    // 出向声明尺寸双参同进退（voice 元数据同款纪律）：只有半边 = 形状坏，
+    // 整条 fail-closed。全缺 = 旧形状零变化（普通文件/语音/贴纸/预览图）。
+    let dimensions = match (width, height) {
+        (None, None) => None,
+        (Some(width), Some(height)) => Some((width, height)),
+        _ => return None,
+    };
     if !is_base64 {
         return None;
     }
+    // 解码前就拒绝明显超单条帽的 payload（decode 后仍有精确字节
+    // 复核）。不能拿 payload 长度直接比 100MB：100MB 附件的
+    // base64 payload 约 133MB（帧帽 160MiB 就是为它留的）。
+    if payload_exceeds_decoded_cap(payload.len(), ATTACHMENT_MAX_BYTES) {
+        return None;
+    }
+    Some(AttachmentMeta {
+        content_type: content_type.to_owned(),
+        filename,
+        is_voice,
+        is_gif,
+        dimensions,
+        payload_offset,
+        payload_len: payload.len(),
+    })
+}
+
+/// 出向声明尺寸参数值位解析（width=/height=）：十进制正整数，上界
+/// MAX_ATTACHMENT_DIMENSION_PX。空串、带正负号（u32::parse 会接受前导
+/// 加号，故先过全数字闸）、非十进制、0、超界一律 None——调用方把 None
+/// 翻成整条形状坏（fail-closed，voice/gif 坏值同姿态），绝不把不可用的
+/// 声明写进指针。
+fn parse_outgoing_dimension(value: &str) -> Option<u32> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let parsed: u32 = value.parse().ok()?;
+    (parsed > 0 && parsed <= MAX_ATTACHMENT_DIMENSION_PX).then_some(parsed)
+}
+
+/// 第二段：真正 base64 decode（调用方已持有全局闸租约并在 decode 前按
+/// payload 上界预留）。坏 base64 / 解码后超单条上限一律 None（fail-closed）。
+fn decode_attachment(uri: &str, meta: &AttachmentMeta) -> Option<ParsedAttachment> {
+    let end = meta.payload_offset.checked_add(meta.payload_len)?;
+    let payload = uri.get(meta.payload_offset..end)?;
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload)
@@ -760,15 +919,53 @@ fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
     }
     Some(ParsedAttachment {
         spec: presage::libsignal_service::sender::AttachmentSpec {
-            content_type: content_type.to_owned(),
+            content_type: meta.content_type.clone(),
             length: bytes.len(),
-            file_name: filename,
-            voice_note: if is_voice { Some(true) } else { None },
+            file_name: meta.filename.clone(),
+            voice_note: if meta.is_voice { Some(true) } else { None },
             ..presage::libsignal_service::sender::AttachmentSpec::default()
         },
         bytes,
-        is_gif,
+        is_gif: meta.is_gif,
+        dimensions: meta.dimensions,
     })
+}
+
+/// 测试便捷入口（生产路径必须走 parse_attachment_meta + decode_attachment
+/// 二段式，以便在 decode 前过全局字节预算）。
+#[cfg(test)]
+fn parse_attachment_data_uri(uri: &str) -> Option<ParsedAttachment> {
+    let meta = parse_attachment_meta(uri)?;
+    decode_attachment(uri, &meta)
+}
+
+/// 附件上行计划结果：uri 列表 + 预览图索引。
+type AttachmentPlan<'a> = (Vec<(&'a str, AttachmentMeta)>, Option<usize>);
+
+/// 附件上行计划（M5 第一段）：形状/定位 + 条数帽，不 decode、
+/// 不分配附件字节。条数超 32 或任一形状坏 → Internal（既有
+/// fail-closed 语义）。调用方随后按 meta.decoded_upper_bound() 汇总，
+/// 在 decode 前过全局字节预算。
+fn attachment_upload_plan<'a>(
+    entries: &'a [String],
+    preview_image: Option<&'a str>,
+) -> Result<AttachmentPlan<'a>, SendError> {
+    let mut metas = entries
+        .iter()
+        .map(|entry| parse_attachment_meta(entry).map(|meta| (entry.as_str(), meta)))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(SendError::Internal)?;
+    let image_index = match preview_image {
+        Some(uri) => {
+            metas.push((uri, parse_attachment_meta(uri).ok_or(SendError::Internal)?));
+            Some(metas.len() - 1)
+        }
+        None => None,
+    };
+    if metas.len() > ATTACHMENT_MAX_COUNT {
+        return Err(SendError::Internal);
+    }
+    Ok((metas, image_index))
 }
 
 /// percent-decode（connector build_attachment_data_uri 的 encodeURIComponent
@@ -821,6 +1018,13 @@ pub(crate) fn mode_from_env() -> bool {
 pub(crate) enum LinkError {
     /// finishLink 校验失败的契约错误原文（-1，compat §3）。
     UnknownUri,
+    /// 链接会话在 URL 交付后终局失败（B1，issue #951）：provisioning WS
+    /// 关闭/超时/流结束即 QR 必死，finishLink 以 -1 + LINK_LOST 确定性应答
+    /// （不是 -32603，避免 connector 把会话死亡当引擎内部错误重试）。
+    Lost,
+    /// rotateLink 入参的 attemptId 不存在（已被新 startLink 顶掉 / 已提交
+    /// 收口）：wire -1 + LINK_ATTEMPT_NOT_FOUND 确定性应答，不是 -32603。
+    AttemptNotFound,
     /// 内部失败（-32603，细节不外泄）。
     Internal,
 }
@@ -828,15 +1032,130 @@ pub(crate) enum LinkError {
 /// finishLink 成功应答投影：号码 + 账号自有 ACI（wire additive，connector
 /// 契约 1.142 消费面）。`aci` 是可选键的取值位：None = wire 整键缺席（不
 /// 出 null）——fake 面、并发幂等臂、store 不可读均诚实落 None。
+#[derive(Clone)]
 pub(crate) struct LinkedAccount {
     pub(crate) number: String,
     pub(crate) aci: Option<String>,
+}
+
+/// 同一 attempt 的 live 槽上限（双槽 QR 轮换：第 3 个槽进 = 最旧的槽退）。
+const LINK_MAX_LIVE_SLOTS: usize = 2;
+
+/// startLink 应答里的单个槽（additive）：slot 是 live 槽表下标（0 起），
+/// deviceLinkUri 是该槽的 provisioning QR。旧端只读顶层 deviceLinkUri
+///（= 第 0 槽）即可保持单槽行为。
+#[derive(Debug, Clone)]
+pub(crate) struct LinkSlotView {
+    pub slot: usize,
+    pub device_link_uri: String,
+}
+
+/// startLink 应答投影：deviceLinkUri 仍是第 0 槽（旧端逐字兼容），
+/// linkAttemptId + slots 是 additive 键（rotateLink 的入参与槽表）。
+#[derive(Debug, Clone)]
+pub(crate) struct LinkAttemptView {
+    pub attempt_id: String,
+    pub slots: Vec<LinkSlotView>,
+}
+
+impl LinkAttemptView {
+    /// 第 0 槽 uri（旧字段 deviceLinkUri 的唯一来源）。
+    pub(crate) fn device_link_uri(&self) -> &str {
+        self.slots
+            .first()
+            .map(|slot| slot.device_link_uri.as_str())
+            .unwrap_or_default()
+    }
+
+    /// wire 投影（compat §3 startLink 行）：三个键恒在。
+    pub(crate) fn to_json(&self) -> Value {
+        let mut row = serde_json::Map::with_capacity(3);
+        row.insert("deviceLinkUri".to_owned(), json!(self.device_link_uri()));
+        row.insert("linkAttemptId".to_owned(), json!(self.attempt_id));
+        row.insert("slots".to_owned(), link_slots_json(&self.slots));
+        Value::Object(row)
+    }
+}
+
+/// rotateLink 应答投影：新槽 uri + 槽号 + 该 attempt 当前 live 槽全表
+///（调用方按 slots 全量重渲染，槽号可能因收回重排）。
+#[derive(Debug, Clone)]
+pub(crate) struct LinkRotateView {
+    pub device_link_uri: String,
+    pub slot: usize,
+    pub slots: Vec<LinkSlotView>,
+}
+
+impl LinkRotateView {
+    /// wire 投影（compat §3 rotateLink 行）：三个键恒在。
+    pub(crate) fn to_json(&self) -> Value {
+        let mut row = serde_json::Map::with_capacity(3);
+        row.insert("deviceLinkUri".to_owned(), json!(self.device_link_uri));
+        row.insert("slot".to_owned(), json!(self.slot));
+        row.insert("slots".to_owned(), link_slots_json(&self.slots));
+        Value::Object(row)
+    }
+}
+
+/// 槽表 → wire 槽数组（[{deviceLinkUri, slot}]，下标即槽号）。
+fn link_slots_json(slots: &[LinkSlotView]) -> Value {
+    Value::Array(
+        slots
+            .iter()
+            .map(|slot| {
+                json!({
+                    "deviceLinkUri": slot.device_link_uri,
+                    "slot": slot.slot,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// 槽 uri 表 → 视图（slot 号 = 表下标；每次应答都带全表，收回后重排）。
+fn link_slot_views(slots: &[String]) -> Vec<LinkSlotView> {
+    slots
+        .iter()
+        .enumerate()
+        .map(|(slot, uri)| LinkSlotView {
+            slot,
+            device_link_uri: uri.clone(),
+        })
+        .collect()
+}
+
+/// 落 LINK_LOST 墓碑：记录摘除/回收后重复 finishLink 仍稳定回同一确定错误
+///（B1 幂等约定）。上限 64 条，先到先出。
+fn push_lost_link_tombstone(inner: &mut Inner, uri: &str, lost_at: u64) {
+    let mut tombstones = inner
+        .lost_link_tombstones
+        .lock()
+        .expect("lost tombstone lock");
+    tombstones.push((uri.to_owned(), lost_at));
+    let overflow = tombstones.len().saturating_sub(64);
+    if overflow > 0 {
+        tombstones.drain(0..overflow);
+    }
 }
 
 #[derive(Debug)]
 pub(crate) enum SendError {
     /// 账号不在本引擎注册表中（连接器只对 listAccounts 结果发送，正常不到达）。
     UnknownAccount,
+    /// 号码寻址的直聊收件人在本机解析不出（resolve_recipient 对裸号码
+    /// 走 contacts 数字位匹配 miss——UUID 首臂直解、本机号次臂直解，
+    /// 到不了此臂的输入只可能是「号码不在引擎 contacts」）。BUG-16 刀2b
+    /// 上移批（2026-11-13）：此前折叠 Internal(-32603)，connector 无法把
+    /// 「身份未解析」和「引擎内部炸」区分开（boot_send_integrity 契约
+    /// 实证）。专用面 -32010 + UNREGISTERED_RECIPIENT（数字码无歧义，
+    /// 不与 -1 通用 upstream 面撞码）；确定性失败不重试。
+    UnregisteredRecipient,
+    /// CDS 联系人发现自身失败（传输/认证/超时——**服务端没答**，与
+    /// UnregisteredRecipient 的「服务端确证未注册」严格区分）。BUG-16
+    /// 2a 终极批（2026-11-13，CDS 三级梯）：可重试面 -32011 +
+    /// CDS_UNAVAILABLE——connector 未知此码自然折叠通用 upstream 可重试
+    /// 臂，绝不落「未注册」文案（2b 打回教训的前置化）。
+    CdsUnavailable,
     /// 目标群已终止（官方 shouldSendToConversation terminated 位硬拒；错误
     /// 面 `-1` + `SEND_TARGET_TERMINATED`，compat §3）。
     TargetTerminated,
@@ -861,9 +1180,19 @@ pub(crate) enum SendError {
         retry_after_secs: Option<u64>,
     },
     /// 服务端要求人机验证（HTTP 428 → ServiceError::ProofRequiredError；
-    /// send 链 sender 同因再包层 MessageSenderError::ProofRequired，
-    /// token/options 不出归型面）。不自动重试；错误面 -32603（compat §3）。
-    ProofRequired,
+    /// send 链 sender 同因再包层 MessageSenderError::ProofRequired）。
+    /// BUG-16 proof 批（2026-11-13）：token/options **透传**出归型面——
+    /// push 挑战（options 含 "pushChallenge"/"push"）可全自动求解
+    /// （GET+PUT /v1/challenge），recaptcha 需人工（UX 批的文案面）。
+    /// 不自动重试（自动求解在 send 管道内联做，此变体 = 求解不可达/失败
+    /// 的确定性终态）；错误面 -32603（compat §3，锚词 PROOF_REQUIRED）。
+    ProofRequired {
+        /// 428 应答的挑战 token（求解/UX 弹码的寻址键；缺席 = 归型点丢失
+        /// payload 的旧形态，仅诊断用途）。
+        token: Option<String>,
+        /// 挑战类型词表（"pushChallenge"/"push"/"recaptcha"…原样透传）。
+        options: Vec<String>,
+    },
     /// Signal 服务端不可用（HTTP 5xx → ServiceError::UnhandledResponseCode
     /// 兜底臂 status≥500；vendored 无独立 ServerError 变体）。建议可重试，
     /// 重试决策在 connector/desktop；错误面 -32603（compat §3）。
@@ -880,6 +1209,8 @@ pub(crate) enum SendError {
     /// -32603 + 固定原文（锚词 WsRejectedException；cause 类全覆盖批
     /// 2026-10-16，compat §3/§5）。
     WsRejected,
+    /// 客户端版本过旧（HTTP 499）：服务端拒绝服务，需升级客户端，不自动重试。
+    AppExpired,
     /// WS 请求响应未达/等响应期断流（`ServiceError::Timeout`、等响应相
     /// `WsClosing`、`WsError`、presage Elapsed 超时）：请求可能已写入
     /// 服务器，结局未知——connector 契约「An unknown send outcome must
@@ -928,6 +1259,15 @@ pub(crate) enum SendError {
     GroupSyncFailed {
         count: u32,
     },
+    /// 附件上行全局槽位等待超时（M5）：并发槽 2，等待有
+    /// 界 10s。上行尚未开始（确定未投递），可重试；错误面
+    /// -32603 + 固定原文（锚词 AttachmentBusyException）。
+    AttachmentBusy,
+    /// 附件上行全局字节预算不足（M5）：base64 decode 前按
+    /// payload 上界预留失败，整批未解码未上行。单请求
+    /// 32×100MB 可能永远超预算，不自动重试；错误面 -32603 +
+    /// 固定原文（锚词 AttachmentBudgetException）。
+    AttachmentBudgetExceeded,
     Internal,
 }
 
@@ -949,6 +1289,7 @@ impl SendError {
                 | SendError::PreKey
                 | SendError::SessionBuild
                 | SendError::AttachmentUpload
+                | SendError::AttachmentBusy
                 | SendError::NoRecipients
         )
     }
@@ -983,9 +1324,25 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
             ServiceError::RateLimitExceeded { retry_after } => SendError::RateLimited {
                 retry_after_secs: retry_after.map(|d| d.num_seconds().max(0) as u64),
             },
-            ServiceError::ProofRequiredError(..) => SendError::ProofRequired,
+            ServiceError::ProofRequiredError(proof) => {
+                // BUG-16 proof 观测（2026-11-13）：挑战类型词表决定后续动作
+                // （push=全自动 / recaptcha 等=人工）。只落类型词，token 与
+                // 号码绝不入日志。
+                tracing::warn!(
+                    target: "engine.proof",
+                    options = ?proof.options,
+                    "server requires a proof challenge"
+                );
+                SendError::ProofRequired {
+                    token: Some(proof.token.clone()),
+                    options: proof.options.clone(),
+                }
+            }
             ServiceError::UnhandledResponseCode { status, .. } if status.as_u16() >= 500 => {
                 SendError::ServerUnavailable
+            }
+            ServiceError::UnhandledResponseCode { status, .. } if status.as_u16() == 499 => {
+                SendError::AppExpired
             }
             // —— cause 类全覆盖批（2026-10-16，§5）：服务器显式应答拒绝
             // 族（应答即未入队，确定未送达）——
@@ -1030,7 +1387,20 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
             MessageSenderError::ServiceError(service_error) => {
                 service_error_face(service_error, "PresageError::MessageSenderError::")
             }
-            MessageSenderError::ProofRequired { .. } => SendError::ProofRequired,
+            MessageSenderError::ProofRequired { token, options } => {
+                // BUG-16 proof 观测（2026-11-13）：send 链真正的归型臂（sender
+                // 求解失败/非 push 挑战原样上抛时到这里）。只落类型词表——token
+                // 与号码绝不入日志。
+                tracing::warn!(
+                    target: "engine.proof",
+                    options = ?options,
+                    "send surfaced a proof challenge (auto-solve did not clear it)"
+                );
+                SendError::ProofRequired {
+                    token: Some(token),
+                    options,
+                }
+            }
             // P9 身份拒发闸：sender 对 process_prekey_bundle 失败统一再包
             // UntrustedIdentity（vendor sender.rs），协议层拒发（旧钥会话/
             // 换钥 bundle）落到此臂；ProtocolError 面的裸
@@ -1266,19 +1636,24 @@ fn presage_error_variant_face(
 pub(crate) fn send_error_variant_face(error: &SendError) -> &'static str {
     match error {
         SendError::UnknownAccount => "SendError::UnknownAccount",
+        SendError::UnregisteredRecipient => "SendError::UnregisteredRecipient",
+        SendError::CdsUnavailable => "SendError::CdsUnavailable",
         SendError::TargetTerminated => "SendError::TargetTerminated",
         SendError::AnnouncementsOnly => "SendError::AnnouncementsOnly",
         SendError::Unbound => "SendError::Unbound",
         SendError::RateLimited { .. } => "SendError::RateLimited",
-        SendError::ProofRequired => "SendError::ProofRequired",
+        SendError::ProofRequired { .. } => "SendError::ProofRequired",
         SendError::ServerUnavailable => "SendError::ServerUnavailable",
         SendError::IdentityUnverified => "SendError::IdentityUnverified",
         SendError::WsRejected => "SendError::WsRejected",
+        SendError::AppExpired => "SendError::AppExpired",
         SendError::WsTimeout => "SendError::WsTimeout",
         SendError::WsTransport => "SendError::WsTransport",
         SendError::PreKey => "SendError::PreKey",
         SendError::SessionBuild => "SendError::SessionBuild",
         SendError::AttachmentUpload => "SendError::AttachmentUpload",
+        SendError::AttachmentBusy => "SendError::AttachmentBusy",
+        SendError::AttachmentBudgetExceeded => "SendError::AttachmentBudgetExceeded",
         SendError::NoRecipients => "SendError::NoRecipients",
         SendError::GroupSyncFailed { .. } => "SendError::GroupSyncFailed",
         SendError::Internal => "SendError::Internal",
@@ -1297,27 +1672,65 @@ fn identity_send_gate(account_dir: &Path, service_id: &ServiceId) -> Result<(), 
     }
 }
 
-/// P9 profileSharing 闸读面（S3，发送长尾修1 加会话级缓存）：Storage
-/// Service 联系人记录 whitelist 位 map。account 作用域进程内存缓存，TTL 内
-/// 直聊/群发送批零 Storage 网络读（活体 2026-10-17 实测该读 1.5-2.3s =
-/// send 暗区根因）；联系人族写面（`storage.write` Contact 臂 / blocked /
-/// state 读改写 / 入站 merge Contact 观测）即清该账号缓存，残余陈旧
-/// ≤ [`WHITELIST_CACHE_TTL`]。fail-open 语义零变化（缺记录/位 true/读失败
-/// 空 map 恒注入，[`include_profile_key_for`] 判定式不动；错误空 map 与
-/// 真实空 map 同缓存同语义）。返回值第二位 = 缓存命中与否（探针段用）。
+/// P9 profileSharing 闸读面（S3；发送长尾修1 进程缓存 + 修4 磁盘层）：
+/// Storage Service 联系人记录 whitelist 位 map，直聊/群发送按会话位闸本机
+/// profile_key 注入。三级读面（契约面见 compat §5「profileSharing 闸读面
+/// 磁盘层」批）：
+///
+/// 1. **进程内存**（TTL [`WHITELIST_CACHE_TTL`]）：零网络零磁盘，热路径；
+/// 2. **账号目录磁盘 map**（[`whitelist_store`]，最近一次成功全量读的拒
+///    集）：冷启动/TTL 过期后的直接答案——首条 send 不再付 ~1.8s Storage
+///    全量拉取（修3 预热要等 sync 臂沉降，进程刚起时的首条真实发送仍会
+///    踩冷缓存；磁盘层把这个窗口关掉）；
+/// 3. **bootstrap 同步全量读**：**仅**「该账号从未有任何持久化 map」时才
+///    发生（首装 / 账号目录被清）；成功后立即落盘，此后不再阻塞发送。
+///
+/// 磁盘 map 越新鲜窗（[`whitelist_store::is_fresh`]）：命中即排后台
+/// best-effort 刷新（[`spawn_profile_sharing_whitelist_refresh`]，单飞、
+/// 失败保留旧 map），**发送路径绝不等网络**。陈旧判据含**未来越界**
+/// （`updatedAtMs > now + MAX_FUTURE_SKEW_MS`，时钟回拨 / 异常写入）——未来
+/// 时间戳不能当新鲜，否则陈旧拒集会被负年龄无限续命。联系人族写面失效只清
+/// 内存 + 打磁盘陈旧标记，下一次发送照旧命中磁盘（不回落同步拉取）。
+///
+/// fail-open 语义零变化（缺记录/位 true/读失败空 map 恒注入，
+/// [`include_profile_key_for`] 判定式不动；读面错误空 map 与真实空 map 同
+/// 缓存同语义）。返回值第二位 = 读面来源（探针段用）。
 async fn profile_sharing_whitelist_probed(
     service: &Arc<Service>,
     account: &str,
-) -> (HashMap<String, bool>, bool) {
+) -> (HashMap<String, bool>, WhitelistSource) {
     if let Some(hit) = whitelist_cache_get(&service.whitelist_cache, account) {
-        return (hit, true);
+        // 陈旧态只在节流窗放行时排后台刷新（失败面每窗至多一次全量拉取，
+        // 旧 map 照常应答——见 WHITELIST_REFRESH_RETRY_WINDOW）。
+        if whitelist_refresh_allowed(&service.whitelist_cache, account) {
+            spawn_profile_sharing_whitelist_refresh(service, account);
+        }
+        return (hit.map, WhitelistSource::Cache);
     }
-    let fresh = match storage_context(service, account).await {
-        Ok(context) => storage_sync::contact_whitelist_map(&context).await,
-        Err(_) => HashMap::new(),
+    let now = now_ms();
+    let persisted = match service.account_dir(account).await {
+        Some(dir) => whitelist_store::load(&dir, account),
+        None => None,
     };
-    whitelist_cache_put(&service.whitelist_cache, account, fresh.clone());
-    (fresh, false)
+    let resolution = resolve_whitelist_miss(persisted, now, || {
+        fetch_profile_sharing_whitelist(service, account)
+    })
+    .await;
+    whitelist_cache_put_with(
+        &service.whitelist_cache,
+        account,
+        resolution.map.clone(),
+        Instant::now() + Duration::from_millis(resolution.cache_ttl_ms.max(1)),
+        resolution.refresh_due,
+    );
+    if let Some(fetched) = resolution.fetched.as_ref() {
+        // bootstrap 成功：立即落盘（此后冷启动/过期都不再同步拉取）。
+        persist_profile_sharing_whitelist(service, account, Some(fetched)).await;
+    } else if resolution.refresh_due {
+        // 磁盘 map 陈旧：已用旧 map 应答本批，后台重拉（失败保留旧 map）。
+        spawn_profile_sharing_whitelist_refresh(service, account);
+    }
+    (resolution.map, resolution.source)
 }
 
 /// profileSharing 闸读面（探针不关心的调用面薄壳，语义同
@@ -1326,50 +1739,146 @@ async fn profile_sharing_whitelist(service: &Arc<Service>, account: &str) -> Has
     profile_sharing_whitelist_probed(service, account).await.0
 }
 
-/// whitelist 缓存 TTL（发送长尾修1）：TTL 内重复发送零 Storage 读；
-/// 写面失效兜住主动翻转，残余陈旧窗口 ≤ TTL（profileSharing 位非实时
-/// 安全闸，偏差面同 compat §5 fail-open 登记）。
+/// whitelist 缓存 TTL / 磁盘 map 新鲜度窗（修1 定 TTL，修4 与磁盘层单源）：
+/// TTL 内重复发送零 Storage 读；写面失效兜住主动翻转，残余陈旧窗口 ≤ TTL
+/// （profileSharing 位非实时安全闸，偏差面同 compat §5 fail-open 登记）。
 /// 取值依据（2026-10-17 真机探针复盘）：5s TTL 在真实发送节奏（间隔
 /// 7-16s）下每条必 miss（服务端全量 manifest+联系人往返 1.5-1.7s 照付），
 /// 形同虚设；读取面是 Signal Storage Service 网络往返（storage_sync::
 /// contact_whitelist_map 全量拉取），本地 SQLite 假设不成立。TTL=600s
-/// 让正常节奏全部命中，正确性由联系人族写面失效（本文件
-/// whitelist_cache_invalidate 四处挂载）承担，TTL 仅作失联兜底。
-const WHITELIST_CACHE_TTL: Duration = Duration::from_secs(600);
+/// 让正常节奏全部命中，正确性由联系人族写面失效（磁盘陈旧标记 + 后台
+/// 重拉）承担，TTL 仅作失联兜底。
+/// 修4 起本值同时是磁盘 map 的新鲜度窗（[`whitelist_store::FRESH_WINDOW_MS`]
+/// 单源引用），两处永不同步漂移。
+const WHITELIST_CACHE_TTL: Duration = Duration::from_millis(whitelist_store::FRESH_WINDOW_MS);
 
-/// whitelist 缓存条目：(位 map, 过期时刻)（到期判定用注入时钟可比对的
-/// deadline 形，测试可拨针）。
-type WhitelistCacheEntry = (HashMap<String, bool>, std::time::Instant);
+/// whitelist 读面来源（探针 `engine.whitelist` 段 cache= 固定词表）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhitelistSource {
+    /// 进程内存命中（零网络零磁盘）。
+    Cache,
+    /// 账号目录磁盘 map 命中（零网络；陈旧时已排后台刷新）。
+    Persisted,
+    /// 无任何持久化 map 的首次账号：同步全量读一次（唯一允许阻塞的面）。
+    Bootstrap,
+}
 
-/// account 作用域 whitelist 缓存（Service 字段类型，进程内存不落盘）。
+impl WhitelistSource {
+    /// 探针固定词（hit|persisted|miss；正文/号码永不入日志）。
+    fn probe_word(self) -> &'static str {
+        match self {
+            Self::Cache => "hit",
+            Self::Persisted => "persisted",
+            Self::Bootstrap => "miss",
+        }
+    }
+}
+
+/// 后台刷新失败重试节流窗：陈旧/失效态下每窗至多一次全量拉取（失败不
+/// 影响旧 map 应答），避免 Storage Service 失联时每条发送都轰一次网络。
+const WHITELIST_REFRESH_RETRY_WINDOW: Duration = Duration::from_secs(30);
+
+/// whitelist 缓存条目（修1 + 修4）：位 map + 内存到期 deadline + 是否该排
+/// 后台刷新（磁盘 map 越新鲜窗 / 写面失效后的陈旧态）+ 下次允许排刷新的
+/// 时刻（失败节流）。
+#[derive(Debug, Clone)]
+struct WhitelistCacheEntry {
+    /// aci 小写 → 位（磁盘装载的 map 只含 false 条目，判定面同义）。
+    map: HashMap<String, bool>,
+    /// 内存命中截止时刻（Instant 形，测试可拨针）。
+    deadline: Instant,
+    /// 下次命中需触发后台刷新（发送路径只标记 + spawn，绝不同步等网络）。
+    refresh_due: bool,
+    /// 下次允许排后台刷新的时刻（失败节流窗；测试可拨针）。
+    next_refresh_at: Instant,
+}
+
+/// account 作用域 whitelist 缓存（Service 字段类型；进程内存，权威快照在
+/// [`whitelist_store`] 的账号目录磁盘 map）。
 type WhitelistCache = HashMap<String, WhitelistCacheEntry>;
 
-/// 缓存读取：TTL 内命中返回位 map，过期/缺席 None（锁内零 await）。
+/// 缓存读取：TTL 内命中返回条目，过期/缺席 None（锁内零 await）。
 fn whitelist_cache_get(
     cache: &StdMutex<WhitelistCache>,
     account: &str,
-) -> Option<HashMap<String, bool>> {
+) -> Option<WhitelistCacheEntry> {
     let guard = cache.lock().expect("whitelist cache lock");
-    let (map, deadline) = guard.get(account)?;
-    (std::time::Instant::now() < *deadline).then(|| map.clone())
+    let entry = guard.get(account)?;
+    (Instant::now() < entry.deadline).then(|| entry.clone())
 }
 
-/// 缓存写入（读面 miss 回填单点）。
+/// 缓存写入（默认 deadline = now + TTL、无待刷新）。
 fn whitelist_cache_put(
     cache: &StdMutex<WhitelistCache>,
     account: &str,
     map: HashMap<String, bool>,
 ) {
-    cache.lock().expect("whitelist cache lock").insert(
-        account.to_owned(),
-        (map, std::time::Instant::now() + WHITELIST_CACHE_TTL),
+    whitelist_cache_put_with(
+        cache,
+        account,
+        map,
+        Instant::now() + WHITELIST_CACHE_TTL,
+        false,
     );
 }
 
-/// 联系人族写面 → 该账号缓存失效（storage.write Contact 臂 / blocked /
-/// state 读改写 / 入站 merge Contact 观测共用单点；下一发送重读全量）。
+/// 缓存写入（显式 deadline / 待刷新位；磁盘装载按剩余新鲜寿命对齐）。
+fn whitelist_cache_put_with(
+    cache: &StdMutex<WhitelistCache>,
+    account: &str,
+    map: HashMap<String, bool>,
+    deadline: Instant,
+    refresh_due: bool,
+) {
+    cache.lock().expect("whitelist cache lock").insert(
+        account.to_owned(),
+        WhitelistCacheEntry {
+            map,
+            deadline,
+            refresh_due,
+            next_refresh_at: Instant::now(),
+        },
+    );
+}
+
+/// 后台刷新节流闸（失败不刷屏）：条目在、待刷新、且过了上次排期窗才放行；
+/// 放行即推进 next_refresh_at（WHITELIST_REFRESH_RETRY_WINDOW）。放行只影响
+/// 「排不排刷新」，与旧 map 应答无关（发送路径永不等网络）。
+fn whitelist_refresh_allowed(cache: &StdMutex<WhitelistCache>, account: &str) -> bool {
+    let mut guard = cache.lock().expect("whitelist cache lock");
+    let Some(entry) = guard.get_mut(account) else {
+        return false;
+    };
+    if !entry.refresh_due {
+        return false;
+    }
+    let now = Instant::now();
+    if now < entry.next_refresh_at {
+        return false;
+    }
+    entry.next_refresh_at = now + WHITELIST_REFRESH_RETRY_WINDOW;
+    true
+}
+
+/// 联系人族写面 → 该账号缓存失效（delete/写面失效共用单点；下一发送按磁盘
+/// map 命中或 bootstrap 重读全量）。
 fn whitelist_cache_invalidate(cache: &StdMutex<WhitelistCache>, account: &str) {
     cache.lock().expect("whitelist cache lock").remove(account);
+}
+
+/// 写面增量落到内存缓存条目（无条目 = no-op：下一次发送走磁盘/bootstrap）。
+fn whitelist_cache_apply_delta(
+    cache: &StdMutex<WhitelistCache>,
+    account: &str,
+    deltas: &[(String, bool)],
+) {
+    let mut guard = cache.lock().expect("whitelist cache lock");
+    let Some(entry) = guard.get_mut(account) else {
+        return;
+    };
+    for (aci, whitelisted) in deltas {
+        whitelist_store::apply(&mut entry.map, aci, *whitelisted);
+    }
 }
 
 /// whitelist 位 → 是否注入本机 profile_key：仅记录显式 `whitelisted == false`
@@ -1381,6 +1890,257 @@ fn include_profile_key_for(whitelist: &HashMap<String, bool>, service_id: &Servi
             .copied(),
         Some(false)
     )
+}
+
+/// 内存 miss 后的读面调度（I/O 注入，测试直打）：磁盘 map 命中就直接用
+/// （陈旧则标 refresh_due 排后台刷新），**只有完全没有任何持久化 map 才**
+/// 走到 `fetch`（bootstrap 同步一次）。返回落定结果供调用方写缓存/落盘/
+/// 排刷新——调度面与 I/O 面分离是本批四条测试的钉定点。
+struct WhitelistMissResolution {
+    map: HashMap<String, bool>,
+    source: WhitelistSource,
+    /// 需要排后台刷新（磁盘 map 陈旧）。
+    refresh_due: bool,
+    /// 内存缓存 deadline（毫秒，自 now 起算）。
+    cache_ttl_ms: u64,
+    /// bootstrap 成功的全量 map（落盘用）；None = 未拉取或拉取失败。
+    fetched: Option<HashMap<String, bool>>,
+}
+
+async fn resolve_whitelist_miss<F, Fut>(
+    persisted: Option<whitelist_store::PersistedWhitelist>,
+    now_ms: u64,
+    fetch: F,
+) -> WhitelistMissResolution
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<HashMap<String, bool>>>,
+{
+    if let Some(persisted) = persisted {
+        let fresh = whitelist_store::is_fresh(persisted.updated_at_ms, now_ms);
+        let cache_ttl_ms = if fresh {
+            whitelist_store::freshness_left_ms(persisted.updated_at_ms, now_ms).max(1)
+        } else {
+            whitelist_store::FRESH_WINDOW_MS
+        };
+        return WhitelistMissResolution {
+            map: persisted.map,
+            source: WhitelistSource::Persisted,
+            refresh_due: !fresh,
+            cache_ttl_ms,
+            fetched: None,
+        };
+    }
+    let fetched = fetch().await;
+    WhitelistMissResolution {
+        map: fetched.clone().unwrap_or_default(),
+        source: WhitelistSource::Bootstrap,
+        refresh_due: false,
+        cache_ttl_ms: whitelist_store::FRESH_WINDOW_MS,
+        fetched,
+    }
+}
+
+/// 全量拉取（唯一网络面）：成功 Some（含「零联系人」「manifest 404」两个
+/// 真实空面）；失败 None（调用方按 fail-open 空 map 应答，且**不落盘**）。
+async fn fetch_profile_sharing_whitelist(
+    service: &Arc<Service>,
+    account: &str,
+) -> Option<HashMap<String, bool>> {
+    let context = storage_context(service, account).await.ok()?;
+    storage_sync::contact_whitelist_map(&context).await
+}
+
+/// 全量拉取结果 → 落账号目录磁盘 map：成功才原子替换，失败（None）不写
+/// 不删（旧 map 原样）。写盘失败只打点，语义零变化。
+async fn persist_profile_sharing_whitelist(
+    service: &Arc<Service>,
+    account: &str,
+    fetched: Option<&HashMap<String, bool>>,
+) {
+    let Some(dir) = service.account_dir(account).await else {
+        return;
+    };
+    let persisted = whitelist_store::persist_fetch(&dir, account, fetched, now_ms());
+    if fetched.is_some() && !persisted {
+        tracing::warn!(
+            cause = "WhitelistPersistFailed",
+            account = %crate::methods::probe_account8(Some(account)),
+            "profile-sharing whitelist persist failed"
+        );
+    }
+}
+
+/// 后台/预热刷新单点：全量拉取 → 成功才写回内存 + 磁盘（失败保留旧 map，
+/// 只打点不上抛）。返回是否成功。
+async fn refresh_profile_sharing_whitelist(service: &Arc<Service>, account: &str) -> bool {
+    let started = std::time::Instant::now();
+    let fetched = fetch_profile_sharing_whitelist(service, account).await;
+    let refreshed = fetched.is_some();
+    if let Some(map) = fetched {
+        whitelist_cache_put(&service.whitelist_cache, account, map.clone());
+        persist_profile_sharing_whitelist(service, account, Some(&map)).await;
+    }
+    tracing::warn!(
+        target: "send_latency_probe",
+        stage = "engine.whitelist-refresh",
+        dur_ms = started.elapsed().as_millis() as u64,
+        account = %crate::methods::probe_account8(Some(account)),
+        outcome = if refreshed { "ok" } else { "err" },
+        "send-latency-probe",
+    );
+    refreshed
+}
+
+/// 单飞在途标记获取（同账号已有刷新 → false，不排第二份网络请求）。
+fn begin_whitelist_refresh(service: &Arc<Service>, account: &str) -> bool {
+    service
+        .whitelist_refresh_inflight
+        .lock()
+        .expect("whitelist refresh inflight lock")
+        .insert(account.to_owned())
+}
+
+/// 单飞槽：任务收口（含 panic 展开）必摘除在途标记。
+struct WhitelistRefreshSlot {
+    service: Arc<Service>,
+    account: String,
+}
+
+impl Drop for WhitelistRefreshSlot {
+    fn drop(&mut self) {
+        self.service
+            .whitelist_refresh_inflight
+            .lock()
+            .expect("whitelist refresh inflight lock")
+            .remove(&self.account);
+    }
+}
+
+/// 后台刷新（发送路径/预热触发）：spawn_local 承载（引擎单线程 LocalSet，
+/// `spawn_self_sync_leg` 同款纪律），单飞 + best-effort——失败保留旧 map，
+/// 绝不上抛、绝不阻塞发送。
+fn spawn_profile_sharing_whitelist_refresh(service: &Arc<Service>, account: &str) {
+    if !service.real {
+        return;
+    }
+    if !begin_whitelist_refresh(service, account) {
+        return;
+    }
+    let service = Arc::clone(service);
+    let account = account.to_owned();
+    tokio::task::spawn_local(async move {
+        let _slot = WhitelistRefreshSlot {
+            service: Arc::clone(&service),
+            account: account.clone(),
+        };
+        refresh_profile_sharing_whitelist(&service, &account).await;
+    });
+}
+
+/// 预热面单点（send_warmup 沉降带调用，返回探针词 hit|filled|busy|err）：
+/// 内存有且不需刷新 → hit（零网络）；同账号刷新在途 → busy（不重复轰）；
+/// 否则做一次刷新（本函数已在后台任务里，不阻塞发送）→ filled/err。
+async fn warm_profile_sharing_whitelist(service: &Arc<Service>, account: &str) -> &'static str {
+    if !service.real {
+        return "skip";
+    }
+    if whitelist_cache_get(&service.whitelist_cache, account).is_some_and(|hit| !hit.refresh_due) {
+        return "hit";
+    }
+    if !begin_whitelist_refresh(service, account) {
+        return "busy";
+    }
+    let _slot = WhitelistRefreshSlot {
+        service: Arc::clone(service),
+        account: account.to_owned(),
+    };
+    if refresh_profile_sharing_whitelist(service, account).await {
+        "filled"
+    } else {
+        "err"
+    }
+}
+
+/// 联系人族写面失效（blocked / state 读改写 / 入站 merge Contact 观测）：
+/// 内存失效 + 磁盘打陈旧标记——下一次发送命中磁盘 map（零网络）后**后台**
+/// 重拉，绝不回落同步拉取。
+async fn invalidate_profile_sharing_whitelist(service: &Service, account: &str) {
+    whitelist_cache_invalidate(&service.whitelist_cache, account);
+    if let Some(dir) = service.account_dir(account).await {
+        let _ = whitelist_store::mark_stale(&dir, account);
+    }
+}
+
+/// 账号启动装载（管线起点一次，纯本地读零网络）：磁盘 map → 内存缓存。
+/// 新鲜按其剩余寿命到期；陈旧（含**未来越界时间戳**，见
+/// [`whitelist_store::is_fresh`]）按 TTL 缓存并标 refresh_due（等后台刷新，
+/// 发送路径不 inline 拉网络）。已有内存条目（重连/重启窗口内已热）不覆盖。
+fn seed_profile_sharing_whitelist(service: &Service, account: &str, account_dir: &Path) {
+    let Some(persisted) = whitelist_store::load(account_dir, account) else {
+        return;
+    };
+    if whitelist_cache_get(&service.whitelist_cache, account).is_some() {
+        return;
+    }
+    let now = now_ms();
+    let fresh = whitelist_store::is_fresh(persisted.updated_at_ms, now);
+    let ttl_ms = if fresh {
+        whitelist_store::freshness_left_ms(persisted.updated_at_ms, now).max(1)
+    } else {
+        whitelist_store::FRESH_WINDOW_MS
+    };
+    whitelist_cache_put_with(
+        &service.whitelist_cache,
+        account,
+        persisted.map,
+        Instant::now() + Duration::from_millis(ttl_ms),
+        !fresh,
+    );
+}
+
+/// `storage.write` 写面增量（Contact 记录明文 → (aci, 位)）：已知位直接落
+/// 内存缓存 + 磁盘 map，免全量重拉。**磁盘只在不破坏「文件 = 完整拒集
+/// 快照」不变量时更新**：无持久化 map（从未成功全量读）就不落盘——半份拒
+/// 集会抑制后续 bootstrap，让未知拒条目静默丢失（比 fail-open 更糟）。
+fn apply_profile_sharing_whitelist_delta(
+    service: &Service,
+    account: &str,
+    account_dir: &Path,
+    deltas: &[(String, bool)],
+) {
+    if deltas.is_empty() {
+        return;
+    }
+    whitelist_cache_apply_delta(&service.whitelist_cache, account, deltas);
+    let Some(mut persisted) = whitelist_store::load(account_dir, account) else {
+        return;
+    };
+    for (aci, whitelisted) in deltas {
+        whitelist_store::apply(&mut persisted.map, aci, *whitelisted);
+    }
+    // 时刻保持原值：内容只对本次写面的 ACI 前进，整体新鲜度仍以全量读为
+    // 准（陈旧标记 0 原样保留 → 后台刷新照旧）。
+    let _ = whitelist_store::save(
+        account_dir,
+        account,
+        &persisted.map,
+        persisted.updated_at_ms,
+    );
+}
+
+/// storage.write 单条更新 → whitelist 位增量（INSERT/UPDATE 的 Contact 明文
+/// 才有；DELETE 无载荷 → None = 保守失效面）。
+fn contact_whitelist_write_delta(
+    update: &storage_write::StorageItemUpdate,
+) -> Option<(String, bool)> {
+    match update {
+        storage_write::StorageItemUpdate::Insert { record, .. }
+        | storage_write::StorageItemUpdate::Update { record, .. } => {
+            storage_sync::contact_whitelist_of(record)
+        }
+        storage_write::StorageItemUpdate::Delete { .. } => None,
+    }
 }
 
 /// F 链路回声抑制预观测（storage.write 面）：三类会话记录（Contact/GV1/
@@ -1732,11 +2492,48 @@ const INITIAL_SYNC_WINDOW_MS: u64 = 60_000;
 /// 登录期 sync 时机裁定（60s 一次性纪律单点；P15c 项4 既有语义抽纯函数，
 /// T-9 manifest 自动拉同门共闸）：上次记录缺席（首流/进程重启后）或超窗
 /// → true（本次建流安排 +2s 沉降）；窗内（重连风暴）→ false 恰跳过。
+static FORCE_INITIAL_SYNC: std::sync::OnceLock<StdMutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn force_initial_sync_on_next_stream(account: &str) {
+    if let Ok(mut set) = FORCE_INITIAL_SYNC
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+    {
+        set.insert(account.to_string());
+    }
+}
+
+fn take_forced_initial_sync(account: &str) -> bool {
+    FORCE_INITIAL_SYNC
+        .get_or_init(|| StdMutex::new(HashSet::new()))
+        .lock()
+        .map(|mut set| set.remove(account))
+        .unwrap_or(false)
+}
+
 fn initial_sync_due(last_elapsed_ms: Option<u64>) -> bool {
     match last_elapsed_ms {
         Some(elapsed) => elapsed >= INITIAL_SYNC_WINDOW_MS,
         None => true,
     }
+}
+
+/// gate-trace 定位打点（SIGNAL-GATE-TRACE-PLAN §1，2026-11-12）：收件箱闸
+/// 四跳断链定位专用，固定单行格式供 grep `[gate-trace]`。账号只落不可逆
+/// 短哈希（`probe_account8`），detail 只放枚举/布尔/计数——号码、名字、
+/// 消息正文一律不落。纯日志发射，不参与任何判定（零行为语义）。
+fn gate_trace(event: &str, account: &str, face: &str, detail: &str) {
+    // 发布前收尾(台账 TODO):四跳探针降级 warn→debug,默认静默,
+    // devtools/日志开 verbose 才见;格式与账号投影零改动。
+    tracing::debug!(
+        target: "engine.gate_trace",
+        "[gate-trace] hop=engine event={} account={} face={} detail={}",
+        event,
+        crate::methods::probe_account8(Some(account)),
+        face,
+        detail
+    );
 }
 
 /// FetchLatest STORAGE_MANIFEST 触发判别（T-9 消费臂入口纯函数面）：官方
@@ -1825,6 +2622,12 @@ async fn pull_storage_manifest(
     if groups.is_err() {
         perf_metrics::add(perf_metrics::keys::STORAGE_MANIFEST_PULL_ERR, 1);
     }
+    let contacts_ok = contacts.is_ok();
+    let groups_ok = groups.is_ok();
+    // BUG-6 收尾（用户护栏 2）：manifest 拉取落定 = 贴纸包/聊天文件夹/置顶
+    // 记录缓存的唯一事件失效点（云上记录可能已被其他设备改写）；下一轮
+    // storage.* 读懒回源，不主动预取、不在事件里刷新。
+    service.storage_contexts.invalidate_records(account).await;
     // 批 R 版本落账：任一腿 Ok 且读到 version ≥1 → 覆盖本地 manifest 状态
     // 文件的 version（重连版本闸比对基线；其余字段沿用旧值）。落账 best-
     // effort：账号解析缺席静默跳过（基线缺失只影响下次 skip 判定，探测
@@ -1836,9 +2639,20 @@ async fn pull_storage_manifest(
     service
         .notify(
             account,
-            storage_pull_notification(account, trigger, contacts.is_ok(), groups.is_ok()),
+            storage_pull_notification(account, trigger, contacts_ok, groups_ok),
         )
         .await;
+    // gate-trace 第 1 点：engine.storagePull 发射后一行（trigger + 两腿布尔）。
+    gate_trace(
+        "storage-pull",
+        account,
+        if contacts_ok && groups_ok {
+            "ok"
+        } else {
+            "fail"
+        },
+        &format!("trigger={trigger} contactsOk={contacts_ok} groupsOk={groups_ok}"),
+    );
     (contacts, groups)
 }
 
@@ -1983,6 +2797,9 @@ fn initial_sync_complete_notification(
 /// syncRequests 单请求构帧（P15c 项4，官方 getRequestConfigurationSyncMessage
 /// / getRequestBlockSyncMessage 同位，SendMessage.preload.ts:1685/:1654）：
 /// SyncMessage.content.Request{type}，padded sync message。
+///
+/// 合并注（2026-11-13）：远端把本函数从测试内提升为模块级（AEP 获取也复用它
+/// 构帧）；本分支测试里的同名私有版本已删除，测试直接解析到这里。
 fn build_sync_request(
     r#type: presage::proto::sync_message::request::Type,
 ) -> presage::proto::SyncMessage {
@@ -2004,16 +2821,33 @@ fn build_sync_request(
 /// 既有 60s 一次性纪律保留（重连风暴不重复轰主设备），请求族由 contacts
 /// 一腿补齐为官方三腿；每腿独立 best-effort（官方 Promise.all 一损俱损，
 /// 引擎零 stderr 纪律下逐腿尽力——sync 请求幂等，失败靠下次链路建立重补）。
-async fn send_initial_sync_requests(manager: &mut Manager<SqliteStore, Registered>) {
-    let _ = manager.request_contacts().await;
-    let own_aci = ServiceId::Aci(manager.registration_data().service_ids.aci.into());
-    for r#type in [
+async fn send_initial_sync_requests(manager: &mut Manager<SqliteStore, Registered>) -> bool {
+    let mut all_sent = true;
+    for request_type in [
+        presage::proto::sync_message::request::Type::Contacts,
         presage::proto::sync_message::request::Type::Configuration,
         presage::proto::sync_message::request::Type::Blocked,
     ] {
-        let body = ContentBody::SynchronizeMessage(build_sync_request(r#type));
-        let _ = manager.send_message(own_aci, body, now_ms()).await;
+        match manager.request_sync(request_type).await {
+            Ok(()) => tracing::warn!(
+                target: "engine.receive",
+                stage = "initial_sync_request_sent",
+                request = ?request_type,
+                "sync request sent"
+            ),
+            Err(error) => {
+                all_sent = false;
+                tracing::warn!(
+                    target: "engine.receive",
+                    stage = "initial_sync_request_failed",
+                    request = ?request_type,
+                    error = %error,
+                    "sync request send failed"
+                );
+            }
+        }
     }
+    all_sent
 }
 
 /// E.164 形状闸（`+` 前缀 + 1..=15 位 ASCII 数字；deleteForMeConversation
@@ -2075,6 +2909,10 @@ impl LinkResultSlot {
         self.resolved.notify_waiters();
     }
 
+    fn is_unresolved(&self) -> bool {
+        self.outcome.lock().expect("outcome lock").is_none()
+    }
+
     async fn wait(&self) -> Result<LinkOutcome, ()> {
         loop {
             if let Some(outcome) = self.outcome.lock().expect("outcome lock").clone() {
@@ -2085,10 +2923,285 @@ impl LinkResultSlot {
     }
 }
 
-struct PendingLink {
+/// 链接会话状态（B1，issue #951）：pending = 等待手机确认；lost = URL 已
+/// 交付后 provisioning 链路终局失败（WS 关闭/超时/流结束），该 QR 必死。
+/// lostAt 是首次观察到终局失败的毫秒时间戳，用于诊断/connector 对账。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkSessionState {
+    Pending,
+    Lost { lost_at: u64 },
+}
+
+impl LinkSessionState {
+    fn lost_at(self) -> Option<u64> {
+        match self {
+            Self::Pending => None,
+            Self::Lost { lost_at } => Some(lost_at),
+        }
+    }
+}
+
+fn mark_link_lost(state: &StdMutex<LinkSessionState>) -> u64 {
+    let mut state = state.lock().expect("link state lock");
+    match *state {
+        LinkSessionState::Pending => {
+            let lost_at = now_ms();
+            *state = LinkSessionState::Lost { lost_at };
+            lost_at
+        }
+        LinkSessionState::Lost { lost_at } => lost_at,
+    }
+}
+
+fn link_lost_at(state: &StdMutex<LinkSessionState>) -> Option<u64> {
+    state.lock().expect("link state lock").lost_at()
+}
+
+/// 单个 link 槽的独立记录（uri 键控）：finishLink 只等自己 uri 的记录，
+/// 新 startLink 取走旧记录后，旧 finish 不可能再拿到别人的结果冒充成功。
+///
+/// 双槽轮换（rotateLink）下同一 attempt 的全部槽共享 committed（attempt 级
+/// 提交位）：跨槽提交单飞，被 rotate 收回的槽上的在飞 finish 也能拿回同一
+/// 结果，绝不丢成 LINK_LOST。
+struct PendingRecord {
+    /// 本槽的 provisioning uri（finish 按它索引；retire 收口时摘除/墓碑用）。
     uri: String,
     store_dir: PathBuf,
+    /// 链接 store 的第二个句柄：flow 收口后由 finish 复用，避免刚 drop 连接
+    /// 池就重开同一 SQLite 文件（sqlx 池关闭是异步的）。提交重试时为空才
+    /// 回退 open_store。
+    store: StdMutex<Option<SqliteStore>>,
     result: Arc<LinkResultSlot>,
+    /// link_flow 的 spawn_local 句柄（B1）：新 startLink 必须 abort 旧任务，
+    /// 仅从表里摘掉记录会让旧 provisioning WS 继续跑并可能写注册数据。
+    /// 用 Option 承载是为了 retire 时能从 Arc<PendingRecord> 里取出 await。
+    task: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 会话状态共享槽：link_flow 任务落 lost/lostAt，finishLink 据此回
+    /// LINK_LOST（与结果槽分离，结果只负责唤醒等待者）。
+    state: Arc<StdMutex<LinkSessionState>>,
+    /// attempt 级提交门 + 已提交结果（同一 attempt 的全部槽共享同一把锁，
+    /// 见 LinkAttempt::committed）：只有真正执行过 state.add_account 的
+    /// finish 才会落 Some。跨槽并发 finish 用它做单飞，连接器超时重试用它
+    /// 做幂等应答；未提交记录永远不会借此返回成功。
+    committed: Arc<AsyncMutex<Option<LinkedAccount>>>,
+    /// 所属 attempt（提交后收回其余槽 / 诊断用）。
+    attempt_id: String,
+    /// 被更新的 startLink 顶掉：置位后任何 finish 都不得再提交或返回成功。
+    superseded: AtomicBool,
+    /// 已被 rotate/提交收回（不再是 live 槽）：置位后不再接受新的 finish；
+    /// 在飞的那次不受影响，物理收口延迟到它归零（见 Service::retire_slot）。
+    retired: AtomicBool,
+    /// 在飞 finish 计数：>0 时不得 abort 本槽 flow（会把用户正在确认的那次
+    /// 提交结果丢掉）。rotate 只置退休旗，收口由最后一个 finish 落地。
+    inflight_finishes: AtomicUsize,
+}
+
+/// 一次 startLink 的链接尝试（双槽 QR 轮换，additive 契约）：槽表 + attempt
+/// 级提交位。slots 按铸造序排列，slot 号 = 下标；rotateLink 追加新槽，超过
+/// LINK_MAX_LIVE_SLOTS 时从最旧开始退休（rotate 淘汰 / 提交后收回）。
+struct LinkAttempt {
+    /// live 槽 uri（铸造序）。
+    slots: Vec<String>,
+    /// attempt 级提交位：全部槽的 PendingRecord::committed 共享本锁。
+    committed: Arc<AsyncMutex<Option<LinkedAccount>>>,
+}
+
+/// fake 面的链接 attempt 形状桩（compat §6）：无网络桩同样带 attemptId 与
+/// live 槽表；没有 rotate 时只有一个槽（旧单槽语义原样保留）。
+struct FakeLinkAttempt {
+    attempt_id: String,
+    slots: Vec<String>,
+}
+
+/// 一个已铸好、尚未登记的 link 槽（startLink / rotateLink 共用的铸造产物）。
+/// 登记进 Inner::links 才成为可 finish 的会话；登记复核失败时
+/// MintedLinkSlot::discard 当场收口（abort flow + 回收未注册 store）。
+struct MintedLinkSlot {
+    uri: String,
+    store_dir: PathBuf,
+    store: StdMutex<Option<SqliteStore>>,
+    result: Arc<LinkResultSlot>,
+    task: tokio::task::JoinHandle<()>,
+    state: Arc<StdMutex<LinkSessionState>>,
+}
+
+impl MintedLinkSlot {
+    /// 铸好的槽 → 待登记记录（锚定 attempt 归属与 attempt 级提交位）。
+    fn into_record(
+        self,
+        attempt_id: String,
+        committed: Arc<AsyncMutex<Option<LinkedAccount>>>,
+    ) -> PendingRecord {
+        PendingRecord {
+            uri: self.uri,
+            store_dir: self.store_dir,
+            store: self.store,
+            result: self.result,
+            task: StdMutex::new(Some(self.task)),
+            state: self.state,
+            committed,
+            attempt_id,
+            superseded: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            inflight_finishes: AtomicUsize::new(0),
+        }
+    }
+
+    /// 丢弃一个未登记的槽（铸造后已过期）：abort flow → 放掉 store 句柄 →
+    /// 回收未注册目录（跨平台顺序同 retire_pending_record）。
+    async fn discard(self) {
+        self.task.abort();
+        let _ = self.task.await;
+        let _ = self.store.lock().expect("link store lock").take();
+        let _ = remove_link_store(&self.store_dir).await;
+    }
+}
+
+/// finishLink 的在飞守卫：进入时已在 Inner 锁内计数，离开（含早退）时归零；
+/// 归零且该槽已被退休时，在这里落地物理收口——retire 因为它在飞而推迟的那
+/// 次 abort/回收，绝不能提前打断用户正在确认的提交。
+struct FinishGuard {
+    service: Arc<Service>,
+    record: Arc<PendingRecord>,
+}
+
+impl FinishGuard {
+    fn new(service: &Arc<Service>, record: Arc<PendingRecord>) -> Self {
+        Self {
+            service: Arc::clone(service),
+            record,
+        }
+    }
+}
+
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        let remaining = self.record.inflight_finishes.fetch_sub(1, Ordering::AcqRel);
+        if remaining != 1 || !self.record.retired.load(Ordering::Acquire) {
+            return;
+        }
+        // Drop 不能 await：回到 LocalSet 里收口（finishLink 只在 LocalSet 内跑）。
+        let service = Arc::clone(&self.service);
+        let record = Arc::clone(&self.record);
+        tokio::task::spawn_local(async move {
+            service.finalize_retired_slot(record).await;
+        });
+    }
+}
+
+/// provisioning 会话终局失败来源（B1）：把「URL 是否已交付」和失败类型
+/// 分开，才能保证只有交付后的会话终局归 LINK_LOST。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkTerminalCause {
+    /// provisioning WS 关闭 / 读流结束。
+    StreamClosed,
+    /// keepalive 超时（由 link_device 的 ServiceError::Timeout 归入）。
+    KeepaliveTimeout,
+    /// startLink 的 URL 有界等待超时 / URL 无法交付给调用方。
+    UrlTimeout,
+    /// 注册数据序列化、落库或重载失败（进程内错误，不是会话终局）。
+    StoreWrite,
+}
+
+/// provisioning 终局错误 → 映射输入。只有明确的超时才归 keepalive 超时；
+/// 其余 WS 关闭/流结束统一按 StreamClosed 收口（两者在 URL 交付后都 = Lost）。
+fn provisioning_terminal_cause(error: &ProvisioningError) -> LinkTerminalCause {
+    match error {
+        ProvisioningError::ServiceError(ProvisioningServiceError::Timeout { .. }) => {
+            LinkTerminalCause::KeepaliveTimeout
+        }
+        _ => LinkTerminalCause::StreamClosed,
+    }
+}
+
+/// 纯映射（B1）：URL 交付后的 provisioning 终局（关闭/超时/流结束）才是
+/// `LinkError::Lost`；URL 交付前失败、URL 等待超时、注册数据落库失败都是
+/// 引擎内部失败 `LinkError::Internal`（-32603），不能冒充 LINK_LOST。
+/// URL 尚未交付就失败（连 URL 都没拿到 / 流出错）：内部失败，不是 lost。
+fn terminal_before_url() -> LinkError {
+    classify_link_terminal(false, LinkTerminalCause::StreamClosed)
+}
+
+/// 调用方已超时丢弃 url_rx（没有可 finish 的会话）：内部失败。
+fn terminal_url_timeout() -> LinkError {
+    classify_link_terminal(false, LinkTerminalCause::UrlTimeout)
+}
+
+/// URL 已交付后流结束/WS 关闭：会话必死 = Lost。
+///
+/// 单点出口：生产链路只经这里产出“交付后死亡”（测试锁住它，避免有人把
+/// 常量改成 false 后整条 B1 静默退回 -32603）。
+fn terminal_after_url_closed() -> LinkError {
+    classify_link_terminal(true, LinkTerminalCause::StreamClosed)
+}
+
+fn classify_link_terminal(url_delivered: bool, cause: LinkTerminalCause) -> LinkError {
+    match (url_delivered, cause) {
+        (true, LinkTerminalCause::StreamClosed) | (true, LinkTerminalCause::KeepaliveTimeout) => {
+            LinkError::Lost
+        }
+        _ => LinkError::Internal,
+    }
+}
+
+/// 注册数据落库/重载失败的归型（URL 已交付，但不是会话终局）。
+fn link_store_error() -> LinkError {
+    classify_link_terminal(true, LinkTerminalCause::StoreWrite)
+}
+
+/// 等 link_flow 任务真正收尾（store 连接随 future drop）。
+///
+/// 结果槽已 Ok 时任务只剩收尾几行，await 不会阻塞；retire 可能已取走句柄，
+/// None = 任务已收口。finish 在提交段复用链接期句柄前先走这一步，确保 flow
+/// 自己的 store 句柄已经 drop，同一 SQLite 池只剩记录里的那个句柄。
+async fn wait_link_task(record: &PendingRecord) {
+    let task = record.task.lock().expect("link task lock").take();
+    if let Some(task) = task {
+        let _ = task.await;
+    }
+    // sqlx 池关闭是异步的：任务收口后再让出几个调度窗口，避免紧随其后的
+    // open_store 与刚 drop 的连接池抢同一 SQLite 文件的 acquire 预算。
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// 收口一个待决链接记录：先立 superseded 旗（在途 finish 不得再提交），
+/// 再 abort 旧 flow，最后只回收从未提交为账号的 store。
+///
+/// 返回 lostAt；若记录已随 attempt 提交（兄弟槽完成了链接）则返回 None
+///（不抹掉成功），但仍唤醒等在本槽结果上的在飞 finish——它读 attempt 级
+/// 提交位拿回同一账号。
+async fn retire_pending_record(record: Arc<PendingRecord>) -> Option<u64> {
+    // 先立旗再 abort：finish 拿到旧结果槽的 Ok 后也必须看见 superseded。
+    record.superseded.store(true, Ordering::Release);
+    let task = record.task.lock().expect("link task lock").take();
+    if let Some(task) = task {
+        task.abort();
+        // 等 abort 真正 drop 旧 future（store 连接与未完成写入一起结束），
+        // 再探测/回收目录；仅置 superseded 不会停掉旧 provisioning WS。
+        let _ = task.await;
+    }
+    // 与在途 finish 的提交门串行：提交成功 = 记录已是真账号，store 必须
+    // 保留；未提交 = 这条会话从未成为账号，连同注册数据一起回收，绝不
+    // 留下引擎不认识的孤儿 store（用户重扫即可）。
+    let committed = record.committed.lock().await.is_some();
+    if committed {
+        // attempt 里别的槽已经提交：唤醒等在本槽结果上的 finish，让它读
+        // attempt 级提交位拿回同一账号（退休槽的在飞提交不丢结果）。
+        if record.result.is_unresolved() {
+            record.result.complete(Err(()));
+        }
+        return None;
+    }
+    // 先放掉 finish 复用的 store 句柄，再删目录（避免自己持有连接时删库）。
+    let _ = record.store.lock().expect("link store lock").take();
+    let lost_at = Some(mark_link_lost(&record.state));
+    if record.result.is_unresolved() {
+        record.result.complete(Err(()));
+    }
+    let _ = remove_link_store(&record.store_dir).await;
+    lost_at
 }
 
 /// provisioning 一次性迁移密钥的收口前行囊：link_flow 解构后原样暂存，
@@ -2118,6 +3231,10 @@ pub(crate) mod conversation_hidden;
 pub(crate) struct Service {
     data_dir: PathBuf,
     real: bool,
+    /// BUG-16 CDS 三级梯（2a 终极批，2026-11-13）：号码→身份的线上发现
+    /// 门——灰度开关/熔断/负缓存全进程内存（每账号一引擎=账号隔离天然
+    /// 成立）。默认关（KT_ENGINE_CDS_ENABLED 缺席=本地语义不变）。
+    cds_gate: CdsGate,
     state: Arc<AsyncMutex<EngineState>>,
     /// receive 通知出口（与 JSON-RPC 响应同一 stdout writer 队列；帧协议
     /// 见 main::OutboundFrame——Notice 直通，Flush 背压栅栏）。全局队列
@@ -2156,6 +3273,9 @@ pub(crate) struct Service {
     /// flag「消费方最后被告知的态」，storage_watch 模块契约（帽/种子静默/
     /// 防回声纪律见模块头注）。delete_account 摘除。
     conversation_state_books: StdMutex<HashMap<String, storage_watch::ConversationStateBook>>,
+    /// 附件上行全局闸（M5）：并发槽 + 解码字节预算。send/sendStory/
+    /// sendContact/贴纸共用一个进程级实例；用完即释放（Drop 租约）。
+    attachments: Arc<attachment_gate::AttachmentGate>,
     /// 账号级常驻发送管理器（C 批提速）：号码 → 共享互斥管理器。发送取用
     /// 命中即复用（websocket 由进程级 slot 注册表归一——同账号全引擎共享
     /// 单连接，closed → 重开并先拆旧，死亡自愈在 vendor 侧）；惰性
@@ -2171,10 +3291,14 @@ pub(crate) struct Service {
     /// 按账号隔离——R4：单账号失败/重连只摘本槽，不拖垮其他账号；池上限
     /// 2 = R2 连接预算，全忙 fail-closed 走 failover）。
     mrm_pool: group_mrm::MrmPool,
-    /// profileSharing 闸 whitelist 位缓存（发送长尾修1）：账号 → (位 map,
-    /// 过期时刻)，TTL [`WHITELIST_CACHE_TTL`] + 联系人族写面失效；进程内存
-    /// 不落盘不跨重启。delete_account 摘除。
+    /// profileSharing 闸 whitelist 位缓存（发送长尾修1 + 修4）：账号 → (位
+    /// map, 到期 deadline, 待刷新位)，TTL [`WHITELIST_CACHE_TTL`] + 联系人族
+    /// 写面失效；账号启动从磁盘 map 装载（[`whitelist_store`]），成功后反向
+    /// 写回磁盘——内存只是磁盘快照的热层。delete_account 摘除。
     whitelist_cache: StdMutex<WhitelistCache>,
+    /// whitelist 后台刷新单飞标记（修4）：账号 → 在途；发送路径/预热同一
+    /// 账号只允许一份全量拉取在飞（失败保留旧 map，不排队重放）。
+    whitelist_refresh_inflight: StdMutex<HashSet<String>>,
     /// 本机 profile capabilities 位缓存（回填能力门数据面，2026-10-20 批）：
     /// 账号 → 回填位 + 过期时刻，TTL [`own_capabilities::CAPABILITIES_CACHE_TTL`]，
     /// 失败不缓存；进程内存不落盘不跨重启。delete/重链摘除。
@@ -2183,6 +3307,14 @@ pub(crate) struct Service {
     /// `discard_incomplete_quarantine_stores` 全进程单飞——重复链接事件
     /// 幂等（后到者扫到已清空的区零通知），并发链接事件不双计。
     quarantine_discard: AsyncMutex<()>,
+    /// storage 面常驻上下文缓存（BUG-6）：账号 → 一次打开的 store + 凭据
+    /// PushService，进程生命周期复用（[`StorageContextCache`]）。条目对已
+    /// 注册账号惰性建立、解绑/同号重链摘除，上界 = 注册账号数。
+    storage_contexts: StorageContextCache,
+    /// Account numbers whose receive stream was rejected with 401/403. This is
+    /// the engine-owned terminal gate: send-family methods check it before any
+    /// vendor sender path (including MRM) can run. Cleared by a fresh link.
+    terminal_accounts: StdMutex<HashSet<String>>,
 }
 
 /// 接收管线停机宽限（S5 关停宽限可配）：停旗发出后等待任务收口（drop
@@ -2253,9 +3385,100 @@ type SendManagerCache = HashMap<String, SharedSendManager>;
 /// 常驻发送管理器共享句柄（取用方持句柄 + `lock_registered_for_send` 锁定）。
 type SharedSendManager = Arc<AsyncMutex<Manager<SqliteStore, Registered>>>;
 
+/// Phase1 Duplicate 重放目标：接收臂能从信封内容推出 thread（两群同
+/// sender+ts、远端删除墓碑都靠它精确定位）；只有经 RPC 传 legacy key 的
+/// 旧入口才退化到 sender+ts 全行匹配。
+enum DuplicateReplayTarget {
+    Thread {
+        sender: ServiceId,
+        timestamp: u64,
+        thread: presage::store::Thread,
+    },
+    Key(String),
+}
+
+/// Duplicate 重放读面的「无法确认」结局：store 打不开 / 行查询或 Content
+/// 解码失败 / 账号目录不可解析 / key 形状不合法。这些都不能证明服务器
+/// 重投的信封没有落库行，因此**不是**「无行」：接收臂必须按 Failed 扣留
+/// ack（信封留服务器队列，下次重投再试），否则读失败会被当 Unavailable
+/// 在 flush 后 ack，投影永久丢失。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DuplicateReplayError {
+    /// 账号不在 state / 账号目录不可解析：连 store 位置都不可知。
+    AccountUnavailable,
+    /// legacy dedupe key 形状不合法：无法定位行（不是确认无行）。
+    MalformedKey,
+    /// store 打不开（目录/连接/迁移失败）。
+    StoreOpen,
+    /// store 查询或 Content 解码失败：投递行状态未知。
+    StoreRead,
+}
+
+impl DuplicateReplayError {
+    /// 结构化日志短标签（wire/日志零正文）。
+    fn stage(self) -> &'static str {
+        match self {
+            DuplicateReplayError::AccountUnavailable => "account_unavailable",
+            DuplicateReplayError::MalformedKey => "malformed_key",
+            DuplicateReplayError::StoreOpen => "store_open_failed",
+            DuplicateReplayError::StoreRead => "store_read_failed",
+        }
+    }
+}
+
+/// Phase1 Duplicate 重放的 store 读面（纯查询单点）：thread 精确优先
+/// （墓碑行 sender 已改为 nil ACI，只有 thread+ts 找得到）；没有 thread
+/// 时按 sender+ts 返回全部命中行。
+///
+/// 查询成功但空集才是「确认无行」；查询/解码错误一律上抛为
+/// DuplicateReplayError::StoreRead，绝不折叠成空集。
+async fn duplicate_replay_contents(
+    store: &SqliteStore,
+    sender: &ServiceId,
+    timestamp: u64,
+    thread: Option<&presage::store::Thread>,
+) -> Result<Vec<(presage::store::Thread, Content)>, DuplicateReplayError> {
+    match thread {
+        Some(thread) => Ok(store
+            .message(thread, timestamp)
+            .await
+            .map_err(|_| DuplicateReplayError::StoreRead)?
+            .map(|content| vec![(thread.clone(), content)])
+            .unwrap_or_default()),
+        None => store
+            .messages_by_sender_and_timestamp(sender, timestamp)
+            .await
+            .map_err(|_| DuplicateReplayError::StoreRead),
+    }
+}
+
 struct Inner {
-    pending: Option<PendingLink>,
-    fake_pending_uri: Option<String>,
+    /// 链接会话独立记录：uri → PendingRecord。finishLink 只按自己的 uri
+    /// 找记录；新 startLink 取走并 retire 旧记录，不再用单个 pending 槽
+    /// 让所有会话互相冒充。
+    links: HashMap<String, Arc<PendingRecord>>,
+    /// 链接 attempt 表：attemptId → 槽表 + attempt 级提交位（双槽 QR 轮换，
+    /// additive）。没有 rotate 时每个 attempt 只有一个槽，旧行为不变。
+    attempts: HashMap<String, LinkAttempt>,
+    /// supersede 代次：每个 startLink 递增。URL 拿到后只有代次仍是自己
+    /// 才允许登记 pending；旧 start 的迟到结果直接丢弃并清理 store。
+    link_epoch: u64,
+    /// lost 墓碑：uri → lostAt。记录已从 links 摘掉并回收 store 之后，重复
+    /// finishLink 仍要稳定回 LINK_LOST（B1 幂等约定），不能被答成 UnknownUri。
+    /// 只保留最近若干条，避免无界增长；新 startLink 不需要清它（uri 唯一）。
+    lost_link_tombstones: StdMutex<Vec<(String, u64)>>,
+    /// fake 面：attemptId + live 槽（形状桩）。
+    fake_link: Option<FakeLinkAttempt>,
+}
+
+/// attempt 槽表恒等于 **live 槽表**（审计必须项 1）：任何让 uri 离开
+/// Inner::links 的出口都必须同步摘掉该 uri，否则槽表会退化成「铸造过的槽」，
+/// rotateLink 的应答就会带死槽、slot 下标也会与表位置错位（调用方按 slots
+/// 全量重渲染，错位等于把用户的 QR 指到死会话上）。
+fn retain_live_attempt_slots(inner: &mut Inner, attempt_id: &str, uri: &str) {
+    if let Some(attempt) = inner.attempts.get_mut(attempt_id) {
+        attempt.slots.retain(|candidate| candidate != uri);
+    }
 }
 
 impl Service {
@@ -2268,11 +3491,15 @@ impl Service {
         Arc::new(Self {
             data_dir,
             real,
+            cds_gate: CdsGate::from_env(),
             state,
             outbound,
             inner: AsyncMutex::new(Inner {
-                pending: None,
-                fake_pending_uri: None,
+                links: HashMap::new(),
+                attempts: HashMap::new(),
+                link_epoch: 0,
+                lost_link_tombstones: StdMutex::new(Vec::new()),
+                fake_link: None,
             }),
             pipelines: AsyncMutex::new(HashMap::new()),
             backup_tasks: Arc::new(StdMutex::new(HashMap::new())),
@@ -2285,13 +3512,218 @@ impl Service {
             cloud_upload_progress: cloud_upload::CloudUploadProgress::new(),
             group_credentials: Arc::new(call_links::GroupCredentialCache::new()),
             conversation_state_books: StdMutex::new(HashMap::new()),
+            attachments: attachment_gate::AttachmentGate::new(
+                attachment_gate::MAX_CONCURRENT_UPLOADS,
+                attachment_gate::GLOBAL_BYTE_BUDGET,
+            ),
             send_managers: AsyncMutex::new(HashMap::new()),
             calling_relays_cache: AsyncMutex::new(HashMap::new()),
             mrm_pool: group_mrm::MrmPool::new(group_mrm::MRM_CONNECTION_LIMIT),
             whitelist_cache: StdMutex::new(HashMap::new()),
+            whitelist_refresh_inflight: StdMutex::new(HashSet::new()),
             own_capabilities_cache: own_capabilities::CapabilitiesCache::new(),
             quarantine_discard: AsyncMutex::new(()),
+            storage_contexts: StorageContextCache::new(),
+            terminal_accounts: StdMutex::new(HashSet::new()),
         })
+    }
+
+    /// 附件上行全局闸（M5）：调用方持 &Arc 以生成 Drop 租约。
+    pub(crate) fn attachment_gate(&self) -> &Arc<attachment_gate::AttachmentGate> {
+        &self.attachments
+    }
+
+    /// receive.confirm 兼容面（phase2，2026-11-10 决策 B）：kt_outbox 已在
+    /// phase2 迁移中 DROP，恢复只依赖 thread_messages，没有行可 confirm。
+    /// 方法保留一版（connector 零调用已核对）作为回滚窗口：已知账号恒答
+    /// true、未知账号如实 false，dedupe key 不参与判定。wire 形状不变。
+    pub(crate) async fn confirm_duplicate(&self, account: &str, _dedupe_key: &str) -> bool {
+        let state = self.state.lock().await;
+        state.account_dir(account).is_some()
+    }
+
+    /// Phase2：Duplicate 重放只读 presage 的 thread_messages 持久行；
+    /// kt_outbox 已随迁移 DROP，没有任何第二份拷贝可读。
+    ///
+    /// legacy 的 dup:{sender}:{ts} key 仍被接受，但只解析成查询参数：行
+    /// 身份是 store 里的消息行，不是 key。没有 thread 时按 sender+ts 返回
+    /// 全部命中行（同 sender+ts 落两个群是合法形态）；接收臂走
+    /// replay_duplicate_in_thread，只投影信封所属 thread 的那一行。
+    ///
+    /// 结局三分类：`Ok(Some)` = 行重建并投影；`Ok(None)` = store 查询
+    /// 成功且**确认无行**（才允许走 Unavailable→flush→ack）；`Err` =
+    /// 无法确认（key 不合法/账号不可解析/store 打不开/查询或解码失败），
+    /// 调用方必须按 Failed 扣留 ack。
+    pub(crate) async fn replay_duplicate(
+        self: &Arc<Self>,
+        account: &str,
+        dedupe_key: &str,
+    ) -> Result<Option<Vec<Value>>, DuplicateReplayError> {
+        let (sender, timestamp) = crate::outbox_model::parse_duplicate_dedupe_key(dedupe_key)
+            .ok_or(DuplicateReplayError::MalformedKey)?;
+        let sender = ServiceId::parse_from_service_id_string(&sender)
+            .ok_or(DuplicateReplayError::MalformedKey)?;
+        self.replay_duplicate_rows(account, &sender, timestamp, None)
+            .await
+    }
+
+    /// Phase2：thread 精确重放。thread 来自被重投信封的内容，因此远端删除
+    /// 墓碑（行被改写为 nil ACI 的 NullMessage）与两群同 sender+ts 都能各
+    /// 自命中自己的行。
+    pub(crate) async fn replay_duplicate_in_thread(
+        self: &Arc<Self>,
+        account: &str,
+        sender: &ServiceId,
+        timestamp: u64,
+        thread: &presage::store::Thread,
+    ) -> Result<Option<Vec<Value>>, DuplicateReplayError> {
+        self.replay_duplicate_rows(account, sender, timestamp, Some(thread))
+            .await
+    }
+
+    async fn replay_duplicate_rows(
+        self: &Arc<Self>,
+        account: &str,
+        sender: &ServiceId,
+        timestamp: u64,
+        thread: Option<&presage::store::Thread>,
+    ) -> Result<Option<Vec<Value>>, DuplicateReplayError> {
+        let dir = {
+            let state = self.state.lock().await;
+            let rel = state
+                .account_dir(account)
+                .ok_or(DuplicateReplayError::AccountUnavailable)?;
+            self.data_dir.join(rel)
+        };
+        let store = open_store(&dir)
+            .await
+            .map_err(|_| DuplicateReplayError::StoreOpen)?;
+        let rows = duplicate_replay_contents(&store, sender, timestamp, thread).await?;
+        // 只有「查询成功且空集」才是确认无行；open/read/decode 错误已在
+        // 上方上抛，绝不会走到这里被当成 miss。
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let mut notifications = Vec::new();
+        for (_thread, content) in rows {
+            notifications.extend(
+                project_content(
+                    account,
+                    &store,
+                    &content,
+                    &self.terminated_groups,
+                    Some(self),
+                )
+                .await,
+            );
+        }
+        Ok(Some(notifications))
+    }
+
+    /// Duplicate 恢复臂 replay：LocalSet 内 spawn（presage store future 非
+    /// Send），并**等它收口**——投影通知全部进入出站队列后才允许 flush/ack
+    /// （时序审计 G1：ack 必须晚于投影与 flush，与 Contacts/IdentityChange
+    /// 臂一致；此前 fire-and-forget 即 ack，投影会在 ack 之后才入队，引擎
+    /// 死亡窗口内连接器永收不到且重放被 Duplicate 就地 ack 吞）。
+    ///
+    /// spawn 失败 / panic / abort 都不静默：计数（perf_metrics
+    /// duplicate_replay_*）+ 结构化 warn/error 日志，返回 Failed 扣留 ack，
+    /// 信封留服务器队列待下次重放重试。读面结局严格二分：只有 store 查询
+    /// 成功且确认无行才是 Unavailable（只计数 + warn，flush 后照常 ack，
+    /// 止血 b：避免重投风暴）；store 打不开/查询/解码失败是 Failed（行状态
+    /// 未知，不能当「无行」吞掉重投信封）。panic payload 不落日志（可能含
+    /// 正文）。
+    async fn spawn_duplicate_replay(
+        service: &Arc<Service>,
+        account: &str,
+        target: DuplicateReplayTarget,
+    ) -> DuplicateReplayOutcome {
+        let replay_service = Arc::clone(service);
+        let replay_account = account.to_owned();
+        // spawn_local 在 LocalSet 上下文之外会 panic（tokio 契约）；接收管线
+        // 恒跑在 LocalSet，理论上不可达，仍按可计数失败面收口，避免把收流
+        // 任务本身带进 panic 重启环。
+        let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::task::spawn_local(async move {
+                let replay = match target {
+                    DuplicateReplayTarget::Thread {
+                        sender,
+                        timestamp,
+                        thread,
+                    } => {
+                        replay_service
+                            .replay_duplicate_in_thread(
+                                &replay_account,
+                                &sender,
+                                timestamp,
+                                &thread,
+                            )
+                            .await
+                    }
+                    DuplicateReplayTarget::Key(key) => {
+                        replay_service.replay_duplicate(&replay_account, &key).await
+                    }
+                };
+                match replay {
+                    Ok(Some(notifications)) => {
+                        for notification in notifications {
+                            replay_service.notify(&replay_account, notification).await;
+                        }
+                        DuplicateReplayOutcome::Projected
+                    }
+                    Ok(None) => DuplicateReplayOutcome::Unavailable,
+                    Err(error) => {
+                        // 读面失败 ≠ 无行：计数 + error 日志后按 Failed 扣留
+                        // ack，等服务器下一次重投再试。
+                        perf_metrics::add(perf_metrics::keys::DUPLICATE_REPLAY_FAILED, 1);
+                        tracing::error!(
+                            target: "engine.receive",
+                            stage = "duplicate_replay_failed",
+                            reason = error.stage(),
+                            account = %crate::methods::probe_account8(Some(&replay_account)),
+                            "duplicate replay could not confirm the stored row; withholding ack"
+                        );
+                        DuplicateReplayOutcome::Failed
+                    }
+                }
+            })
+        }));
+        let joined = match spawned {
+            Ok(handle) => handle.await,
+            Err(_) => {
+                perf_metrics::add(perf_metrics::keys::DUPLICATE_REPLAY_SPAWN_FAILED, 1);
+                tracing::error!(
+                    target: "engine.receive",
+                    stage = "duplicate_replay_spawn_failed",
+                    account = %crate::methods::probe_account8(Some(account)),
+                    "duplicate replay task could not be spawned; withholding ack"
+                );
+                return DuplicateReplayOutcome::Failed;
+            }
+        };
+        classify_duplicate_replay(account, joined)
+    }
+
+    /// Mark a receive-terminal account. 401/403 is device-unlinked, not a
+    /// recoverable transport failure; keep it until a fresh link clears it.
+    pub(crate) fn mark_terminal_account(&self, account: &str) {
+        if let Ok(mut accounts) = self.terminal_accounts.lock() {
+            accounts.insert(account.to_string());
+        }
+    }
+
+    /// A fresh link for this number revives the account gate.
+    pub(crate) fn clear_terminal_account(&self, account: &str) {
+        if let Ok(mut accounts) = self.terminal_accounts.lock() {
+            accounts.remove(account);
+        }
+    }
+
+    fn is_terminal_account(&self, account: &str) -> bool {
+        self.terminal_accounts
+            .lock()
+            .map(|accounts| accounts.contains(account))
+            .unwrap_or(false)
     }
 
     /// stdout 通知入队（账号在途许可 + 全局有界队列；行序 = 队列序）。
@@ -2339,6 +3771,16 @@ impl Service {
                     false
                 }
             };
+        // 诊断面（2026-11-12）：栅栏慢（stdout 背压）是收流停滞的嫌疑面。
+        if started.elapsed().as_millis() >= 200 {
+            tracing::warn!(
+                target: "engine.latency",
+                stage = "flush_barrier",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                ok = resolved,
+                "stdout flush barrier slow"
+            );
+        }
         // S2a 打点：栅栏时长 + 成败计数（O3 flush_barrier 批量化候选的
         // 基线测量面；只测不改，语义零变化）。
         perf_metrics::record_us(
@@ -2490,62 +3932,205 @@ impl Service {
         snapshot
     }
 
-    pub(crate) async fn start_link(self: &Arc<Self>) -> Result<String, LinkError> {
+    pub(crate) async fn start_link(self: &Arc<Self>) -> Result<LinkAttemptView, LinkError> {
         if !self.real {
             let mut inner = self.inner.lock().await;
             let uri = fake_link_uri();
-            inner.fake_pending_uri = Some(uri.clone());
-            return Ok(uri);
+            let attempt_id = random_attempt_id();
+            // 形状桩同样带 attempt：单槽 = 只有一个槽的 attempt。
+            inner.fake_link = Some(FakeLinkAttempt {
+                attempt_id: attempt_id.clone(),
+                slots: vec![uri.clone()],
+            });
+            return Ok(LinkAttemptView {
+                attempt_id,
+                slots: vec![LinkSlotView {
+                    slot: 0,
+                    device_link_uri: uri,
+                }],
+            });
+        }
+        self.start_link_with_flow(link_flow).await
+    }
+
+    /// startLink 主体（B1）：flow 由调用方注入，生产走 link_flow；单测用
+    /// 无网络 flow 复用同一套收口/URL 等待/超时/abort 逻辑。
+    ///
+    /// 锁纪律：`self.inner` 内只登记 supersede 代次并取走旧记录；abort +
+    /// await、spawn flow、30s URL 等待全部在锁外——否则一个慢 provisioning
+    /// WS 会把并发 start/finish 串行阻塞。
+    async fn start_link_with_flow<F, Fut>(
+        self: &Arc<Self>,
+        flow_factory: F,
+    ) -> Result<LinkAttemptView, LinkError>
+    where
+        F: FnOnce(SqliteStore, futures::channel::oneshot::Sender<url::Url>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<LinkOutcome, LinkError>> + 'static,
+    {
+        // 锁内只做三件事：登记本次 supersede 代次、取走旧记录、清掉旧 attempt。
+        // 旧 flow 的 abort/await 与目录回收都放到锁外（retire_pending_record）。
+        let (epoch, retired) = {
+            let mut inner = self.inner.lock().await;
+            inner.link_epoch = inner.link_epoch.wrapping_add(1);
+            let epoch = inner.link_epoch;
+            // 新 startLink 作废上一个 attempt（契约 4：没有 rotate 时仍是单槽，
+            // attempt 归属照旧只保留最新一个）。
+            inner.attempts.clear();
+            let retired = inner
+                .links
+                .drain()
+                .map(|(_, record)| record)
+                .collect::<Vec<_>>();
+            (epoch, retired)
+        };
+        // 旧会话真正收口（B1）：旧 flow 必须 abort，不能只从表里摘掉记录
+        // 让旧 provisioning WS 继续跑。旧结果槽同步落 lost 并唤醒可能在等
+        // 的 finishLink（确定性 LINK_LOST）。
+        for old in retired {
+            let lost_at = retire_pending_record(old).await;
+            if let Some(lost_at) = lost_at {
+                tracing::warn!(
+                    target: "engine.link",
+                    stage = "superseded",
+                    state = "lost",
+                    lost_at,
+                    "previous link flow superseded by startLink"
+                );
+            }
         }
 
-        let mut inner = self.inner.lock().await;
-        // 新会话作废旧会话：丢掉 url_rx（presage 内部 send 失败 → 流程按
-        // Err 收口，任务自行清理目录）。
-        inner.pending = None;
+        // 铸第 0 槽（与 rotateLink 共用同一条单槽铸造路径）：开 store +
+        // spawn flow + 30s URL 有界等待全部在锁外。
+        let minted = self.mint_link_slot(flow_factory).await?;
+        let uri = minted.uri.clone();
+        let attempt_id = random_attempt_id();
+        let committed = Arc::new(AsyncMutex::new(None));
 
+        // 拿到 URL 后重新加锁做 supersede 复核：等待期间可能有更新的
+        // startLink 抢先把代次推高。只有代次仍是自己才允许登记 pending；
+        // 否则本次迟到结果直接丢弃（abort flow + 清理本次 store），绝不
+        // 覆盖新会话或留下未登记 store。
+        let mut inner = self.inner.lock().await;
+        if inner.link_epoch != epoch {
+            let superseded_epoch = inner.link_epoch;
+            drop(inner);
+            tracing::warn!(
+                target: "engine.link",
+                stage = "superseded_before_commit",
+                epoch,
+                superseded_epoch,
+                "startLink result discarded after URL handoff"
+            );
+            minted.discard().await;
+            return Err(LinkError::Internal);
+        }
+        inner.links.insert(
+            uri.clone(),
+            Arc::new(minted.into_record(attempt_id.clone(), Arc::clone(&committed))),
+        );
+        inner.attempts.insert(
+            attempt_id.clone(),
+            LinkAttempt {
+                slots: vec![uri.clone()],
+                committed,
+            },
+        );
+        Ok(LinkAttemptView {
+            attempt_id,
+            slots: vec![LinkSlotView {
+                slot: 0,
+                device_link_uri: uri,
+            }],
+        })
+    }
+
+    /// 铸一个 provisioning 槽（startLink / rotateLink 共用的单槽铸造路径）：
+    /// 开 store → spawn link flow → 有界等 URL（30s）。返回**未登记**的槽件；
+    /// 登记（写 Inner::links 与槽表归属）及过期复核由调用方在 inner 锁内完成，
+    /// MintedLinkSlot::discard 负责一次过期铸造的当场收口。
+    async fn mint_link_slot<F, Fut>(
+        self: &Arc<Self>,
+        flow_factory: F,
+    ) -> Result<MintedLinkSlot, LinkError>
+    where
+        F: FnOnce(SqliteStore, futures::channel::oneshot::Sender<url::Url>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<LinkOutcome, LinkError>> + 'static,
+    {
         let store_dir = self.data_dir.join("accounts").join(random_dir_name());
-        let store = open_store(&store_dir)
-            .await
-            .map_err(|error| {
-                tracing::warn!(target: "engine.link", stage = "open_store", ?error, "startLink store open failed");
-                LinkError::Internal
-            })?;
+        let store = open_store(&store_dir).await.map_err(|error| {
+            tracing::warn!(target: "engine.link", stage = "open_store", ?error, "link store open failed");
+            LinkError::Internal
+        })?;
+        // 给 finish 留一个同池句柄：flow 任务收尾 drop 自己的句柄后，提交段
+        // 直接复用本句柄，不重开同一 SQLite 文件。
+        let finish_store = store.clone();
 
         let (url_tx, url_rx) = futures::channel::oneshot::channel::<url::Url>();
         let slot = Arc::new(LinkResultSlot::new());
+        let state = Arc::new(StdMutex::new(LinkSessionState::Pending));
 
         // 链接流程 future 同样非 Send：spawn_local 承载（见 spawn_pipeline）。
-        // start_link 只会从 LocalSet 内的 dispatch 被调用，上下文必然在。
+        // startLink / rotateLink 只会从 LocalSet 内的 dispatch 被调用，上下文必然在。
         let task_slot = Arc::clone(&slot);
-        tokio::task::spawn_local(async move {
-            match link_flow(store, url_tx).await {
+        let task_state = Arc::clone(&state);
+        let task_store_dir = store_dir.clone();
+        let task = tokio::task::spawn_local(async move {
+            match flow_factory(store, url_tx).await {
                 Ok(outcome) => task_slot.complete(Ok(outcome)),
-                Err(()) => task_slot.complete(Err(())),
+                Err(LinkError::Lost) => {
+                    let lost_at = mark_link_lost(&task_state);
+                    tracing::warn!(
+                        target: "engine.link",
+                        stage = "link_lost",
+                        state = "lost",
+                        lost_at,
+                        "link flow lost after URL handoff"
+                    );
+                    task_slot.complete(Err(()));
+                    // lost = QR 必死，但此刻 PendingRecord 仍持同一 SqlitePool
+                    // （store.clone() 同池），Windows 上删目录必撞 sharing
+                    // violation。目录回收一律交给 retire_pending_record：
+                    // 它会先 take store 句柄再删，跨平台安全。这里只留痕。
+                    tracing::warn!(
+                        target: "engine.link",
+                        stage = "link_lost_store_deferred",
+                        "link store reclamation deferred to retire (open pool handle)"
+                    );
+                    let _ = &task_store_dir;
+                }
+                Err(_) => task_slot.complete(Err(())),
             }
         });
 
         // URL 产出有界等待：provisioning WS 正常亚秒级出 URL。超时/失败时
-        // url_rx 随返回值丢弃，链接任务自行收口。
+        // 链接任务必须 abort（不能让它继续跑），本次 store 安全回收。
         let uri = match tokio::time::timeout(Duration::from_secs(30), url_rx).await {
             Ok(Ok(uri)) => uri.to_string(),
             Ok(Err(_)) => {
-                tracing::warn!(target: "engine.link", stage = "url_channel_closed", "startLink provisioning URL channel closed");
-                let _ = tokio::fs::remove_dir_all(&store_dir).await;
+                tracing::warn!(target: "engine.link", stage = "url_channel_closed", "link provisioning URL channel closed");
+                task.abort();
+                let _ = task.await;
+                drop(finish_store);
+                let _ = remove_link_store(&store_dir).await;
                 return Err(LinkError::Internal);
             }
             Err(_) => {
-                tracing::warn!(target: "engine.link", stage = "url_timeout", "startLink provisioning URL timed out");
-                let _ = tokio::fs::remove_dir_all(&store_dir).await;
+                tracing::warn!(target: "engine.link", stage = "url_timeout", "link provisioning URL timed out");
+                task.abort();
+                let _ = task.await;
+                drop(finish_store);
+                let _ = remove_link_store(&store_dir).await;
                 return Err(LinkError::Internal);
             }
         };
-
-        inner.pending = Some(PendingLink {
+        Ok(MintedLinkSlot {
             uri,
             store_dir,
+            store: StdMutex::new(Some(finish_store)),
             result: slot,
-        });
-        Ok(inner.pending.as_ref().expect("just set").uri.clone())
+            task,
+            state,
+        })
     }
 
     pub(crate) async fn finish_link(
@@ -2556,13 +4141,13 @@ impl Service {
         if !self.real {
             let mut inner = self.inner.lock().await;
             let matches = inner
-                .fake_pending_uri
-                .as_deref()
-                .is_some_and(|pending| pending == uri);
+                .fake_link
+                .as_ref()
+                .is_some_and(|fake| fake.slots.iter().any(|pending| pending == uri));
             if !matches {
                 return Err(LinkError::UnknownUri);
             }
-            inner.fake_pending_uri = None;
+            inner.fake_link = None;
             let mut state = self.state.lock().await;
             let number = format!("+1555000{:04}", state.accounts().len() + 1);
             state
@@ -2572,44 +4157,165 @@ impl Service {
             return Ok(LinkedAccount { number, aci: None });
         }
 
-        // 锁内只做会话查找；等待手机确认必须放锁（finishLink 可能阻塞数分钟，
-        // 其他方法必须继续可用）。
-        let slot = {
+        // 每个 link 会话独立记录：finishLink 只等自己 uri 的记录。被更新的
+        // startLink 顶掉的记录已从表里取走 → UnknownUri，绝不拿别的会话
+        // 的结果冒充成功。
+        let record = {
             let inner = self.inner.lock().await;
-            let pending = inner.pending.as_ref().ok_or(LinkError::UnknownUri)?;
-            if pending.uri != uri {
-                return Err(LinkError::UnknownUri);
+            match inner.links.get(uri).cloned() {
+                Some(record) => record,
+                None => {
+                    // 记录已按 lost 收口并回收 store：重复 finish 仍答 LINK_LOST。
+                    let tombstoned = inner
+                        .lost_link_tombstones
+                        .lock()
+                        .expect("lost tombstone lock")
+                        .iter()
+                        .any(|(tombstone_uri, _)| tombstone_uri == uri);
+                    if tombstoned {
+                        return Err(LinkError::Lost);
+                    }
+                    return Err(LinkError::UnknownUri);
+                }
             }
-            Arc::clone(&pending.result)
         };
-        let (number, pending_transfer) = slot.wait().await.map_err(|_| LinkError::Internal)?;
+
+        // 已提交记录的重试（connector 超时重试 / 轮换槽的幂等应答）：同一
+        // attempt 的全部槽共享 attempt 级提交位，只有真正执行过
+        // state.add_account 的记录才会落 Some，直接返回同一账号（跨槽也只
+        // 提交一次）。
+        {
+            let committed = record.committed.lock().await;
+            if let Some(account) = committed.as_ref() {
+                return Ok(account.clone());
+            }
+        }
+
+        // 在飞 finish 登记：与 rotate 的退休判定同锁互斥——退休槽不再接受
+        // 新的 finish；已计数的那次不会被 abort（收口延迟到它归零）。
+        let _finish_guard = {
+            let inner = self.inner.lock().await;
+            if record.retired.load(Ordering::Acquire)
+                || !inner
+                    .links
+                    .get(uri)
+                    .is_some_and(|current| Arc::ptr_eq(current, &record))
+            {
+                return Err(LinkError::Lost);
+            }
+            record.inflight_finishes.fetch_add(1, Ordering::AcqRel);
+            FinishGuard::new(self, Arc::clone(&record))
+        };
+
+        // 锁内只做记录查找；等待手机确认必须放锁（finishLink 可能阻塞数分钟，
+        // 其他方法必须继续可用）。
+        let (number, pending_transfer) = match record.result.wait().await {
+            Ok(outcome) => outcome,
+            Err(()) => {
+                // attempt 级提交位：兄弟槽已提交时，本槽（可能刚被 rotate
+                // 收回）的 finish 拿回同一结果，绝不丢成 LINK_LOST/内部错误。
+                if let Some(account) = record.committed.lock().await.clone() {
+                    return Ok(account);
+                }
+                // B1：URL 交付后 Provisioning WS 关闭/超时/流结束 = 会话
+                // 已死。记录的 state/lostAt 是判别器（-1 LINK_LOST）；
+                // 没有 lost 记录才是真正的内部失败（-32603）。
+                if let Some(lost_at) = link_lost_at(&record.state) {
+                    tracing::warn!(
+                        target: "engine.link",
+                        stage = "finish_link",
+                        state = "lost",
+                        lost_at,
+                        "finishLink rejected: link session lost"
+                    );
+                    // 会话已死：把记录从表里摘掉并按 retire 纪律回收 store
+                    // （先 take 句柄再删目录，Windows 才删得掉）。否则这份
+                    // 未注册目录要等到下一次 startLink 才可能被清理。
+                    {
+                        let mut inner = self.inner.lock().await;
+                        if inner
+                            .links
+                            .get(uri)
+                            .is_some_and(|current| Arc::ptr_eq(current, &record))
+                        {
+                            inner.links.remove(uri);
+                            // 审计必须项：记录离开 links 的每个出口都要同步把该
+                            // uri 从 attempt 槽表摘掉，attempt.slots 恒等于 live
+                            // 槽表（否则 rotateLink 应答会带死槽、slot 下标错位）。
+                            retain_live_attempt_slots(&mut inner, &record.attempt_id, uri);
+                            // 墓碑让重复 finish 稳定答 LINK_LOST（幂等）。
+                            push_lost_link_tombstone(&mut inner, uri, lost_at);
+                        }
+                    }
+                    let _ = retire_pending_record(record).await;
+                    return Err(LinkError::Lost);
+                }
+                return Err(LinkError::Internal);
+            }
+        };
+
+        // 结果槽 Ok 只代表 flow 产出号码；先等任务收尾，确保 flow 自己的
+        // store 句柄已 drop；提交段复用记录里的同池句柄，不重开同一文件。
+        wait_link_task(&record).await;
+
+        // 提交单飞：同 uri 的并发 finish 只允许一个执行 add_account。
+        let mut committed = record.committed.lock().await;
+        if let Some(account) = committed.as_ref() {
+            return Ok(account.clone());
+        }
+        // 结果槽可能是 Ok（旧 flow 已产出号码），但记录若已被新 start 顶掉，
+        // 这条 Ok 不属于任何已登记账号——必须按 LINK_LOST 收口，不能返回
+        // 假成功（旧实现的 Ok(number, aci:None) 会留下孤儿 store）。
+        {
+            let inner = self.inner.lock().await;
+            let active = inner
+                .links
+                .get(uri)
+                .is_some_and(|current| Arc::ptr_eq(current, &record));
+            if !active || record.superseded.load(Ordering::Acquire) {
+                drop(inner);
+                // 先放掉记录里的 store 句柄，再删目录（跨平台删除都不怕
+                // 自己持有连接）。
+                let _ = record.store.lock().expect("link store lock").take();
+                let _ = remove_link_store(&record.store_dir).await;
+                tracing::warn!(
+                    target: "engine.link",
+                    stage = "finish_link",
+                    state = "superseded",
+                    "finishLink rejected: link record superseded before commit"
+                );
+                return Err(LinkError::Lost);
+            }
+        }
 
         // 成功：会话收口。设备名（ADR 0004）：改写 store 注册数据后启动接收
         // 管线；名字只落本地注册数据，管线不回写服务器（B4 起停发
         // AccountAttributes PUT——官方链接设备从不 PUT attributes，compat §5）。
-        let mut inner = self.inner.lock().await;
-        if inner
-            .pending
-            .as_ref()
-            .is_none_or(|pending| pending.uri != uri)
-        {
-            // 并发重试已完成收口：幂等返回同一号码。ACI 不为此回查 store
-            //（会话槽已收走，锁结构不为一枚 additive 键复杂化）——键缺席
-            // 无害，重试消费方按可选键语义退回旧行为。
-            return Ok(LinkedAccount { number, aci: None });
+        self.clear_terminal_account(&number);
+        // 复用链接期句柄读取一次注册数据：设备名改写与 aci 投影共用同一次
+        // 读取，避免刚收口就重开 SQLite 池（池关闭是异步的）。句柄缺席
+        //（前次提交失败已取走）才回退 open_store。
+        let mut store = record.store.lock().expect("link store lock").take();
+        if store.is_none() {
+            store = Some(
+                open_store(&record.store_dir)
+                    .await
+                    .map_err(|_| LinkError::Internal)?,
+            );
         }
-        let pending = inner.pending.take().expect("checked");
-        // 会话槽已收走：后续 store/state/pipeline 收口均不持 inner 锁。
-        drop(inner);
+        let mut store = store.expect("store handle");
+        let registration = store
+            .load_registration_data()
+            .await
+            .map_err(|_| LinkError::Internal)?;
+        // ACI additive 投影（connector 契约 1.142）：链接成功后读取按
+        // best-effort（注册数据缺席 = aci 整键缺席）——宁缺勿炸，不连坐
+        // 链接主结局。
+        let aci = registration
+            .as_ref()
+            .map(|data| data.service_ids.aci.to_string());
         if !device_name.is_empty() {
-            let mut store = open_store(&pending.store_dir)
-                .await
-                .map_err(|_| LinkError::Internal)?;
-            if let Some(mut data) = store
-                .load_registration_data()
-                .await
-                .map_err(|_| LinkError::Internal)?
-            {
+            if let Some(mut data) = registration {
                 data.device_name = Some(device_name.to_owned());
                 store
                     .save_registration_data(&data)
@@ -2617,10 +4323,11 @@ impl Service {
                     .map_err(|_| LinkError::Internal)?;
             }
         }
-        let rel = pending
+        drop(store);
+        let rel = record
             .store_dir
             .strip_prefix(&self.data_dir)
-            .unwrap_or(&pending.store_dir)
+            .unwrap_or(&record.store_dir)
             .to_string_lossy()
             .to_string();
         // P0 重链孤儿批（2026-10-23）：注册表按号码唯一，写入新 dir 的同时
@@ -2636,6 +4343,22 @@ impl Service {
             .await
             .add_account_superseding(number.clone(), Some(rel.clone()))
             .map_err(|_| LinkError::Internal)?;
+        // add_account 成功 = 记录真正成为账号，提交位此刻置位；此前的任何
+        // 路径（supersede/内部失败）都不得返回 Ok。
+        let account = LinkedAccount {
+            number: number.clone(),
+            aci,
+        };
+        *committed = Some(account.clone());
+        drop(committed);
+        // BUG-6：同号重链 = 新 store 目录/新注册数据——旧常驻 storage 上下文
+        // （旧库句柄 + 旧 push 凭据/device_id）必须摘除，新链接的首个
+        // storage.* 调用按新目录重建。
+        self.storage_contexts.invalidate(&number).await;
+        // 提交成功 = 本 attempt 收口：其余 live 槽立即收回（abort flow +
+        // 未注册回收），attempt 从表里摘掉（rotateLink 此后答 NOT_FOUND）。
+        // 等在这些槽结果上的在飞 finish 由 attempt 级提交位拿回同一账号。
+        self.retire_attempt_siblings(&record).await;
         // 同号重链换新 store 目录：摘除旧常驻管理器（下次发送按新目录重建）。
         self.send_managers.lock().await.remove(&number);
         // 同号重链：摘除旧 MRM 连接槽（R4 槽按账号生命周期；新身份下次发送
@@ -2654,7 +4377,7 @@ impl Service {
         // 不变：`history.importCancel` 按账号中止在途下载（transfer 腿）。
         if let Some(transfer) = pending_transfer {
             let handle = tokio::task::spawn_local(download_transfer_archive(
-                pending.store_dir.clone(),
+                record.store_dir.clone(),
                 transfer.aci,
                 transfer.backup_key,
                 transfer.credentials,
@@ -2673,14 +4396,19 @@ impl Service {
                 }
             }
         }
-        // ACI additive 投影（connector 契约 1.142）：链接已成功，注册数据
-        // 读取按 best-effort（account_aci）——宁缺勿炸，不连坐链接主结局。
-        let aci = account_aci(&pending.store_dir).await;
-        self.spawn_pipeline(number.clone(), pending.store_dir).await;
-        // 旧 store 归档（顺序结构性锁死）：必须晚于 spawn_pipeline——它在
-        // 内部先 stop_pipeline 并等旧管线收口（store drop → SQLite 刷盘），
-        // 归档前不再有句柄写旧目录；也晚于 transfer 腿 cancel。仍然引用的
-        // 目录（极端：同 dir 被另一号码登记）不动；与本次新 dir 相同的也不动。
+        // 本分支多槽架构（links map，双槽 QR 轮换）：变量是 record 而非
+        // 远端的单槽 pending；合并时把远端两段逻辑移植到 record 上。
+        force_initial_sync_on_next_stream(&number);
+        // ACI additive 投影（connector 契约 1.142，远端批）：链接已成功，
+        // 注册数据读取按 best-effort——宁缺勿炸，不连坐链接主结局。
+        let _aci = account_aci(&record.store_dir).await;
+        self.spawn_pipeline(number.clone(), record.store_dir.clone())
+            .await;
+        // 旧 store 归档（顺序结构性锁死，远端 P0 重链孤儿批）：必须晚于
+        // spawn_pipeline——它在内部先 stop_pipeline 并等旧管线收口（store
+        // drop → SQLite 刷盘），归档前不再有句柄写旧目录；也晚于 transfer 腿
+        // cancel。仍然引用的目录（极端：同 dir 被另一号码登记）不动；与本
+        // 次新 dir 相同的也不动。
         self.archive_superseded_link_dir(superseded, &rel).await;
         // 批 W2（§29.73）：成功链接事件 = 旧孤儿可弃的定局信号（§29.72 硬闸
         // 待办闭环）。隔离区未完成注册件此刻自动清扫；含注册数据件保留并随
@@ -2694,7 +4422,183 @@ impl Service {
                 discard_incomplete_quarantine_stores(&service, &linked).await;
             });
         }
-        Ok(LinkedAccount { number, aci })
+        Ok(account)
+    }
+
+    /// rotateLink（双槽 QR 轮换，additive 契约）：为同一 attempt 铸一个新
+    /// provisioning 槽；live 槽超过 LINK_MAX_LIVE_SLOTS 时收回最旧槽（abort
+    /// 其 flow、按未注册回收）。attempt 不存在（已被新 startLink 顶掉或已
+    /// 提交收口）→ LinkError::AttemptNotFound。
+    pub(crate) async fn rotate_link(
+        self: &Arc<Self>,
+        attempt_id: &str,
+    ) -> Result<LinkRotateView, LinkError> {
+        if !self.real {
+            let mut inner = self.inner.lock().await;
+            let Some(fake) = inner.fake_link.as_mut() else {
+                return Err(LinkError::AttemptNotFound);
+            };
+            if fake.attempt_id != attempt_id {
+                return Err(LinkError::AttemptNotFound);
+            }
+            let uri = fake_link_uri();
+            fake.slots.push(uri.clone());
+            while fake.slots.len() > LINK_MAX_LIVE_SLOTS {
+                fake.slots.remove(0);
+            }
+            let slots = link_slot_views(&fake.slots);
+            let slot = slots.len() - 1;
+            return Ok(LinkRotateView {
+                device_link_uri: uri,
+                slot,
+                slots,
+            });
+        }
+        self.rotate_link_with_flow(attempt_id, link_flow).await
+    }
+
+    /// rotateLink 主体：flow 由调用方注入（单测用无网络 flow），与 startLink
+    /// 共用同一条单槽铸造路径（Service::mint_link_slot）。
+    ///
+    /// 锁纪律同 startLink：inner 内只做 attempt 校验与槽表登记，铸造（含 30s
+    /// URL 等待）与退休收口全部在锁外。
+    async fn rotate_link_with_flow<F, Fut>(
+        self: &Arc<Self>,
+        attempt_id: &str,
+        flow_factory: F,
+    ) -> Result<LinkRotateView, LinkError>
+    where
+        F: FnOnce(SqliteStore, futures::channel::oneshot::Sender<url::Url>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<LinkOutcome, LinkError>> + 'static,
+    {
+        {
+            let inner = self.inner.lock().await;
+            if !inner.attempts.contains_key(attempt_id) {
+                return Err(LinkError::AttemptNotFound);
+            }
+        }
+
+        let minted = self.mint_link_slot(flow_factory).await?;
+        let uri = minted.uri.clone();
+
+        let (slot, slots, victims) = {
+            let mut inner = self.inner.lock().await;
+            if !inner.attempts.contains_key(attempt_id) {
+                drop(inner);
+                // 铸造期间 attempt 被新 startLink 顶掉 / 被兄弟槽提交收口：
+                // 本槽当场收口，绝不留未登记 store。
+                tracing::warn!(
+                    target: "engine.link",
+                    stage = "rotate_discarded",
+                    "rotateLink result discarded: attempt gone"
+                );
+                minted.discard().await;
+                return Err(LinkError::AttemptNotFound);
+            }
+            let Inner {
+                attempts, links, ..
+            } = &mut *inner;
+            let attempt = attempts.get_mut(attempt_id).expect("attempt checked above");
+            // 双保险（审计必须项 1）：所有离开 links 的出口已同步 retain，
+            // 这里在 push 新槽前再按 links 存在性修剪一次——任何漏网的出口
+            // 都只会让表暂时多一格死槽，绝不会被当成 live 槽返回，也不占
+            // slot 下标（死槽不参与下标，调用方按 slots 全量重渲染）。
+            attempt
+                .slots
+                .retain(|candidate| links.contains_key(candidate));
+            links.insert(
+                uri.clone(),
+                Arc::new(minted.into_record(attempt_id.to_owned(), Arc::clone(&attempt.committed))),
+            );
+            attempt.slots.push(uri.clone());
+            // 双槽上限：超出即退休最旧的**活**槽。slot 号 = live 槽表下标，
+            // 退休后重排；调用方每次都用应答里的 slots 全表重渲染。
+            let mut victims = Vec::new();
+            while attempt.slots.len() > LINK_MAX_LIVE_SLOTS {
+                let victim = attempt.slots.remove(0);
+                let Some(record) = links.get(&victim).cloned() else {
+                    // 淘汰目标已死（不在 links）：跳过，继续找真正最旧的活槽，
+                    // 不能把它的死 uri 留在表里也不该把它算成一次退休。
+                    continue;
+                };
+                victims.push(record);
+            }
+            let slot = attempt.slots.len() - 1;
+            (slot, link_slot_views(&attempt.slots), victims)
+        };
+
+        for victim in victims {
+            tracing::warn!(
+                target: "engine.link",
+                stage = "rotate_retired",
+                "oldest link slot retired by rotateLink"
+            );
+            self.retire_slot(victim).await;
+        }
+        Ok(LinkRotateView {
+            device_link_uri: uri,
+            slot,
+            slots,
+        })
+    }
+
+    /// 收回一个槽（rotate 淘汰 / 提交后收回其余槽）：有在飞 finish 时不 abort
+    /// （会把用户正在确认的那次提交结果丢掉），只置退休旗，物理收口由最后
+    /// 一个 finish 在 FinishGuard 里落地。
+    async fn retire_slot(self: &Arc<Self>, record: Arc<PendingRecord>) {
+        record.retired.store(true, Ordering::Release);
+        if record.inflight_finishes.load(Ordering::Acquire) > 0 {
+            tracing::warn!(
+                target: "engine.link",
+                stage = "retire_deferred",
+                "link slot retirement deferred: finish in flight"
+            );
+            return;
+        }
+        self.finalize_retired_slot(record).await;
+    }
+
+    /// 物理收口一个已退休的槽：abort flow、未提交则回收 store 与目录，并从
+    /// links 摘除（落 LINK_LOST 墓碑，旧码后续 finish 稳定回 LINK_LOST）。
+    /// 已提交（attempt 里别的槽完成了链接）的槽保留可查，供幂等应答。
+    async fn finalize_retired_slot(self: &Arc<Self>, record: Arc<PendingRecord>) {
+        record.retired.store(true, Ordering::Release);
+        let Some(lost_at) = retire_pending_record(Arc::clone(&record)).await else {
+            return;
+        };
+        let mut inner = self.inner.lock().await;
+        if inner
+            .links
+            .get(&record.uri)
+            .is_some_and(|current| Arc::ptr_eq(current, &record))
+        {
+            inner.links.remove(&record.uri);
+            // 同一条纪律（审计必须项）：离开 links 就必须离开 attempt 槽表。
+            // 正常路径上退休方已先把 uri 移出表（rotate 淘汰 / attempt 收口），
+            // 这里覆盖 FinishGuard 延迟收口等旁路，顺带把不变量钉在单点。
+            retain_live_attempt_slots(&mut inner, &record.attempt_id, &record.uri);
+            push_lost_link_tombstone(&mut inner, &record.uri, lost_at);
+        }
+    }
+
+    /// 提交成功后收回同 attempt 的其余槽：全部物理收口（abort + 未注册回收），
+    /// 等在这些槽结果上的在飞 finish 由 attempt 级提交位拿回同一账号。
+    async fn retire_attempt_siblings(self: &Arc<Self>, record: &Arc<PendingRecord>) {
+        let siblings: Vec<Arc<PendingRecord>> = {
+            let mut inner = self.inner.lock().await;
+            let slots = inner
+                .attempts
+                .remove(&record.attempt_id)
+                .map(|attempt| attempt.slots)
+                .unwrap_or_default();
+            slots
+                .into_iter()
+                .filter_map(|uri| inner.links.get(&uri).cloned())
+                .collect()
+        };
+        for sibling in siblings {
+            self.finalize_retired_slot(sibling).await;
+        }
     }
 
     /// 重链收尾归档单点（P0 重链孤儿批）：把被取代的旧 store 目录归档到
@@ -2803,6 +4707,10 @@ impl Service {
         // 两腿），进度/终态快照同步清缺——账号没了终态无人消费，半成品随
         // 下面的目录删除一并消失。
         let _ = self.history_import_cancel(account).await;
+        // BUG-6：先摘常驻 storage 上下文（关掉缓存持有的 SQLite 连接池），
+        // 再做注册表摘除/删目录——缓存句柄不先摘，Windows 上
+        // remove_dir_all 会因库文件仍被打开而失败。
+        self.storage_contexts.invalidate(account).await;
         // 注册表摘除并取回目录（fake 账号 dir=None）。
         let removed_dir: Option<PathBuf> = {
             let mut state = self.state.lock().await;
@@ -2811,19 +4719,43 @@ impl Service {
                 .and_then(|entry| entry.dir.map(|rel| self.data_dir.join(rel)))
         };
         let had_dir = removed_dir.is_some();
+        // 摘注册表与首次摘缓存之间有 await 窗口：期间到达的 storage.* 调用
+        // 可能用旧目录重新建条目。删目录前再摘一次，确保缓存不指向死库
+        //（此后再调用 storage_context 会先因账号不在注册表答 UnknownAccount）。
+        self.storage_contexts.invalidate(account).await;
         // A4 收口顺序（官方 MessageReceiver.stopProcessing → drain 同语义，
         // `ts/textsecure/MessageReceiver.preload.ts:516-547`）：先停接收并等待
         // 任务退出（drop Manager → SQLite store 刷盘），再删 store 目录——
         // 避免在飞投影/落库落在已删除目录上。删除是显式破坏性意图，宽限
         // 超时仍继续（不阻塞连接器）。
         self.stop_pipeline(account).await;
-        if let Some(dir) = removed_dir {
-            let _ = std::fs::remove_dir_all(&dir);
-        }
         // 摘除常驻发送管理器（若有在途发送，guard 释放后管理器随 Arc 落弃）。
+        // 必须先摘再删目录：SharedSendManager 与账号 store 共用同一
+        // SqlitePool，Windows 上文件仍被打开时 remove_dir_all 必失败。
         self.send_managers.lock().await.remove(account);
         // MRM 连接槽按账号摘除（R4：其他账号槽不受影响）。
         self.mrm_pool.remove(account);
+        // 池关闭/连接归还是异步 spawn，让出一次再删。
+        tokio::task::yield_now().await;
+        // M5：先 drain（stop_pipeline + 发送管理器/池收口）再删账号日志文件，
+        // 避免在飞发送在删除后又追加一行把文件重建出来。fail-soft：日志清理
+        // 失败不改删除主结局，只落结构化 warn。
+        {
+            let state = self.state.lock().await;
+            state.remove_dispatch_log(account);
+        }
+        if let Some(dir) = removed_dir {
+            if let Err(error) = std::fs::remove_dir_all(&dir) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        target: "engine.account",
+                        stage = "delete_account_dir",
+                        error = %error,
+                        "delete_account could not remove account store dir"
+                    );
+                }
+            }
+        }
         // A1 观测行随账号生命周期摘除。
         account_metrics::remove_account(account);
         // F 链路观测簿摘除（账号面随注册表生命周期）。
@@ -2906,6 +4838,9 @@ impl Service {
         if !self.real {
             return Ok((now_ms(), Vec::new(), Vec::new()));
         }
+        if self.is_terminal_account(account) {
+            return Err(SendError::Unbound);
+        }
         // KT (send latency probe): 纯日志零行为变化——lock 段含 db 打开与
         // 账号互斥等待（发送长尾嫌疑面），ts_id 供与 dispatch/vendor 行
         // 对账；正文/号码/群名永不入日志。
@@ -2923,17 +4858,18 @@ impl Service {
             "send-latency-probe",
         );
         // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
-        // KT (send latency probe): 暗区段探针三之一——whitelist 读面（修1
-        // 缓存后命中即近零；cache=hit|miss 固定词，正文/号码不入日志）。
+        // KT (send latency probe): 暗区段探针三之一——whitelist 读面（修4 起
+        // 三级读面：内存 hit / 磁盘 persisted / 首装 bootstrap miss；后两者
+        // 零阻塞，persisted 陈旧只排后台刷新。固定词表，正文/号码不入日志）。
         let probe_whitelist_t0 = std::time::Instant::now();
-        let (whitelist, probe_whitelist_hit) =
+        let (whitelist, probe_whitelist_source) =
             profile_sharing_whitelist_probed(self, account).await;
         tracing::warn!(
             target: "send_latency_probe",
             stage = "engine.whitelist",
             dur_ms = probe_whitelist_t0.elapsed().as_millis() as u64,
             ts_id = timestamp,
-            cache = if probe_whitelist_hit { "hit" } else { "miss" },
+            cache = probe_whitelist_source.probe_word(),
             "send-latency-probe",
         );
         // 附件/预览图一次上行（多收件人共享同一批指针）；贴纸图单条上行，
@@ -2945,6 +4881,7 @@ impl Service {
             let mut attempt = 0usize;
             loop {
                 match upload_attachments_for_send(
+                    self.attachment_gate(),
                     &manager,
                     attachments,
                     preview.and_then(|item| item.image.as_deref()),
@@ -2977,7 +4914,7 @@ impl Service {
             Some(sticker) => {
                 let mut attempt = 0usize;
                 loop {
-                    match upload_sticker_image(&manager, sticker).await {
+                    match upload_sticker_image(self.attachment_gate(), &manager, sticker).await {
                         Ok(pointer) => break Some(pointer),
                         Err(error)
                             if attempt < Self::SEND_FAST_RETRY_LIMIT
@@ -3012,9 +4949,9 @@ impl Service {
         for number in recipients {
             let send_one = async {
                 let probe_resolve_t0 = std::time::Instant::now();
-                let service_id = resolve_recipient(&manager, number)
-                    .await
-                    .ok_or(SendError::Internal)?;
+                let service_id = self
+                    .resolve_recipient_for_send(&mut manager, number)
+                    .await?;
                 tracing::warn!(
                     target: "send_latency_probe",
                     stage = "engine.resolve",
@@ -3142,9 +5079,9 @@ impl Service {
         // P9 profileSharing 闸（S3）：整批读一次 whitelist 位（fail-open）。
         let whitelist = profile_sharing_whitelist(self, account).await;
         for number in recipients {
-            let service_id = resolve_recipient(&manager, number)
-                .await
-                .ok_or(SendError::Internal)?;
+            let service_id = self
+                .resolve_recipient_for_send(&mut manager, number)
+                .await?;
             // P9 身份拒发闸（撤回同为内容面）。
             identity_send_gate(&account_dir, &service_id)?;
             // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -3312,9 +5249,9 @@ impl Service {
             .await
             .ok_or(SendError::Internal)?;
         // 目的地 = story 作者会话（号码/UUID 双形态收敛同一 ServiceId）。
-        let service_id = resolve_recipient(&manager, story_author)
-            .await
-            .ok_or(SendError::Internal)?;
+        let service_id = self
+            .resolve_recipient_for_send(&mut manager, story_author)
+            .await?;
         // P9 身份拒发闸（story 反应同为直聊内容发送）。
         identity_send_gate(&account_dir, &service_id)?;
         // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -3408,9 +5345,9 @@ impl Service {
             .await
             .ok_or(SendError::Internal)?;
         for number in recipients {
-            let service_id = resolve_recipient(&manager, number)
-                .await
-                .ok_or(SendError::Internal)?;
+            let service_id = self
+                .resolve_recipient_for_send(&mut manager, number)
+                .await?;
             // P9 身份拒发闸（回应面同为直聊内容发送）。
             identity_send_gate(&account_dir, &service_id)?;
             // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -3748,9 +5685,9 @@ impl Service {
             .ok_or(SendError::Internal)?;
         let aci_bytes = aci_to_bytes(&target_aci).ok_or(SendError::Internal)?;
         for number in recipients {
-            let service_id = resolve_recipient(&manager, number)
-                .await
-                .ok_or(SendError::Internal)?;
+            let service_id = self
+                .resolve_recipient_for_send(&mut manager, number)
+                .await?;
             // P9 身份拒发闸（pin/unpin 同为直聊内容发送）。
             identity_send_gate(&account_dir, &service_id)?;
             // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -3788,9 +5725,9 @@ impl Service {
         // land in the vendored self-None path and fail this RPC (-32603).
         let own = ServiceId::from(manager.registration_data().service_ids.aci());
         for number in recipients {
-            let service_id = resolve_recipient(&manager, number)
-                .await
-                .ok_or(SendError::Internal)?;
+            let service_id = self
+                .resolve_recipient_for_send(&mut manager, number)
+                .await?;
             if service_id == own {
                 continue;
             }
@@ -3834,9 +5771,9 @@ impl Service {
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
-        let service_id = resolve_recipient(&manager, recipient)
-            .await
-            .ok_or(SendError::Internal)?;
+        let service_id = self
+            .resolve_recipient_for_send(&mut manager, recipient)
+            .await?;
         // P9 身份拒发闸（官方 conversationJobQueue 对 untrusted 目标取消
         // Receipts 任务同位——conversationJobQueue.preload.ts:1141-1146；
         // 自动 delivery receipt flush 复用本面，失败静默弃批）。
@@ -4241,9 +6178,9 @@ impl Service {
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
-        let service_id = resolve_recipient(&manager, recipient)
-            .await
-            .ok_or(SendError::Internal)?;
+        let service_id = self
+            .resolve_recipient_for_send(&mut manager, recipient)
+            .await?;
         // P9 身份拒发闸（直聊通话信令臂；群臂走群发送通路不在此闸）。
         identity_send_gate(&account_dir, &service_id)?;
         let timestamp = now_ms();
@@ -4316,9 +6253,9 @@ impl Service {
         let mut manager = lock_registered_for_send(&shared).await;
         let conversation_bytes = match &event.conversation {
             CallEventConversation::Direct(recipient) => {
-                let service_id = resolve_recipient(&manager, recipient)
-                    .await
-                    .ok_or(SendError::Internal)?;
+                let service_id = self
+                    .resolve_recipient_for_send(&mut manager, recipient)
+                    .await?;
                 aci_to_bytes(&service_id.service_id_string()).ok_or(SendError::Internal)?
             }
             CallEventConversation::Group(bytes) | CallEventConversation::AdHoc(bytes) => {
@@ -4347,6 +6284,7 @@ impl Service {
     /// DataMessage.contact=9 单条目（官方 sendMessage 面单条目序列化同位，
     /// body/attachments 恒空——名片无正文位）。
     async fn build_contact_data_message(
+        gate: &Arc<attachment_gate::AttachmentGate>,
         manager: &Manager<SqliteStore, Registered>,
         payload: &SendContact,
         timestamp: u64,
@@ -4354,7 +6292,8 @@ impl Service {
         let avatar = match payload.avatar.as_deref() {
             Some(uri) => {
                 let (pointers, _) =
-                    upload_attachments_for_send(manager, &[uri.to_owned()], None, None).await?;
+                    upload_attachments_for_send(gate, manager, &[uri.to_owned()], None, None)
+                        .await?;
                 Some(pointers.into_iter().next().ok_or(SendError::Internal)?)
             }
             None => None,
@@ -4383,13 +6322,15 @@ impl Service {
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
-        let service_id = resolve_recipient(&manager, recipient)
-            .await
-            .ok_or(SendError::Internal)?;
+        let service_id = self
+            .resolve_recipient_for_send(&mut manager, recipient)
+            .await?;
         // P9 身份拒发闸（直聊内容面同纪律）。
         identity_send_gate(&account_dir, &service_id)?;
         let timestamp = now_ms();
-        let body = Self::build_contact_data_message(&manager, payload, timestamp).await?;
+        let body =
+            Self::build_contact_data_message(self.attachment_gate(), &manager, payload, timestamp)
+                .await?;
         manager
             .send_message(service_id, body, timestamp)
             .await
@@ -4413,7 +6354,9 @@ impl Service {
         }
         let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
         let mut manager = lock_registered_for_send(&shared).await;
-        let body = Self::build_contact_data_message(&manager, payload, timestamp).await?;
+        let body =
+            Self::build_contact_data_message(self.attachment_gate(), &manager, payload, timestamp)
+                .await?;
         dispatch_group(
             self,
             account,
@@ -4455,9 +6398,9 @@ impl Service {
         let whitelist = profile_sharing_whitelist(self, account).await;
         let mut results = Vec::new();
         for number in recipients {
-            let service_id = resolve_recipient(&manager, number)
-                .await
-                .ok_or(SendError::Internal)?;
+            let service_id = self
+                .resolve_recipient_for_send(&mut manager, number)
+                .await?;
             // P9 身份拒发闸（编辑同为内容面）。
             identity_send_gate(&account_dir, &service_id)?;
             let include_profile_key = include_profile_key_for(&whitelist, &service_id);
@@ -4727,6 +6670,7 @@ impl Service {
             "send-latency-probe",
         );
         let (pointers, preview_image) = upload_attachments_for_send(
+            self.attachment_gate(),
             &manager,
             attachments,
             preview.and_then(|item| item.image.as_deref()),
@@ -4735,7 +6679,8 @@ impl Service {
         .await?;
         let body = match sticker {
             Some(sticker) => {
-                let pointer = upload_sticker_image(&manager, sticker).await?;
+                let pointer =
+                    upload_sticker_image(self.attachment_gate(), &manager, sticker).await?;
                 build_sticker_data_message(manager.store(), sticker, quote, pointer, timestamp)
                     .await?
             }
@@ -4896,6 +6841,9 @@ impl Service {
         account: &str,
         group_id: &str,
     ) -> Result<(SharedSendManager, u64), SendError> {
+        if self.is_terminal_account(account) {
+            return Err(SendError::Unbound);
+        }
         let shared = open_registered(self, account)
             .await
             .ok_or(SendError::UnknownAccount)?;
@@ -5387,9 +7335,9 @@ impl Service {
             .await
             .ok_or(SendError::UnknownAccount)?;
         let mut manager = lock_registered_for_send(&shared).await;
-        let service_id = resolve_recipient(&manager, recipient)
-            .await
-            .ok_or(SendError::Internal)?;
+        let service_id = self
+            .resolve_recipient_for_send(&mut manager, recipient)
+            .await?;
         let mut store = manager.store().clone();
         // 未注册联系人拒绝：contacts 表必须已有该收件人行（UUID 形态直通
         // 也不例外——无行 = presage 持久化面静默 no-op，宁拒不哑改）。
@@ -5467,7 +7415,12 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_sync::read_pinned(&context).await
+        // BUG-6 收尾：按账号记录缓存（60s TTL 下限 + storage-pull-settled
+        // 失效；写穿见 setConversationPinned）。
+        context
+            .records
+            .pinned(now_ms(), || storage_sync::read_pinned(&context))
+            .await
     }
 
     /// getBlockedConversations（P5 扩面 + 窗D B7 blockedAt 透出）：读
@@ -5561,7 +7514,7 @@ impl Service {
             .iter()
             .any(|(id, _)| matches!(id, storage_sync::EngineConversationId::Contact(_)))
         {
-            whitelist_cache_invalidate(&self.whitelist_cache, account);
+            invalidate_profile_sharing_whitelist(self, account).await;
         }
         let flips = {
             let mut books = self
@@ -5610,7 +7563,13 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_sync::write_pinned(&context, conversation, pinned).await
+        let result = storage_sync::write_pinned(&context, conversation, pinned).await;
+        // 写穿：返回的是写后全量投影 = 云端真相，直接更新缓存槽
+        //（不是主动回源）。
+        if let Ok(entries) = result.as_ref() {
+            context.records.store_pinned(now_ms(), entries.clone());
+        }
+        result
     }
 
     /// setConversationBlocked（拉黑写面）：官方写语义（读改写目标会话
@@ -5627,10 +7586,11 @@ impl Service {
         }
         let context = storage_context(self, account).await?;
         let result = storage_sync::write_blocked(&context, &conversation, blocked, now_ms()).await;
-        // Contact 族拉黑读改写同携全记录重写（修1）：写成功即失效缓存。
+        // Contact 族拉黑读改写同携全记录重写（修1）：写成功即失效缓存 +
+        // 磁盘打陈旧标记（修4：下一次发送后台重拉，不回落同步拉取）。
         if result.is_ok() && matches!(conversation, storage_sync::EngineConversationId::Contact(_))
         {
-            whitelist_cache_invalidate(&self.whitelist_cache, account);
+            invalidate_profile_sharing_whitelist(self, account).await;
         }
         result
     }
@@ -5675,9 +7635,9 @@ impl Service {
         let (canonical, written) =
             storage_sync::write_conversation_state(&context, &conversation, intent).await?;
         // Contact 族读改写携全记录重写（whitelist 位随读值回写，修1）：缓存
-        // 同步失效，与写面真相对齐。
+        // 同步失效 + 磁盘陈旧标记（修4），与写面真相对齐。
         if matches!(canonical, storage_sync::EngineConversationId::Contact(_)) {
-            whitelist_cache_invalidate(&self.whitelist_cache, account);
+            invalidate_profile_sharing_whitelist(self, account).await;
         }
         self.note_conversation_state_known(account, canonical, written);
         Ok(written)
@@ -5693,7 +7653,10 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_sticker::read_sticker_packs(&context).await
+        context
+            .records
+            .sticker_packs(now_ms(), || storage_sticker::read_sticker_packs(&context))
+            .await
     }
 
     /// setStickerPackSync（P5 扩面）：安装/卸载写面（官方 toStickerPackRecord
@@ -5707,7 +7670,12 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_sticker::write_sticker_pack(&context, &intent, now_ms()).await
+        let now = now_ms();
+        let result = storage_sticker::write_sticker_pack(&context, &intent, now).await;
+        if let Ok(packs) = result.as_ref() {
+            context.records.store_sticker_packs(now, packs.clone());
+        }
+        result
     }
 
     /// storage.getCallLinks（窗D A6）：读全部 call link 投影（存储序 =
@@ -5856,7 +7824,19 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::read_records(&context, storage_sync::StorageRecordKind::ChatFolder).await
+        context
+            .records
+            .records(
+                storage_sync::StorageRecordKind::ChatFolder,
+                now_ms(),
+                || {
+                    storage_records::read_records(
+                        &context,
+                        storage_sync::StorageRecordKind::ChatFolder,
+                    )
+                },
+            )
+            .await
     }
 
     /// chatFolders.setRecords（Storage 跨设备同步批）：官方 upload 语义
@@ -5872,13 +7852,22 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::write_records(
+        let now = now_ms();
+        let result = storage_records::write_records(
             &context,
             storage_sync::StorageRecordKind::ChatFolder,
             records,
             remove_ids,
         )
-        .await
+        .await;
+        if let Ok(values) = result.as_ref() {
+            context.records.store_records(
+                storage_sync::StorageRecordKind::ChatFolder,
+                now,
+                values.clone(),
+            );
+        }
+        result
     }
 
     /// notificationProfiles.list（Storage 跨设备同步批）：同 chatFolders
@@ -5891,11 +7880,19 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::read_records(
-            &context,
-            storage_sync::StorageRecordKind::NotificationProfile,
-        )
-        .await
+        context
+            .records
+            .records(
+                storage_sync::StorageRecordKind::NotificationProfile,
+                now_ms(),
+                || {
+                    storage_records::read_records(
+                        &context,
+                        storage_sync::StorageRecordKind::NotificationProfile,
+                    )
+                },
+            )
+            .await
     }
 
     /// notificationProfiles.setRecords（Storage 跨设备同步批）：同
@@ -5910,13 +7907,22 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::write_records(
+        let now = now_ms();
+        let result = storage_records::write_records(
             &context,
             storage_sync::StorageRecordKind::NotificationProfile,
             records,
             remove_ids,
         )
-        .await
+        .await;
+        if let Ok(values) = result.as_ref() {
+            context.records.store_records(
+                storage_sync::StorageRecordKind::NotificationProfile,
+                now,
+                values.clone(),
+            );
+        }
+        result
     }
 
     /// storyDistributionLists.list（Stories 跨设备名单同步批）：同
@@ -5929,11 +7935,19 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::read_records(
-            &context,
-            storage_sync::StorageRecordKind::StoryDistributionList,
-        )
-        .await
+        context
+            .records
+            .records(
+                storage_sync::StorageRecordKind::StoryDistributionList,
+                now_ms(),
+                || {
+                    storage_records::read_records(
+                        &context,
+                        storage_sync::StorageRecordKind::StoryDistributionList,
+                    )
+                },
+            )
+            .await
     }
 
     /// storyDistributionLists.setRecords（Stories 跨设备名单同步批）：同
@@ -5948,13 +7962,22 @@ impl Service {
             return Ok(Vec::new());
         }
         let context = storage_context(self, account).await?;
-        storage_records::write_records(
+        let now = now_ms();
+        let result = storage_records::write_records(
             &context,
             storage_sync::StorageRecordKind::StoryDistributionList,
             records,
             remove_ids,
         )
-        .await
+        .await;
+        if let Ok(values) = result.as_ref() {
+            context.records.store_records(
+                storage_sync::StorageRecordKind::StoryDistributionList,
+                now,
+                values.clone(),
+            );
+        }
+        result
     }
 
     /// setAccountConfiguration（P5 扩面，官方 updateConfiguration 等价）：
@@ -6268,20 +8291,34 @@ impl Service {
                 storage_sync::ConversationState,
             )>,
         > = updates.iter().map(conversation_write_observation).collect();
+        // 修4：Contact 记录的 whitelist 位就写在本次写的明文里——写成功即
+        // 落增量（内存 + 磁盘），联系人写面不必再付一次全量 Storage 读。
+        let whitelist_deltas: Vec<Option<(String, bool)>> =
+            updates.iter().map(contact_whitelist_write_delta).collect();
         let context = storage_context(self, account).await?;
         let outcome = storage_write::write_items(&context, updates).await?;
-        for (observation, result) in pre_observed.into_iter().zip(&outcome.results) {
-            if let (Some((canonical, state)), storage_write::ItemOutcome::Written { .. }) =
-                (observation, &result.outcome)
-            {
+        let mut applied_deltas: Vec<(String, bool)> = Vec::new();
+        for (index, result) in outcome.results.iter().enumerate() {
+            if !matches!(result.outcome, storage_write::ItemOutcome::Written { .. }) {
+                continue;
+            }
+            let observation = pre_observed.get(index).and_then(|item| item.as_ref());
+            if let Some((canonical, state)) = observation {
                 // whitelist 位住在 ContactRecord（修1）：联系人族写面即清
-                // 发送闸缓存，下一发送重读全量。
+                // 发送闸缓存，下一发送重读全量；修4 起改为「明文带位就落
+                // 增量，无位载荷才保守失效」。
                 if matches!(canonical, storage_sync::EngineConversationId::Contact(_)) {
-                    whitelist_cache_invalidate(&self.whitelist_cache, account);
+                    match whitelist_deltas.get(index).and_then(|item| item.as_ref()) {
+                        Some((aci, whitelisted)) => {
+                            applied_deltas.push((aci.clone(), *whitelisted));
+                        }
+                        None => invalidate_profile_sharing_whitelist(self, account).await,
+                    }
                 }
-                self.note_conversation_state_known(account, canonical, state);
+                self.note_conversation_state_known(account, canonical.clone(), *state);
             }
         }
+        apply_profile_sharing_whitelist_delta(self, account, &context.account_dir, &applied_deltas);
         Ok(outcome)
     }
 
@@ -6534,6 +8571,11 @@ impl Service {
 
 /// storage 面共用上下文：已注册账号的 store + 手工构造凭据的 PushService
 /// + 账号 store 目录（service/mod.rs link_flow 凭据构造先例同构）。
+///
+/// BUG-6 起本结构是**每账号常驻**（[`StorageContextCache`] 持有、clone 取
+/// 用）：SqliteStore/PushService 内部都是 Arc 句柄，clone 共享同一连接池与
+/// 同一凭据面，不再逐 RPC 重开库/重读注册数据。
+#[derive(Clone)]
 pub(crate) struct StorageContext {
     pub(crate) store: SqliteStore,
     pub(crate) push: PushService,
@@ -6542,6 +8584,9 @@ pub(crate) struct StorageContext {
     /// 本机 ACI/PNI（UUID；群凭据 present 面，groups 模块消费，不入日志）。
     pub(crate) aci_uuid: presage::libsignal_service::prelude::Uuid,
     pub(crate) pni_uuid: presage::libsignal_service::prelude::Uuid,
+    /// BUG-6 收尾：storage 记录按账号缓存（sticker/folders/pinned 读面），
+    /// 与上下文同生命周期——解绑/换号/删库即随条目丢弃。
+    pub(crate) records: Arc<storage_records_cache::StorageRecordsCache>,
     /// 群凭据双族缓存句柄（Service 共享，进程内存不落盘；P4c 切一）。
     pub(crate) group_credentials: Arc<call_links::GroupCredentialCache>,
     /// 所属 Service 弱句柄 + 账号名（群态成员 profileKey 新落 → profile
@@ -6549,6 +8594,107 @@ pub(crate) struct StorageContext {
     /// 生命周期）。
     pub(crate) service: Weak<Service>,
     pub(crate) account: String,
+}
+
+/// 账号级 storage 上下文缓存（BUG-6：消除 `storage.*` 逐 RPC 开库税）。
+///
+/// **结构**：账号 → 目录指纹 + `OnceCell<Arc<StorageContext>>`。首次
+/// `storage.*` 调用建库/读注册数据，之后 clone 复用进程生命周期；同号重链
+/// 换新目录时目录指纹不符，旧 cell 被替换（旧 store 句柄随最后一个 clone
+/// 释放关闭）。账号解绑/注销由 `delete_account` 显式摘除。
+///
+/// **并发**：`cells` 是 `tokio::sync::Mutex`，只在取/换 cell 的短临界区持有，
+/// **绝不持锁跨 await**；真正的开库单飞由每账号 `OnceCell` 的
+/// `get_or_try_init` 承担（同时到达的调用只有一个执行开库，其余等结果）。
+/// 因此锁序恒为「cells → OnceCell」，不存在重入路径：开库闭包本身不回调
+/// 本缓存。
+///
+/// **上界**：条目只为已注册账号惰性建立，删除/重链即摘除，故上界 = 账号
+/// 数（无需额外 LRU）；未注册/开库失败不落缓存，错误面与旧实现一致
+/// （`StorageSyncError::UnknownAccount`）。
+pub(crate) struct StorageContextCache {
+    /// 账号 → 目录 + 上下文 cell。锁内只做 HashMap 读写，无 await。
+    cells: AsyncMutex<HashMap<String, CachedStorageContext>>,
+    /// 真实 `open_store` 次数（缓存命中不增；测试断言单飞/复用的观测点）。
+    opens: AtomicU64,
+}
+
+/// 单账号缓存项：目录指纹用于识别同号重链（新 store 目录 = 旧上下文作废）。
+struct CachedStorageContext {
+    account_dir: PathBuf,
+    cell: Arc<OnceCell<Arc<StorageContext>>>,
+    /// storage 记录缓存（与 cell 同条目：换目录/解绑时随整条一起丢弃）。
+    records: Arc<storage_records_cache::StorageRecordsCache>,
+}
+
+impl StorageContextCache {
+    fn new() -> Self {
+        Self {
+            cells: AsyncMutex::new(HashMap::new()),
+            opens: AtomicU64::new(0),
+        }
+    }
+
+    /// 取账号 cell：目录一致复用，目录变化（同号重链）替换旧 cell。
+    async fn cell_for(
+        &self,
+        account: &str,
+        account_dir: &Path,
+    ) -> (
+        Arc<OnceCell<Arc<StorageContext>>>,
+        Arc<storage_records_cache::StorageRecordsCache>,
+    ) {
+        let mut cells = self.cells.lock().await;
+        if let Some(cached) = cells.get(account) {
+            if cached.account_dir.as_path() == account_dir {
+                return (Arc::clone(&cached.cell), Arc::clone(&cached.records));
+            }
+        }
+        let cell = Arc::new(OnceCell::new());
+        let records = Arc::new(storage_records_cache::StorageRecordsCache::new());
+        cells.insert(
+            account.to_owned(),
+            CachedStorageContext {
+                account_dir: account_dir.to_path_buf(),
+                cell: Arc::clone(&cell),
+                records: Arc::clone(&records),
+            },
+        );
+        (cell, records)
+    }
+
+    /// 「storage-pull-settled」失效：manifest 两腿落定后清该账号记录缓存
+    /// （只清已存在的条目，不为未注册/未建上下文的账号建条目）。
+    async fn invalidate_records(&self, account: &str) {
+        let records = {
+            let cells = self.cells.lock().await;
+            cells.get(account).map(|cached| Arc::clone(&cached.records))
+        };
+        if let Some(records) = records {
+            records.invalidate();
+        }
+    }
+
+    /// 摘除并关闭账号上下文（解绑/注销/同号重链）：map 持有一份 Arc，摘除
+    /// 后若调用方没有在飞 clone，store 连接池即随 drop 关闭。
+    async fn invalidate(&self, account: &str) {
+        let _removed = self.cells.lock().await.remove(account);
+    }
+
+    /// 真实开库计数（测试注入点；生产只做原子自增）。
+    fn note_open(&self) {
+        self.opens.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn open_count(&self) -> u64 {
+        self.opens.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    async fn cached_len(&self) -> usize {
+        self.cells.lock().await.len()
+    }
 }
 
 /// 凭据构造共用面（storage_context 上下文与 prekey remote config 读面同
@@ -6573,19 +8719,15 @@ pub(crate) fn push_service_from_registration(data: &RegistrationData) -> Option<
     ))
 }
 
-/// 组装 storage 上下文：账号 store + 凭据（照抄 link_flow 先例）。Arc 面
-/// 入参：群态 profileKey 新落触发面需要 Service 弱句柄（StorageContext.service）。
-async fn storage_context(
+/// 组装 storage 上下文（缓存未命中时才走）：账号 store + 凭据（照抄
+/// link_flow 先例）。Arc 面入参：群态 profileKey 新落触发面需要 Service
+/// 弱句柄（StorageContext.service）。
+async fn build_storage_context(
     service: &Arc<Service>,
     account: &str,
+    account_dir: PathBuf,
+    records: Arc<storage_records_cache::StorageRecordsCache>,
 ) -> Result<StorageContext, storage_sync::StorageSyncError> {
-    let rel = {
-        let state = service.state.lock().await;
-        state
-            .account_dir(account)
-            .ok_or(storage_sync::StorageSyncError::UnknownAccount)?
-    };
-    let account_dir = service.data_dir.join(&rel);
     let store = open_store(&account_dir)
         .await
         .map_err(|_| storage_sync::StorageSyncError::UnknownAccount)?;
@@ -6601,12 +8743,46 @@ async fn storage_context(
         push,
         device_id: data.device_id.unwrap_or(1),
         account_dir,
+        records,
         aci_uuid: data.service_ids.aci,
         pni_uuid: data.service_ids.pni,
         group_credentials: service.group_credentials.clone(),
         service: Arc::downgrade(service),
         account: account.to_owned(),
     })
+}
+
+/// 取账号 storage 上下文（BUG-6 缓存入口，语义与旧逐调用组装相同）。
+///
+/// 每次仍解析一次账号目录以保持 `UnknownAccount` 错误面（账号不在注册表 /
+/// fake 账号 → 未命中缓存也永远不建条目），但命中时只 clone 既有 Arc 句柄，
+/// 不再 `open_store` + `load_registration_data` + 重建 push。
+async fn storage_context(
+    service: &Arc<Service>,
+    account: &str,
+) -> Result<StorageContext, storage_sync::StorageSyncError> {
+    let account_dir = {
+        let state = service.state.lock().await;
+        let rel = state
+            .account_dir(account)
+            .ok_or(storage_sync::StorageSyncError::UnknownAccount)?;
+        service.data_dir.join(rel)
+    };
+    let (cell, records) = service
+        .storage_contexts
+        .cell_for(account, &account_dir)
+        .await;
+    let context = cell
+        .get_or_try_init(|| async {
+            // 只有真正执行开库的那一个调用 +1；并发等在同一 cell 上的调用
+            // 由 OnceCell 唤醒后直接拿结果，不重复计数。
+            service.storage_contexts.note_open();
+            build_storage_context(service, account, account_dir, records)
+                .await
+                .map(Arc::new)
+        })
+        .await?;
+    Ok((**context).clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -6905,6 +9081,18 @@ fn identity_changed_notification(account: &str, sender: &ServiceId, timestamp: u
 /// `ServiceError::Unauthorized`，401/403 同型）后接收循环停止，上抛一次
 /// 本通知（wire additive，connector 白名单不消费零影响）——官方链接设备
 /// 语义：凭据失效即停，等用户重链，不无限退避重连。
+fn connection_state_notification(account: &str, state: &str, close_code: Option<u16>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "connectionState",
+        "params": {
+            "account": account,
+            "state": state,
+            "closeCode": close_code,
+        },
+    })
+}
+
 fn account_unbound_notification(account: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -6929,6 +9117,103 @@ fn receive_stream_unbound(error: &presage::Error<<SqliteStore as Store>::Error>)
     }
 }
 
+/// Duplicate 恢复臂的投影结局（replay 任务收口后）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuplicateReplayOutcome {
+    /// store 行重建成功，投影通知已全部进入出站队列。
+    Projected,
+    /// store 查询成功且**确认无行**（Ok(None)）：没有可投影内容。
+    /// 止血口径 = 「确认无可投影 = 已投影」：flush 后照常 ack，避免服务器
+    /// 重投风暴；计数 + 日志保留（不静默）。注意：store 打不开/查询/解码
+    /// 失败不是本结局（那是 Failed，行状态未知）。
+    Unavailable,
+    /// 投影未完成或行状态未知（ack 扣留）：replay spawn 失败 / 任务 panic /
+    /// 被取消 / store open·read·decode 失败 / key·账号不可定位。
+    Failed,
+}
+
+/// Duplicate 恢复臂最终收口结局（投影 → flush 栅栏 → ack 单点判定）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuplicateRecovery {
+    /// 投影与 flush 均完成，ack 已发出。
+    Acked,
+    /// replay 未投影（spawn 失败/panic/abort/store open·read·decode 失败）：
+    /// 投影或行状态未知，ack 扣留。
+    ProjectionFailed,
+    /// 出口已死（flush 栅栏不可解），ack 扣留并停管线。
+    OutputDead,
+}
+
+/// Duplicate 恢复臂收口序列（唯一实现，单测直打）：投影完成 → flush 栅栏
+/// resolve → ack。与 Contacts/IdentityChange 臂同序（G1）：ack 早于投影/
+/// flush，会在引擎死亡窗口里把服务器队列耗掉，而连接器从未收到投影。
+///
+/// 止血 b（2026-11-10 决策）：Unavailable 仅指 store 查询成功且确认无行
+/// （Ok(None)）——按「确认无可投影 = 已投影」处理，照常 flush 后 ack，只
+/// 保留计数/日志；否则重复信封永不确认，每轮重连都被服务器重投（风暴）。
+/// Failed（spawn 失败/panic/abort/store open·read·decode 失败，投影或行
+/// 状态未知）扣留 ack。
+async fn ack_after_duplicate_projection<R, F, A>(replay: R, flush: F, ack: A) -> DuplicateRecovery
+where
+    R: std::future::Future<Output = DuplicateReplayOutcome>,
+    F: std::future::Future<Output = bool>,
+    A: FnOnce(),
+{
+    match replay.await {
+        DuplicateReplayOutcome::Projected | DuplicateReplayOutcome::Unavailable => {}
+        DuplicateReplayOutcome::Failed => return DuplicateRecovery::ProjectionFailed,
+    }
+    if !flush.await {
+        return DuplicateRecovery::OutputDead;
+    }
+    ack();
+    DuplicateRecovery::Acked
+}
+
+/// replay 任务的 JoinHandle 收口：panic / 取消都落计数 + 结构化日志并返回
+/// Failed（ack 扣留），不静默。单独成函数便于单测直打 panic 分支；
+/// panic payload 不落日志（可能含正文）。
+fn classify_duplicate_replay(
+    account: &str,
+    joined: Result<DuplicateReplayOutcome, tokio::task::JoinError>,
+) -> DuplicateReplayOutcome {
+    match joined {
+        Ok(DuplicateReplayOutcome::Projected) => DuplicateReplayOutcome::Projected,
+        Ok(DuplicateReplayOutcome::Unavailable) => {
+            perf_metrics::add(perf_metrics::keys::DUPLICATE_REPLAY_UNAVAILABLE, 1);
+            tracing::warn!(
+                target: "engine.receive",
+                stage = "duplicate_replay_unavailable",
+                account = %crate::methods::probe_account8(Some(account)),
+                "duplicate replay confirmed no stored row to project; acking after flush"
+            );
+            DuplicateReplayOutcome::Unavailable
+        }
+        // 任务内已计数 + error 日志（含失败 stage）；这里只透传。
+        Ok(DuplicateReplayOutcome::Failed) => DuplicateReplayOutcome::Failed,
+        Err(error) if error.is_panic() => {
+            perf_metrics::add(perf_metrics::keys::DUPLICATE_REPLAY_PANIC, 1);
+            tracing::error!(
+                target: "engine.receive",
+                stage = "duplicate_replay_panic",
+                account = %crate::methods::probe_account8(Some(account)),
+                "duplicate replay task panicked; withholding ack"
+            );
+            DuplicateReplayOutcome::Failed
+        }
+        Err(_) => {
+            perf_metrics::add(perf_metrics::keys::DUPLICATE_REPLAY_ABORTED, 1);
+            tracing::warn!(
+                target: "engine.receive",
+                stage = "duplicate_replay_aborted",
+                account = %crate::methods::probe_account8(Some(account)),
+                "duplicate replay task was cancelled; withholding ack"
+            );
+            DuplicateReplayOutcome::Failed
+        }
+    }
+}
+
 /// serve 流结局（B4 Unbound 停环）：Connected = 建流成功后结束（对端断/
 /// 关停/流排空）→ 退避 reset；Recoverable = 建流失败（store/manager/
 /// websocket 初始化）→ 退避步进；Unbound = 服务端凭据拒绝 → 停环等重链。
@@ -6944,6 +9229,11 @@ enum StreamOutcome {
     /// 官方 SocketManager 明确不重连（`SocketManager.preload.ts`:391-394）。
     /// 停环等连接器/重链显式重建，绝不与夺走连接的客户端互搏。
     Terminated,
+    /// M6 C 阶段：store 打开命中**终态**分类（`StoreKeyRequired` /
+    /// `StoreKeyRejected` / `StoreKeyInvalid` / `StoreCorrupt`）。
+    /// 停环等 key 补齐/人工处置，**不进** Fibonacci 退避重连：错 key 重试
+    /// 一万次还是错 key，每次重试还要再碰一遍盘（设计 F9）。
+    StoreTerminal,
 }
 
 impl StreamOutcome {
@@ -6951,7 +9241,10 @@ impl StreamOutcome {
     fn is_terminal(self) -> bool {
         matches!(
             self,
-            StreamOutcome::Unbound | StreamOutcome::StdioDead | StreamOutcome::Terminated
+            StreamOutcome::Unbound
+                | StreamOutcome::StdioDead
+                | StreamOutcome::Terminated
+                | StreamOutcome::StoreTerminal
         )
     }
 }
@@ -6971,6 +9264,29 @@ const WS_CLOSE_LOCAL_HANDOVER: u16 = 4000;
 /// 接收流结束时是否进入「不重连」终点：1000（normal closure）、4409
 /// （connected elsewhere，官方同位）与 4000（本地槽接管，引擎适配）。
 /// 其余（1001/1006/3001/无 close code）按传输失败走 Fibonacci 重连。
+/// C: one close-code classifier shared by receive, supervisor, and future
+/// connection events. 4401 is invalidated (reconnect, not account terminal);
+/// 4409 is terminated_external (no reconnect); 1000/4000 are local/terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectionClose {
+    Normal,
+    LocalHandover,
+    ConnectedElsewhere,
+    Invalidated,
+    Reconnect,
+}
+
+pub(crate) fn classify_connection_close(close_code: Option<u16>) -> ConnectionClose {
+    match close_code {
+        Some(WS_CLOSE_NORMAL) => ConnectionClose::Normal,
+        Some(WS_CLOSE_LOCAL_HANDOVER) => ConnectionClose::LocalHandover,
+        Some(WS_CLOSE_CONNECTED_ELSEWHERE) => ConnectionClose::ConnectedElsewhere,
+        Some(4401) => ConnectionClose::Invalidated,
+        _ => ConnectionClose::Reconnect,
+    }
+}
+
+#[allow(dead_code)]
 fn receive_close_is_terminal(close_code: Option<u16>) -> bool {
     matches!(
         close_code,
@@ -7248,19 +9564,21 @@ async fn receive_pipeline(
 ) {
     // 发送证书后台预轮换任务（止血批③）：与接收循环同生命周期（shutdown
     // 即止），周期检查 store 持久证书临期并刷新，发送路径只读缓存。
-    let mut cert_shutdown = shutdown.clone();
+    //
+    // 评审阻塞项 2：任务自身的停止条件补齐两条——①store 命中终态时
+    // `certificate_maintenance_loop` 自己返回（不再按 60s→600s 重开磁盘）；
+    // ②管线收口（StoreTerminal / Unbound / StdioDead / 停旗）后这里显式
+    // abort，绝不让一个「管线已死」的账号继续在后台碰盘。
+    let cert_shutdown = shutdown.clone();
     let cert_dir = dir.clone();
-    tokio::spawn(async move {
-        let mut maintenance = CertificateMaintenance::new();
-        loop {
-            tokio::select! {
-                _ = cert_shutdown.changed() => return,
-                _ = tokio::time::sleep(maintenance.delay()) => {
-                    certificate_maintenance_tick(&cert_dir, &mut maintenance).await;
-                }
-            }
-        }
-    });
+    let cert_task = tokio::spawn(certificate_maintenance_loop(
+        cert_dir,
+        cert_shutdown,
+        |path| {
+            let path = path.to_path_buf();
+            async move { open_store(&path).await }
+        },
+    ));
     supervision::run_account_supervisor(
         shutdown,
         supervision::AccountCrashBackoff::default(),
@@ -7281,6 +9599,9 @@ async fn receive_pipeline(
         },
     )
     .await;
+    // 管线收口即停手：证书维护任务不再有任何存在的理由（它只会继续开库
+    // 检查一份这个账号已经读不了的 store）。
+    cert_task.abort();
 }
 
 /// 单次账号运行态：流内重连由本循环承载（状态跨流存活），panic 时随
@@ -7298,6 +9619,14 @@ async fn receive_account_loop(
 ) {
     // 存量联系人补同步的一次性纪律：60s 内断连重开不重复轰主设备。
     let mut last_contacts_sync: Option<std::time::Instant> = None;
+    // gate-trace 第 4 点：双同步（三 sync 请求 + 登录期 manifest 拉）共用的
+    // 60s 一次性窗口随本管线重建 = 窗口作废/重开的现场证据。
+    gate_trace(
+        "window-restart",
+        number,
+        "-",
+        "window-restart reason=pipeline-start",
+    );
     // DERM 重试防环计数（同管线生命周期；断连重开不清——防环窗口以
     // 原始消息时间戳为键，跨重连持续有效）。
     let mut derm_guard = DermRetryGuard::default();
@@ -7317,6 +9646,11 @@ async fn receive_account_loop(
     // 重连节奏（官方 Desktop ts/backoff/BackOff.std 同语义）：Fibonacci
     // 1→55s + ±5s jitter，连接成功 reset 从 1s 重来。
     let mut schedule = ReconnectSchedule::default();
+    // profileSharing 闸读面磁盘层装载（发送长尾修4）：账号启动一次把磁盘
+    // map 铺进内存缓存——冷启动首条真实发送零 Storage 网络读（修3 预热要
+    // 等 sync 臂沉降，进程刚起时仍会踩冷缓存）。纯本地读零网络，失败静默
+    // （= 无 map，首条发送按 bootstrap 语义拉一次）。
+    seed_profile_sharing_whitelist(service, number, dir);
     loop {
         if *shutdown.borrow() {
             return;
@@ -7356,6 +9690,7 @@ async fn receive_account_loop(
                     account = %crate::methods::probe_account8(Some(number)),
                     "receive credentials rejected (401/403); stopping until relink"
                 );
+                service.mark_terminal_account(number);
                 service
                     .notify(number, account_unbound_notification(number))
                     .await;
@@ -7385,6 +9720,19 @@ async fn receive_account_loop(
                     reason = "no_reconnect_close_code",
                     account = %crate::methods::probe_account8(Some(number)),
                     "receive stream closed with a no-reconnect close code; stopping per official semantics"
+                );
+                return;
+            }
+            // M6 C 阶段：store 终态（key/损坏）——停环等 key 补齐或人工
+            // 处置。不 notify、不 mark_terminal_account：账号本身没坏，
+            // 只是这一进程读不了盘；连接器按固定 stderr code 分类处置。
+            StreamOutcome::StoreTerminal => {
+                tracing::error!(
+                    target: "engine.receive",
+                    stage = "receive_stopped",
+                    reason = "store_terminal",
+                    account = %crate::methods::probe_account8(Some(number)),
+                    "store open hit a terminal class; stopping receive until the store is usable"
                 );
                 return;
             }
@@ -7511,12 +9859,49 @@ impl CertificateMaintenance {
     }
 }
 
+/// 证书维护单轮结局（评审阻塞项 2）。
+///
+/// `StoreTerminal` = store 命中终态（缺能力 / key 形状非法 / 缺 key / 错 key /
+/// 库损坏）：这类失败**不会自愈**，维护任务必须停手——否则它会按
+/// 60s→600s 无限重开磁盘（错 key 重试一万次还是同一个结论，每次都要再碰
+/// 一次盘，而且把固定 stderr 行的「终态」语义在后台悄悄推翻）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CertTickOutcome {
+    Continue,
+    StoreTerminal,
+}
+
+/// 证书维护任务的停因（观测/测试面）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CertTaskExit {
+    /// 停机旗（管线收口 / 账号删除 / 进程关停）。
+    Shutdown,
+    /// store 终态：不再重开磁盘，也不重试。
+    StoreTerminal,
+}
+
+/// store 打开失败 → 退避记账 or 终态停机（纯函数，单测直打这条映射）。
+fn note_cert_store_open_failure(
+    maintenance: &mut CertificateMaintenance,
+    error: StoreOpenError,
+) -> CertTickOutcome {
+    if error.is_terminal() {
+        return CertTickOutcome::StoreTerminal;
+    }
+    maintenance.failures += 1;
+    CertTickOutcome::Continue
+}
+
 /// 单轮检查：证书健康即不动（清退避）；不健康 → 刷新。零 stderr（接收
-/// 面纪律），失败只记退避态，下一轮自愈。
-async fn certificate_maintenance_tick(dir: &Path, maintenance: &mut CertificateMaintenance) {
-    let Ok(store) = open_store(dir).await else {
-        maintenance.failures += 1;
-        return;
+/// 面纪律），可重试失败只记退避态、下一轮自愈；store 终态则回报让调用方
+/// 停机（[CertificateMaintenance] 的退避不再被用上）。
+async fn certificate_maintenance_tick(
+    opened: Result<SqliteStore, StoreOpenError>,
+    maintenance: &mut CertificateMaintenance,
+) -> CertTickOutcome {
+    let store = match opened {
+        Ok(store) => store,
+        Err(error) => return note_cert_store_open_failure(maintenance, error),
     };
     let needs_refresh = match store.sender_certificate().await {
         Ok(Some(cert)) => match cert.expiration() {
@@ -7528,15 +9913,45 @@ async fn certificate_maintenance_tick(dir: &Path, maintenance: &mut CertificateM
     };
     if !needs_refresh {
         maintenance.failures = 0;
-        return;
+        return CertTickOutcome::Continue;
     }
     if let Ok(mut manager) = Manager::load_registered(store).await {
         if manager.refresh_sender_certificate().await.is_ok() {
             maintenance.failures = 0;
-            return;
+            return CertTickOutcome::Continue;
         }
     }
     maintenance.failures += 1;
+    CertTickOutcome::Continue
+}
+
+/// 证书维护任务主体（与接收管线同生命周期）：每轮按退避间隔开库检查证书，
+/// 命中 store 终态即返回 [CertTaskExit::StoreTerminal] 收口。
+///
+/// `open` 是注入点（生产传 `open_store`）：单测用它造终态/瞬时失败，
+/// 不必依赖真实能力门与进程 key 环境。
+async fn certificate_maintenance_loop<O, Fut>(
+    dir: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+    mut open: O,
+) -> CertTaskExit
+where
+    O: FnMut(&Path) -> Fut,
+    Fut: std::future::Future<Output = Result<SqliteStore, StoreOpenError>>,
+{
+    let mut maintenance = CertificateMaintenance::new();
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return CertTaskExit::Shutdown,
+            _ = tokio::time::sleep(maintenance.delay()) => {}
+        }
+        let opened = open(&dir).await;
+        if certificate_maintenance_tick(opened, &mut maintenance).await
+            == CertTickOutcome::StoreTerminal
+        {
+            return CertTaskExit::StoreTerminal;
+        }
+    }
 }
 
 /// 接收循环内任何网络维护调用的硬上限（官方单请求 30s 语义）：维护臂
@@ -7553,48 +9968,22 @@ const RECEIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 /// KT (pre-keys gate, §29.6): 接收流拨号前 pre-keys 注册的等待上限。正常
 /// 注册亚秒级（服务器计数 ≥10 时零上传仅一次计数查询），30s 覆盖慢网 +
 /// §29.6 WsClosing 重试链（2×500ms）+ 一次完整重拨，超时不再死等。
+#[allow(dead_code)]
 const PREKEYS_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// KT (pre-keys gate, §29.6): 闸结局 —— `Registered` = 注册完成放行；
 /// `Degraded` = 注册未确认（重试耗尽/超时）仍放行，原因串进降级日志。
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 enum PreKeysGateOutcome {
     Registered,
     Degraded(&'static str),
 }
 
-/// KT (pre-keys gate, §29.6): pre-keys 时序闸（生产包装）。接收流拨号前
-/// 串行等待 `refresh_pre_keys` 完成（内部自带 WsClosing 兜底重试与
-/// require_unused=false 的 slot 拨号——复用活连接，不杀消息管道）。任何
-/// 失败模式都放行接收流（显式落降级 warn），不把注册面故障变成接收面
-/// 停摆。证据行 warn 级 = 滚动日志（与 receive_stream_established 同位，
-/// 链接窗口的时序对账直接可查）。
-async fn prekeys_gate(
-    manager: &mut Manager<SqliteStore, Registered>,
-    account: &str,
-) -> PreKeysGateOutcome {
-    let outcome = run_prekeys_gate(|| manager.refresh_pre_keys(), PREKEYS_GATE_TIMEOUT).await;
-    match &outcome {
-        PreKeysGateOutcome::Registered => tracing::warn!(
-            target: "engine.receive",
-            stage = "prekeys_gate_registered",
-            account = %crate::methods::probe_account8(Some(account)),
-            "pre-keys registered before receive stream dial"
-        ),
-        PreKeysGateOutcome::Degraded(reason) => tracing::warn!(
-            target: "engine.receive",
-            stage = "prekeys_gate_degraded",
-            account = %crate::methods::probe_account8(Some(account)),
-            reason,
-            "pre-keys gate released the receive stream in degraded mode"
-        ),
-    }
-    outcome
-}
-
 /// KT (pre-keys gate, §29.6): 闸核心（预算注入，单测用假注册 future 钉
 /// 语义）。`register` 只调用一次；预算内完成且成功 = `Registered`，否则
 /// `Degraded`（失败 / 超时各有原因串）。
+#[allow(dead_code)]
 async fn run_prekeys_gate<E, F, Fut>(register: F, budget: Duration) -> PreKeysGateOutcome
 where
     E: std::error::Error,
@@ -7639,10 +10028,25 @@ async fn serve_account_stream(
     let account_hash = crate::methods::probe_account8(Some(number));
     let store = match tokio::time::timeout(RECEIVE_CONNECT_TIMEOUT, open_store(dir)).await {
         Ok(Ok(store)) => store,
-        Ok(Err(())) => {
+        // M6 C 阶段（设计 F9）：store 打开失败要分终态/可重试两类。终态
+        // （缺 key / 错 key / 形状非法 / 库损坏）停环，不进退避重连——
+        // 固定 stderr 证据行已由打开路径落过一次（`report_once`），这里只
+        // 落文件日志（带结构化 code，供逐账号对账）。
+        Ok(Err(error)) if error.is_terminal() => {
+            tracing::error!(
+                target: "engine.receive",
+                stage = "receive_store_terminal",
+                code = error.code(),
+                account = %account_hash,
+                "store open refused with a terminal class; stopping receive (no reconnect)"
+            );
+            return StreamOutcome::StoreTerminal;
+        }
+        Ok(Err(error)) => {
             tracing::warn!(
                 target: "engine.receive",
                 stage = "receive_store_open",
+                code = error.code(),
                 account = %account_hash,
                 "receive store unavailable; retrying with backoff"
             );
@@ -7723,7 +10127,8 @@ async fn serve_account_stream(
     // 放行；重试耗尽/超时放行但记降级 warn——服务器可能仍有存量 pre-keys，
     // 接收面健康优先于注册面严格，缺口由 prekey 巡检与 §29.6 WsClosing
     // 重试兜底补齐。
-    prekeys_gate(&mut manager, &account_hash).await;
+    // Official does not block receive on a prekey refresh; the loop's
+    // maintenance tick (maint_at = now) converges keys after the stream is up.
     let mut stream =
         match tokio::time::timeout(RECEIVE_CONNECT_TIMEOUT, manager.receive_messages()).await {
             Ok(Ok(stream)) => stream,
@@ -7774,12 +10179,39 @@ async fn serve_account_stream(
     // 群组不在本面（presage 栈无 groups sync 消费路径，首条群消息渐进落
     // 库=官方链接设备同款）；群会话完整性由本批登录期 manifest 自动拉补
     // （同一时机带，见 sync 臂体）。
-    let mut sync_pending =
-        if initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64)) {
-            Some(tokio::time::Instant::now() + Duration::from_secs(2))
-        } else {
-            None
-        };
+    let forced_initial_sync = take_forced_initial_sync(number);
+    let post_registration_syncs_complete = {
+        let state = service.state.lock().await;
+        state.post_registration_syncs_complete(number)
+    };
+    // Official order: syncRequests are sent when the authenticated socket is
+    // ready, before the receive queue starts. The deferred select arm below
+    // still owns manifest/profile completion; the request itself must not
+    // wait for a timer that a busy receive stream can starve.
+    let early_sync_sent = if forced_initial_sync
+        || (!post_registration_syncs_complete
+            && initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64)))
+    {
+        // Never hold the receive loop on a slow sync-request send. Official
+        // sends the three requests exactly once per auth socket; the deferred
+        // arm only retries a failed early send.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            send_initial_sync_requests(&mut manager),
+        )
+        .await
+        .unwrap_or(false)
+    } else {
+        false
+    };
+    let mut sync_pending = if forced_initial_sync
+        || (!post_registration_syncs_complete
+            && initial_sync_due((*last_contacts_sync).map(|at| at.elapsed().as_millis() as u64)))
+    {
+        Some(tokio::time::Instant::now() + Duration::from_secs(2))
+    } else {
+        None
+    };
     // T-9 fetchLatest 消费臂防抖簿（触发位在 Received::Content 臂；
     // 500ms trailing 窗沿毫秒簿记，窗沿 select 臂执行拉取）。
     let mut manifest_debounce = ManifestPullDebounce::default();
@@ -7812,6 +10244,9 @@ async fn serve_account_stream(
     // （纪律终止收流、拨号挂 30s、断连循环 450+ 次/日）。根修：presage
     // account_manager 改为复用活动 WS（registered.rs account_manager 传
     // require_unused=false），不再拨第二条——维护恢复默认开启。
+    let envelope_probe_until = tokio::time::Instant::now() + Duration::from_secs(60);
+    // WebSocket 收帧 → receive loop 延迟探针（只读采样，零接收语义变化）。
+    let mut ws_latency_probe = ws_latency::WsLatencyProbe::new();
     let mut maint_at = Some(tokio::time::Instant::now() + Duration::from_millis(0));
     // prekey 快速巡检（P12/R4）：30min 时间触发 + 200 信封量触发的低水位
     // 快速路径——长连接内 prekey 耗尽的发现窗从 2 天（maintenance_tick）
@@ -7825,7 +10260,20 @@ async fn serve_account_stream(
     // （maintenance_tick 书签判到期同纪律），量触发刷新书签让时间窗重开。
     let mut quick_last_ms: Option<u64> = None;
     let mut quick_seen: u64 = 0;
+    // 诊断面（2026-11-12）：接收循环每轮入口记gap。gap 大 = 上一轮在循环内
+    // 忙别的（或没被唤醒）；配合 ws_frame_to_loop 可区分「没取」与「取了没处理」。
+    let mut last_iter_at = std::time::Instant::now();
     loop {
+        let iter_gap_ms = last_iter_at.elapsed().as_millis() as u64;
+        if iter_gap_ms >= 200 {
+            tracing::warn!(
+                target: "engine.latency",
+                stage = "receive_loop_gap",
+                gap_ms = iter_gap_ms,
+                "receive loop iteration gap"
+            );
+        }
+        last_iter_at = std::time::Instant::now();
         tokio::select! {
             _ = shutdown.changed() => return StreamOutcome::Connected,
             _ = async {
@@ -7835,19 +10283,12 @@ async fn serve_account_stream(
                     // sendSyncRequests 同位——成功/失败都不重试（一次性
                     // 纪律，下次链路建立再补）。
                     let sync_started = std::time::Instant::now();
-                    if tokio::time::timeout(
-                        RECEIVE_CONNECT_TIMEOUT,
-                        send_initial_sync_requests(&mut manager),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        tracing::warn!(
-                            target: "engine.receive",
-                            stage = "initial_sync_requests_timeout",
-                            account = %account_hash,
-                            "initial sync requests timed out; returning to receive loop"
-                        );
+                    if !early_sync_sent {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            send_initial_sync_requests(&mut manager),
+                        )
+                        .await;
                     }
                     // S2a 打点：存量补同步三请求耗时（一次性面基线）。
                     perf_metrics::record_us(
@@ -7893,6 +10334,7 @@ async fn serve_account_stream(
                     let manifest_service = Arc::clone(service);
                     let manifest_account = number.to_owned();
                     let manifest_join = tokio::task::spawn_local(async move {
+                        let manifest_started = std::time::Instant::now();
                         let outcome = tokio::time::timeout(
                             RECEIVE_JOB_TIMEOUT,
                             pull_storage_manifest(
@@ -7903,6 +10345,16 @@ async fn serve_account_stream(
                         )
                         .await
                         .ok();
+                        // 诊断面（2026-11-12）：登录期 manifest 拉取耗时。它与
+                        // 收流循环同在一个 LocalSet，重活在 await 之间会把循环
+                        // 按在原地——同步慢的嫌疑对象之一。
+                        tracing::warn!(
+                            target: "engine.latency",
+                            stage = "login_manifest_pull",
+                            ok = outcome.is_some(),
+                            elapsed_ms = manifest_started.elapsed().as_millis() as u64,
+                            "login manifest pull finished"
+                        );
                         if outcome.is_none() {
                             tracing::warn!(
                                 target: "engine.receive",
@@ -7970,6 +10422,13 @@ async fn serve_account_stream(
                                 ),
                             )
                             .await;
+                        // gate-trace 第 2 点：engine.initialSyncComplete 发射后一行。
+                        gate_trace(
+                            "initial-sync",
+                            &join_account,
+                            if manifest_ok && profiles_ok { "ok" } else { "fail" },
+                            &format!("manifestOk={manifest_ok} profilesOk={profiles_ok}"),
+                        );
                         // 启动预热批（send 性能批 2026-10-16，compat §5）：
                         // 刷新批之后同一沉降带一次发送路径预热（近活跃会话
                         // 目标收集 → 独立 Manager ensure_session，零真实
@@ -8117,6 +10576,49 @@ async fn serve_account_stream(
             item = stream.next() => {
                 // S2a 打点：信封级到达起点（ack 前逐臂落 RECEIVE_ENVELOPE）。
                 let envelope_started = std::time::Instant::now();
+                // 只读延迟探针：帧进入传输栈的本地时刻 → 本处理点的差值。
+                // 无帧戳的条目（QueueEmpty / GroupSyncFailed）静默跳过；
+                // 采样与日志均不参与接收分支。
+                if let Some(sample) = ws_latency_probe.observe(&item) {
+                    ws_latency::log_frame_to_loop(&sample);
+                }
+                // Bounded link-window probe: type + server timestamp only.
+                if tokio::time::Instant::now() < envelope_probe_until {
+                    let (kind, server_ts) = match &item {
+                        Some(Received::Content(content, _)) => (
+                            "content",
+                            Some(content.metadata.client_timestamp.timestamp_millis()),
+                        ),
+                        Some(Received::Contacts(sync, _)) => (
+                            "contacts",
+                            Some(sync.content.metadata.client_timestamp.timestamp_millis()),
+                        ),
+                        Some(Received::IdentityChange(_, content, _)) => (
+                            "identity_change",
+                            Some(content.metadata.client_timestamp.timestamp_millis()),
+                        ),
+                        Some(Received::Duplicate(content, _)) => (
+                            "duplicate",
+                            Some(content.metadata.client_timestamp.timestamp_millis()),
+                        ),
+                        Some(Received::DecryptionError(_, ts, _, _)) => {
+                            ("decryption_error", ts.map(|v| v as i64))
+                        }
+                        Some(Received::QueueEmpty) => ("queue_empty", None),
+                        Some(Received::GroupSyncFailed { .. }) => ("group_sync_failed", None),
+                        None => ("stream_end", None),
+                    };
+                    let now = now_ms() as i64;
+                    tracing::warn!(
+                        target: "engine.receive",
+                        stage = "receive_envelope_probe",
+                        kind,
+                        server_ts = server_ts.unwrap_or(-1),
+                        now_ms = now,
+                        delta_ms = server_ts.map(|ts| now - ts).unwrap_or(-1),
+                        "receive envelope probe"
+                    );
+                }
                 // A1 观测：该账号接收在飞置 1（离开臂体含提前 return 自动归 0）。
                 let _inflight = account_metrics::ReceiveInflight::enter(number);
                 match item {
@@ -8132,9 +10634,19 @@ async fn serve_account_stream(
                     // 也恒产出、每流恰一次，vendored presage 无条件透传
                     // 不丢弃，武装必达）。
                     skew_gate.arm();
+                    let notify_started = std::time::Instant::now();
                     service
                         .notify(number, queue_emptied_notification(number))
                         .await;
+                    let notify_ms = notify_started.elapsed().as_millis() as u64;
+                    if notify_ms >= 200 {
+                        tracing::warn!(
+                            target: "engine.latency",
+                            stage = "queue_empty_notify",
+                            elapsed_ms = notify_ms,
+                            "queue-empty notification blocked"
+                        );
+                    }
                 }
                 // contacts 由 presage 自动入库（号码/名字面随之可用）。P15a
                 // 项3：解析后的联系人记录随 Received::Contacts 上抛（vendored
@@ -8142,6 +10654,27 @@ async fn serve_account_stream(
                 // 事件供 connector upsert 自有库（官方 contactSync 消费同位）。
                 // G1：ack 前等 flush 栅栏（投影可达连接器才耗服务器队列）。
                 Some(Received::Contacts(sync, ack)) => {
+                    // Before retrieve_contacts (attachment download + decrypt).
+                    tracing::warn!(
+                        target: "engine.receive",
+                        stage = "contact_sync_envelope_received",
+                        complete = sync.complete,
+                        "contact sync envelope reached receive loop"
+                    );
+                    tracing::warn!(
+                        target: "engine.receive",
+                        stage = "contact_sync_received",
+                        complete = sync.complete,
+                        records = sync.contacts.len(),
+                        "contact sync attachment received"
+                    );
+                    // gate-trace 第 3 点：contacts sync 信封到达（complete 面 + 记录数）。
+                    gate_trace(
+                        "contact-sync",
+                        number,
+                        if sync.complete { "ok" } else { "-" },
+                        &format!("complete={} records={}", sync.complete, sync.contacts.len()),
+                    );
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTACTS, 1);
                     quick_seen += 1;
                     for notification in project_contacts_sync(number, &sync) {
@@ -8150,8 +10683,21 @@ async fn serve_account_stream(
                     if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
                     }
+                    if sync.complete {
+                        let mut state = service.state.lock().await;
+                        if let Err(error) = state.mark_post_registration_syncs_complete(number) {
+                            tracing::warn!(
+                                target: "engine.receive",
+                                stage = "post_registration_syncs_persist_failed",
+                                %error,
+                                "failed to persist post-registration sync completion"
+                            );
+                        }
+                    }
                     record_receive_envelope(number, envelope_started);
-                    ack.ack();
+                    if let Some(ack) = ack {
+                        ack.ack();
+                    }
                 }
                 // 解密失败：官方语义同样是 ack（Android IncomingMessageObserver
                 // 落库事务后逐条 ack，解密失败也 ack），否则服务器队列堆积；
@@ -8209,12 +10755,54 @@ async fn serve_account_stream(
                     record_receive_envelope(number, envelope_started);
                     ack.ack();
                 }
-                // 重复投递（store 已有同源行）：已投影过，仅补 ack 不再通知。
-                Some(Received::Duplicate(ack)) => {
+                // 重复投递（store 已有同源行）：上次落库后投影可能未完成
+                // （引擎死亡窗口），按 store 行重建后补投影；行身份是
+                // thread_messages（kt_outbox 已 DROP），dup key 仅 wire 标识。
+                Some(Received::Duplicate(content, ack)) => {
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_DUPLICATE, 1);
-                    quick_seen += 1;
-                    record_receive_envelope(number, envelope_started);
-                    ack.ack();
+                    let timestamp = content
+                        .metadata
+                        .client_timestamp
+                        .timestamp_millis()
+                        .max(0) as u64;
+                    let sender = content.metadata.sender.service_id_string();
+                    // Phase2：kt-events marker 与 event_store 模块已删除，
+                    // 恢复目标只用信封内容推出的 thread：两群同 sender+ts
+                    // 与远端删除墓碑都靠它定位到本信封自己的行。
+                    let target = match presage::store::Thread::try_from(content.as_ref()) {
+                        Ok(thread) => DuplicateReplayTarget::Thread {
+                            sender: content.metadata.sender,
+                            timestamp,
+                            thread,
+                        },
+                        Err(_) => DuplicateReplayTarget::Key(
+                            crate::outbox_model::duplicate_dedupe_key(&sender, timestamp),
+                        ),
+                    };
+                    // G1：投影（replay）与 flush 栅栏都完成才 ack——与
+                    // Contacts/IdentityChange 臂同序。spawn 失败/panic/abort
+                    // 与 store open/read/decode 失败都已计数 + 记日志（不静默），
+                    // 投影或行状态未知 → ack 扣留；只有 store 查询成功且确认
+                    // 无行才按「确认无可投影 = 已投影」flush 后照常 ack
+                    // （止血 b：避免服务器重投风暴）。
+                    match ack_after_duplicate_projection(
+                        Service::spawn_duplicate_replay(service, number, target),
+                        service.flush_barrier(number),
+                        || {
+                            ack.ack();
+                        },
+                    )
+                    .await
+                    {
+                        DuplicateRecovery::Acked => {
+                            quick_seen += 1;
+                            record_receive_envelope(number, envelope_started);
+                        }
+                        DuplicateRecovery::ProjectionFailed => {}
+                        DuplicateRecovery::OutputDead => {
+                            return StreamOutcome::StdioDead;
+                        }
+                    }
                 }
                 // 群取回失败（接收完整性批②，compat §3 additive）：同信封
                 // 触发的群 update fetch/decrypt 在 vendored 重试环耗尽。解码
@@ -8292,27 +10880,64 @@ async fn serve_account_stream(
                             ),
                         )
                         .await;
-                    for notification in
-                        project_content(
+                    let project_started = std::time::Instant::now();
+                    let project_ms;
+                    let notify_ms;
+                    {
+                        let notifications = project_content(
                             number,
                             manager.store(),
                             &content,
                             &service.terminated_groups,
                             Some(service),
                         )
-                        .await
-                    {
-                        service.notify(number, notification).await;
+                        .await;
+                        project_ms = project_started.elapsed().as_millis() as u64;
+                        let notify_started = std::time::Instant::now();
+                        for notification in notifications {
+                            service.notify(number, notification).await;
+                        }
+                        notify_ms = notify_started.elapsed().as_millis() as u64;
                     }
+                    let flush_started = std::time::Instant::now();
                     // G1：ack 前等 flush 栅栏（同 Content 臂）。
                     if !service.flush_barrier(number).await {
                         return StreamOutcome::StdioDead;
+                    }
+                    if project_ms >= 200 || notify_ms >= 200 || flush_started.elapsed().as_millis() >= 200 {
+                        tracing::warn!(
+                            target: "engine.latency",
+                            stage = "content_steps",
+                            project_ms,
+                            notify_ms,
+                            flush_ms = flush_started.elapsed().as_millis() as u64,
+                            "content arm step timings"
+                        );
                     }
                     quick_seen += 1;
                     record_receive_envelope(number, envelope_started);
                     ack.ack();
                 }
                 Some(Received::Content(content, ack)) => {
+                    // 诊断面（2026-11-12）：单封信封在循环里的处理耗时。
+                    // 与 ws_frame_to_loop 的排队耗时相加即为「帧到 → 已处理」
+                    // 的全链；用于把同步慢的 20 秒归因到具体分段。
+                    let handled_started = std::time::Instant::now();
+                    {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let server_ts = content.metadata.server_timestamp.timestamp_millis();
+                        tracing::warn!(
+                            target: "engine.latency",
+                            stage = "content_enter",
+                            server_ts,
+                            now_ms,
+                            delta_ms = now_ms - server_ts,
+                            "incoming content reached receive loop"
+                        );
+                    }
                     // S2a 打点：Content 臂信封计数。
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTENT, 1);
                     // 延迟探针（契约 §4.90 服务器时间戳的观测用法）：
@@ -8414,6 +11039,12 @@ async fn serve_account_stream(
                     }
                     quick_seen += 1;
                     record_receive_envelope(number, envelope_started);
+                    tracing::warn!(
+                        target: "engine.latency",
+                        stage = "envelope_handled",
+                        elapsed_ms = handled_started.elapsed().as_millis() as u64,
+                        "envelope handled"
+                    );
                     ack.ack();
                 }
                     None => {
@@ -8424,17 +11055,53 @@ async fn serve_account_stream(
                         // 失败回到 Fibonacci 重连。旧实现把 4409 当
                         // Connected 立即重连，会与被夺走的客户端互踢振荡。
                         let close_code = manager.identified_websocket_close_code().await;
-                        if receive_close_is_terminal(close_code) {
-                            tracing::warn!(
-                                target: "engine.receive",
-                                stage = "receive_stream_closed_no_reconnect",
-                                account = %account_hash,
-                                close_code = ?close_code,
-                                "receive stream closed with a no-reconnect code (1000/4409/4000)"
-                            );
-                            return StreamOutcome::Terminated;
+                        match classify_connection_close(close_code) {
+                            ConnectionClose::Normal
+                            | ConnectionClose::ConnectedElsewhere
+                            | ConnectionClose::LocalHandover => {
+                                let state = match classify_connection_close(close_code) {
+                                    ConnectionClose::Normal => "normal",
+                                    ConnectionClose::ConnectedElsewhere => "connected_elsewhere",
+                                    ConnectionClose::LocalHandover => "local_handover",
+                                    _ => "unknown",
+                                };
+                                service
+                                    .notify(
+                                        number,
+                                        connection_state_notification(number, state, close_code),
+                                    )
+                                    .await;
+                                tracing::warn!(
+                                    target: "engine.receive",
+                                    stage = "receive_stream_closed_no_reconnect",
+                                    account = %account_hash,
+                                    close_code = ?close_code,
+                                    "receive stream closed with a no-reconnect code (1000/4409/4000)"
+                                );
+                                return StreamOutcome::Terminated;
+                            }
+                            ConnectionClose::Invalidated => {
+                                service
+                                    .notify(
+                                        number,
+                                        connection_state_notification(
+                                            number,
+                                            "invalidated",
+                                            close_code,
+                                        ),
+                                    )
+                                    .await;
+                                tracing::warn!(
+                                    target: "engine.receive",
+                                    stage = "receive_stream_invalidated",
+                                    account = %account_hash,
+                                    close_code = ?close_code,
+                                    "receive stream invalidated (4401); reconnecting, not unlinking"
+                                );
+                                return StreamOutcome::Connected;
+                            }
+                            ConnectionClose::Reconnect => return StreamOutcome::Connected,
                         }
-                        return StreamOutcome::Connected;
                     }
                 }
                 // prekey 快速巡检量臂（P12/R4）：窗内 ≥200 信封即快速巡检
@@ -10211,7 +12878,18 @@ fn project_data_message(
         // E2：官方 isValidTapToView 同构校验——非法行补 viewOnceInvalid
         // （官方 isTapToViewInvalid 同位）。引擎 metadata-only 无字节可擦，
         // 只标记不擦除（compat §5）。
-        if !is_valid_view_once_row(data_message) {
+        if let Some(reason) = view_once_invalid_reason(data_message) {
+            // 诊断面（2026-11-12）：只记判据名与附件数，不含正文/文件名/账号。
+            // 用途：把「对方版本较旧，暂不能展示」的兜底分成 我们判严/官方新形状/消息损坏 三类。
+            tracing::warn!(
+                target: "engine.view_once",
+                stage = "view_once_invalid",
+                reason = reason,
+                attachments = data_message.attachments.len(),
+                has_quote = data_message.quote.is_some(),
+                has_sticker = data_message.sticker.is_some(),
+                "view-once row failed shape validation"
+            );
             out["viewOnceInvalid"] = json!(true);
         }
     }
@@ -10608,27 +13286,38 @@ fn project_data_message(
 /// JS `if (body)` 同口径：空串为 falsy 即合法）∧ 恰 1 附件 ∧ 媒体族
 /// image|video ∧ 无 quote/sticker/contact/preview。官方不查 mentions，接收
 /// 面同构不查（发送面 E1 更严：mentions 禁发，compat §5）。
-fn is_valid_view_once_row(data_message: &presage::proto::DataMessage) -> bool {
+/// 非法判据名（诊断面用；顺序即官方 isValidTapToView 的短路顺序）。
+/// 返回 `None` = 合法。文案只进日志，不上 wire。
+fn view_once_invalid_reason(data_message: &presage::proto::DataMessage) -> Option<&'static str> {
     if data_message
         .body
         .as_deref()
         .is_some_and(|body| !body.is_empty())
     {
-        return false;
+        return Some("body_non_empty");
     }
     if data_message.attachments.len() != 1 {
-        return false;
+        return Some("attachment_count");
     }
     let Some(content_type) = data_message.attachments[0].content_type.as_deref() else {
-        return false;
+        return Some("content_type_missing");
     };
     if !is_view_once_media(content_type) {
-        return false;
+        return Some("content_type_not_view_once");
     }
-    if data_message.quote.is_some() || data_message.sticker.is_some() {
-        return false;
+    if data_message.quote.is_some() {
+        return Some("has_quote");
     }
-    data_message.contact.is_empty() && data_message.preview.is_empty()
+    if data_message.sticker.is_some() {
+        return Some("has_sticker");
+    }
+    if !data_message.contact.is_empty() {
+        return Some("has_contact");
+    }
+    if !data_message.preview.is_empty() {
+        return Some("has_preview");
+    }
+    None
 }
 
 /// story 回复作者解析（Stories 接收批，E2）：author_aci_binary 16B UUID
@@ -11561,7 +14250,7 @@ fn qr_link_url(mut url: url::Url) -> url::Url {
 async fn link_flow(
     mut store: SqliteStore,
     url_tx: futures::channel::oneshot::Sender<url::Url>,
-) -> Result<LinkOutcome, ()> {
+) -> Result<LinkOutcome, LinkError> {
     let mut rng = rng();
     let password = Alphanumeric.sample_string(&mut rng, 24);
     let push_service = PushService::new(SignalServers::Production, None, USER_AGENT);
@@ -11580,28 +14269,72 @@ async fn link_flow(
         async move {
             let url = match event_rx.next().await {
                 Some(SecondaryDeviceProvisioning::Url(url)) => url,
-                _ => return Err(()),
+                // URL 都没拿到：startLink 自己的 URL 等待臂收口（Internal）。
+                _ => return Err(terminal_before_url()),
             };
-            let _ = url_tx.send(qr_link_url(url));
+            let url_delivered_at = std::time::Instant::now();
+            if url_tx.send(qr_link_url(url)).is_err() {
+                // 调用方已超时/丢弃 url_rx：没有可 finish 的会话，按未交付
+                // URL 收口，不把死会话记成 lost（startLink 会 abort 本任务）。
+                return Err(terminal_url_timeout());
+            }
+            // B1：URL 已交付后，流结束/WS 关闭/超时全部是终局 Lost。
             match event_rx.next().await {
-                Some(SecondaryDeviceProvisioning::NewDeviceRegistration(data)) => Ok(data),
-                _ => Err(()),
+                Some(SecondaryDeviceProvisioning::NewDeviceRegistration(data)) => {
+                    // BUG-5 尾巴（link 分段计时 · 2026-11-13）：42s 黑盒的第
+                    // 一段——QR 交付 → 手机扫码/确认/密钥交换/注册消息上传
+                    // 完成真机实测 42s 级（108 次样本），本段拆出「用户+上游」
+                    // 与本机 commit 的占比。纯日志，零行为。
+                    // ENGINE-15: engine stderr 文件级只收 WARN（与 send_latency_probe
+                    // 同款先例），info 级在这条链上是不可见的——分段计时必须用 warn
+                    // 才能落盘，否则 42s 永远是黑盒。
+                    tracing::warn!(
+                        target: "engine.link",
+                        stage = "provisioning-wait",
+                        qr_to_registration_ms = url_delivered_at.elapsed().as_millis() as u64,
+                        "QR delivered → NewDeviceRegistration received"
+                    );
+                    Ok(data)
+                }
+                // URL 已交付后任何非注册事件（流结束/关闭）= Lost。
+                _ => Err(terminal_after_url_closed()),
             }
         },
     )
     .await;
 
-    if let Err(error) = &link_outcome {
-        tracing::warn!(target: "engine.link", stage = "link_device", ?error, "link_device failed");
-    }
-    link_outcome.map_err(|_| ())?;
     let registration = match registration {
         Ok(data) => data,
-        Err(()) => {
-            tracing::warn!(target: "engine.link", stage = "registration_missing", "provisioning registration message missing");
-            return Err(());
+        Err(error) => {
+            // URL 是否已交付由结果槽编码：Lost = 交付后读流结束；Internal =
+            // 交付前失败。再用 link_device 的真实终局错误细分 keepalive 超时
+            // 与普通关闭，最后交给纯映射归型（URL 前一律 Internal）。
+            let url_delivered = matches!(error, LinkError::Lost);
+            let cause = match &link_outcome {
+                Err(link_error) => provisioning_terminal_cause(link_error),
+                Ok(()) => LinkTerminalCause::StreamClosed,
+            };
+            let classified = classify_link_terminal(url_delivered, cause);
+            let stage = if matches!(&classified, LinkError::Lost) {
+                "registration_missing_lost"
+            } else {
+                "registration_missing"
+            };
+            tracing::warn!(target: "engine.link", stage, "provisioning registration message missing");
+            return Err(classified);
         }
     };
+    // registration 已到手 = provisioning 已把完整注册数据交过来；link_device
+    // 的收尾错误不再反悔一次成功链接（旧实现把它误归 Lost，会丢弃有效
+    // 注册数据并把已完成的会话报成死链）。
+    if let Err(error) = &link_outcome {
+        tracing::warn!(
+            target: "engine.link",
+            stage = "link_device_tail",
+            ?error,
+            "link_device failed after registration"
+        );
+    }
     let NewDeviceRegistration {
         phone_number,
         device_id,
@@ -11639,9 +14372,14 @@ async fn link_flow(
 
     // serde 数据面构造（官方 store 落库格式）：pub(crate) 字段的唯一合法
     // 构造路径；键面与序列化形态由往返单测锁死。
+    // BUG-5 尾巴（link 分段计时 · 2026-11-13）：第二段起点——注册数据到手
+    // 后的本机收口（serde 构造 + store 三连写 + load_registered 门禁）。
+    let commit_started_at = std::time::Instant::now();
     let number = e164_string(&phonenumber_from_signal(&phone_number));
-    let servers = serde_json::to_value(SignalServers::Production).map_err(|_| ())?;
-    let phone = serde_json::to_value(phonenumber_from_signal(&phone_number)).map_err(|_| ())?;
+    let servers =
+        serde_json::to_value(SignalServers::Production).map_err(|_| link_store_error())?;
+    let phone = serde_json::to_value(phonenumber_from_signal(&phone_number))
+        .map_err(|_| link_store_error())?;
     use base64::Engine as _;
     let profile_key_b64 = base64::engine::general_purpose::STANDARD.encode(profile_key.bytes);
     // 注意 from_str 而非 from_value：上游 serde_profile_key 用借用反序列化
@@ -11661,19 +14399,19 @@ async fn link_flow(
             "pni_registration_id": Some(pni_registration_id),
             "profile_key": profile_key_b64,
         }))
-        .map_err(|_| ())?,
+        .map_err(|_| link_store_error())?,
     )
-    .map_err(|_| ())?;
+    .map_err(|_| link_store_error())?;
 
     // 落库顺序与官方 link_secondary_device 一致。
     store
         .set_aci_identity_key_pair(IdentityKeyPair::new(aci_public_key, aci_private_key))
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| link_store_error())?;
     store
         .set_pni_identity_key_pair(IdentityKeyPair::new(pni_public_key, pni_private_key))
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| link_store_error())?;
     let master_key = account_entropy_pool.as_ref().and_then(|aep| {
         presage::libsignal_service::prelude::MasterKey::from_slice(aep.derive_svr_key().as_slice())
             .ok()
@@ -11681,24 +14419,34 @@ async fn link_flow(
     store
         .store_master_key(master_key.as_ref())
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| link_store_error())?;
     store
         .store_account_entropy_pool(account_entropy_pool.as_ref())
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| link_store_error())?;
     store
         .save_registration_data(&registration_data)
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| link_store_error())?;
 
     // 回归既有收发管线的门禁：标准 load 路径能读回（本任务内 Manager 即弃，
     // 接收管线在 finish_link 后由 spawn_pipeline 自行 load）。
-    Manager::load_registered(store).await.map_err(|_| ())?;
+    Manager::load_registered(store)
+        .await
+        .map_err(|_| link_store_error())?;
 
     // 一次性迁移密钥：原样装入行囊移交 finish_link——收口清理（同号旧
     // 任务 cancel + 进度清缺）必须先于新任务启动，spawn 留在本函数会被
     // finish_link 确定性误杀（真机四连「永久同步中」根因）。导出面 future
     // 非 Send（上游 FramesReader 持 Rc 状态），spawn 仍在 LocalSet 承载。
+    // BUG-5 尾巴（link 分段计时 · 2026-11-13）：第二段终点——与第一段
+    // provisioning-wait 相加即 finish 全程，42s 黑盒从此有账可查。纯日志。
+    tracing::warn!(
+        target: "engine.link",
+        stage = "registration-commit",
+        commit_ms = commit_started_at.elapsed().as_millis() as u64,
+        "registration data in hand → store written + load_registered verified"
+    );
     let pending_transfer = ephemeral_backup_key.map(|backup_key| PendingTransferDownload {
         aci: service_ids.aci,
         credentials: ServiceCredentials {
@@ -12558,12 +15306,15 @@ fn project_contact_entry(
 /// send 附件上行：官方 CDN v4 面零 fork（presage upload_attachments，加密/
 /// padding/digest/上传全官方原语）。任何一条失败整体 fail-closed（半发的
 /// 引用消息比拒绝更糟）。预览图（若有）与附件同批上传，按序取回。上传
-/// 返回后按 parsed 序对齐置位两类客户端线上陈述（presage join_all 保序，
+/// 返回后按 parsed 序对齐置位三类客户端线上陈述（presage join_all 保序，
 /// input 序 = output 序）：GIF 旗标（`;gif=true` → Flags.GIF，见
-/// apply_outgoing_gif_flag）与语音波形+时长（`;voice=true` → 官方算法
+/// apply_outgoing_gif_flag）、语音波形+时长（`;voice=true` → 官方算法
 /// 生成 audioWaveform/audioDurationSeconds，见 apply_outgoing_voice_
-/// metadata）；贴纸图走 upload_sticker_image 单条面不经此处（官方贴纸
-/// 指针无 GIF 位、无语音元数据）。
+/// metadata）与普通附件声明尺寸（`;width=<px>;height=<px>` →
+/// AttachmentPointer.width/height，见 apply_outgoing_dimensions；BUG-11
+/// wire 批，无两参 = 旧形状逐字节不变）；贴纸图走 upload_sticker_image
+/// 单条面不经此处（官方贴纸指针无 GIF 位、无语音元数据；贴纸尺寸走
+/// spec 上行面）。
 ///
 /// `caption`（2026-10-15 媒体 story caption 批）：story 媒体腿 caption 走
 /// spec 上行面直通（apply_outgoing_caption 置位首条正文附件 spec，vendored
@@ -12571,6 +15322,7 @@ fn project_contact_entry(
 /// uploadAttachment `caption || null` 进指针同构）——仅 story 媒体腿传
 /// Some（entries 恒单条），send/preview 调用面传 None 零变化。
 async fn upload_attachments_for_send(
+    gate: &Arc<attachment_gate::AttachmentGate>,
     manager: &Manager<SqliteStore, Registered>,
     entries: &[String],
     preview_image: Option<&str>,
@@ -12582,26 +15334,29 @@ async fn upload_attachments_for_send(
     ),
     SendError,
 > {
-    let mut parsed = entries
-        .iter()
-        .map(|entry| parse_attachment_data_uri(entry))
-        .collect::<Option<Vec<_>>>()
-        .ok_or(SendError::Internal)?;
-    let image_index = match preview_image {
-        Some(uri) => {
-            parsed.push(parse_attachment_data_uri(uri).ok_or(SendError::Internal)?);
-            Some(parsed.len() - 1)
-        }
-        None => None,
-    };
-    if parsed.len() > ATTACHMENT_MAX_COUNT {
-        return Err(SendError::Internal);
-    }
-    if parsed.is_empty() {
+    // 第一段：只解析形状/定位 payload（不 decode）。
+    let (metas, image_index) = attachment_upload_plan(entries, preview_image)?;
+    if metas.is_empty() {
         return Ok((Vec::new(), None));
     }
+    // 第二段前的全局闸（M5）：按 payload 上界在 decode **之前**
+    // 预留字节并占上行并发槽；超预算/槽位等待超时立即拒，
+    // 不先解一份大内存再发现超限。lease 在函数返回/上传
+    // 失败/超时取消时都随 Drop 释放。
+    let reserved_bytes: u64 = metas
+        .iter()
+        .map(|(_, meta)| meta.decoded_upper_bound())
+        .sum();
+    let _lease = gate.acquire(reserved_bytes).await?;
+    // 第三段：持租约 decode → 上传（字节预算与槽位覆盖
+    // 整段存活期）。
+    let mut parsed = metas
+        .into_iter()
+        .map(|(uri, meta)| decode_attachment(uri, &meta))
+        .collect::<Option<Vec<_>>>()
+        .ok_or(SendError::Internal)?;
     apply_outgoing_caption(&mut parsed, caption);
-    let mut outgoing_faces = Vec::with_capacity(parsed.len());
+    let mut outgoing_faces: Vec<OutgoingAttachmentFace> = Vec::with_capacity(parsed.len());
     let mut batch = Vec::with_capacity(parsed.len());
     for item in parsed {
         // 语音元数据生成（2026-10-14 批）：`;voice=true` 附件在解码面
@@ -12613,7 +15368,7 @@ async fn upload_attachments_for_send(
         } else {
             None
         };
-        outgoing_faces.push((item.is_gif, voice_metadata));
+        outgoing_faces.push((item.is_gif, voice_metadata, item.dimensions));
         batch.push((item.spec, item.bytes));
     }
     let uploads = manager
@@ -12627,14 +15382,7 @@ async fn upload_attachments_for_send(
     for result in uploads {
         pointers.push(result.map_err(|_| SendError::AttachmentUpload)?);
     }
-    for (pointer, (is_gif, voice_metadata)) in pointers.iter_mut().zip(outgoing_faces) {
-        if is_gif {
-            apply_outgoing_gif_flag(pointer);
-        }
-        if let Some(metadata) = voice_metadata {
-            apply_outgoing_voice_metadata(pointer, &metadata);
-        }
-    }
+    apply_outgoing_attachment_faces(&mut pointers, &outgoing_faces);
     let image = image_index.map(|index| pointers.remove(index));
     Ok((pointers, image))
 }
@@ -12879,13 +15627,17 @@ async fn assemble_quote(
 /// image 且禁 video/text，回退 image/webp 的语义由上游声明等价承担）；
 /// width/height 官方随 AttachmentPointer 出站，经 AttachmentSpec 透传。
 async fn upload_sticker_image(
+    gate: &Arc<attachment_gate::AttachmentGate>,
     manager: &Manager<SqliteStore, Registered>,
     sticker: &SendSticker,
 ) -> Result<presage::proto::AttachmentPointer, SendError> {
-    let parsed = parse_attachment_data_uri(&sticker.image).ok_or(SendError::Internal)?;
-    if !parsed.spec.content_type.starts_with("image/") {
+    // 同二段式：先形状/字节上界+全局闸，再 decode。
+    let meta = parse_attachment_meta(&sticker.image).ok_or(SendError::Internal)?;
+    if !meta.content_type.starts_with("image/") {
         return Err(SendError::Internal);
     }
+    let _lease = gate.acquire(meta.decoded_upper_bound()).await?;
+    let parsed = decode_attachment(&sticker.image, &meta).ok_or(SendError::Internal)?;
     let spec = presage::libsignal_service::sender::AttachmentSpec {
         width: sticker.width,
         height: sticker.height,
@@ -13071,18 +15823,244 @@ fn store_connect_options(path: &str) -> Result<SqliteConnectOptions, ()> {
         .pragma("cache_size", SQLITE_CACHE_SIZE_PRAGMA))
 }
 
-async fn open_store(dir: &Path) -> Result<SqliteStore, ()> {
-    std::fs::create_dir_all(dir).map_err(|_| ())?;
-    // SqliteStore 要的是数据库文件路径，不是目录；sqlx 的连接串解析只剥
-    // `sqlite://`/`sqlite:` 前缀，传 `file:///…` 会把整串当文件名。这里固定
-    // 在账号目录下落 store.db、直接传裸路径。路径来自受信启动器，可入日志。
+/// 打开（或建）账号目录下的 `store.db`。
+///
+/// 唯一入口：`open_store` = 「进程唯一能力门 + 进程 key 三态 + 真实打开」，
+/// 门与 key 都由 [`open_store_with`] 在**任何磁盘动作之前**判定；单测把
+/// 门/key 换成自建实例直打同一个函数，从而不必污染全局结论（见
+/// `src/store_cipher_tests.rs` 与 `src/store_encryption_tests.rs`）。
+pub(crate) async fn open_store(dir: &Path) -> Result<SqliteStore, StoreOpenError> {
+    // 先过能力门（`ensure_cipher_capable` 的同一份判定），再按进程 key 三态
+    // 打开：缺能力/形状非法时一个文件都不落（连账号目录都不建）。
+    open_store_gated(dir, store_cipher::gate()).await
+}
+
+/// 带 key 的连接选项（C 阶段矩阵 b/d）：基础选项 + SQLCipher raw key。
+///
+/// sqlx 把 `key` pragma 固定排在建连语句的第 0 位（`SqliteConnectOptions::new`
+/// 预置槽位 + IndexMap 保序，设计 §2.2），所以这里追加不会排到
+/// `journal_mode`/`cache_size` 之后——`PRAGMA key` 必须先于任何页读，
+/// 否则 SQLCipher 会拿默认 key 去解页、把正确 key 也判成错。
+fn store_connect_options_with_key(
+    path: &str,
+    key: &crate::store_key::StoreKey,
+) -> Result<SqliteConnectOptions, ()> {
+    Ok(store_connect_options(path)?.pragma("key", key.pragma_literal()))
+}
+
+/// 带能力门的打开实现（key 三态取进程环境：[StoreKeyState::process]）。
+///
+/// 门必须**前置**——`open_with_options` 会 `create_if_missing` 建
+/// `store.db`、起连接池（2 连接）并跑 `sqlx::migrate!()` 落 schema
+/// （vendor `presage-store-sqlite/src/lib.rs:67-92`），门后置就等于「先落
+/// 明文库/明文 schema 再报错」（P0 评审第 1 条）。
+pub(crate) async fn open_store_gated(
+    dir: &Path,
+    gate: &store_cipher::CipherGate,
+) -> Result<SqliteStore, StoreOpenError> {
+    open_store_with(dir, gate, StoreKeyState::process()).await
+}
+
+/// 打开实现：门与 key 三态都可注入（单测直打真实顺序）。
+///
+/// 顺序是契约：**能力门 → key 形状 → 文件分类 → （加密库先验真）→
+/// 建目录 → 打开并跑迁移**。前四步**不创建 `store.db` 主体**，任何一步失败
+/// 都不建目录、不建 `store.db`；只有第 5 步的密文验真是读写连接，SQLite 在
+/// WAL 模式下会临时建 `-wal`/`-shm`（连接收口即回收，不是「零落盘」——见
+/// docs/plan/engine-store-encryption.md §7 C.6 的口径纠正）。
+///
+/// 决策表（C 阶段矩阵；`(key, 磁盘状态) → 行为`）：
+///
+/// | key | store.db | 行为 |
+/// |---|---|---|
+/// | 无 | 无 | 明文创建（现状兼容，a）；**C-1 开关 on 时**改判 `StoreKeyRequired` 终态（没 key 建不出密文库，也就不许再造新的明文库） |
+/// | 无 | 明文 | 明文打开（现状兼容） |
+/// | 无 | 密文 | `StoreKeyRequired`（终态，绝不新建明文库） |
+/// | 有 | 无 | 加密创建（b） |
+/// | 有 | 明文 | 按 legacy 打开**不设 key** + warn 一次（c，迁移在 D 阶段） |
+/// | 任意 | 明文 + C-1 开关 on | `StorePlaintextRequiresMigration`（终态，与有没有 key 无关；不打开、不写盘、不删明文库） |
+/// | 有 | 密文 | 先验真再打开；错 key → `StoreKeyRejected`（d） |
+/// | 任意 | 损坏 | `StoreCorrupt`（e） |
+/// | 形状非法 | 任意 | `StoreKeyInvalid`（终态，不建库） |
+pub(crate) async fn open_store_with(
+    dir: &Path,
+    gate: &store_cipher::CipherGate,
+    key_state: &StoreKeyState,
+) -> Result<SqliteStore, StoreOpenError> {
+    open_store_with_requirement(dir, gate, key_state, store_open::require_encrypted()).await
+}
+
+/// 打开实现：门、key 三态与 C-1 终态开关都可注入（单测直打真实顺序；
+/// 生产入口 [`open_store_with`] 的开关取进程 env）。
+///
+/// 开关是**逐进程**的：`KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on` 时，明文库
+/// 一律终态；off（缺省）时下面每一行行为与 C 阶段逐字节相同。
+pub(crate) async fn open_store_with_requirement(
+    dir: &Path,
+    gate: &store_cipher::CipherGate,
+    key_state: &StoreKeyState,
+    require_encrypted: store_open::RequireEncrypted,
+) -> Result<SqliteStore, StoreOpenError> {
+    // 1) 能力门：缺能力时磁盘上零文件。固定 stderr 行由门在**首次判定**时
+    // 落下（`store_cipher::unavailable_stderr_line`，与
+    // `StoreOpenError::stderr_line()` 同形同值、每进程一次）；这里不再
+    // report_once，否则同一事实会出现两遍。
+    if gate.ensure().await.is_err() {
+        return Err(StoreOpenError::CipherUnavailable);
+    }
+    // 2) key 形状：非法形状在建目录/建库之前失败（fail-closed，矩阵 1）。
+    let key = match key_state {
+        StoreKeyState::Absent => None,
+        StoreKeyState::Present(key) => Some(key),
+        StoreKeyState::Invalid => return refuse(StoreOpenError::KeyInvalid),
+    };
+    // 3) 文件分类（只读元数据 + 16 字节头，不建目录）。
     let path = dir.join("store.db");
-    let path = path.to_str().ok_or(())?;
-    SqliteStore::open_with_options(store_connect_options(path)?, OnNewIdentity::Trust)
+    let state = store_open::classify(&path).inspect_err(|error| error.report_once())?;
+    // 3.5) C-1 终态闸（**默认 off**）：开关 on 且库是明文头 → 终态，无论有
+    // 没有 key。位置是契约——分类之后、验真/建目录/打开之前，所以这条路径
+    // 一个字节都不写，也不删明文库（迁移器要拿它当源）。无 key 也拦的理由：
+    // 放它过去等于「删掉 key 就能读明文」，开关形同虚设。
+    //
+    // off 时这段不成立，向下走的仍是 C 阶段那条 `match (key, state)`：行为
+    // 与加开关前逐字节相同（既有矩阵 a–e 断言原样全绿）。
+    if require_encrypted.is_on() && state == StoreFileState::Plaintext {
+        return refuse(StoreOpenError::PlaintextRequiresMigration);
+    }
+    // 3.6) C-1 的新建闸（**补漏**：开关 on + 无 key + 库不存在）：终态
+    // `StoreKeyRequired`，位置与 3.5 同为「分类之后、一切写动作之前」。
+    //
+    // 这一格原来的落点是矩阵 a 的 `(None, _) => false`：开关 on 时它会走到
+    // 第 6 步的 `create_if_missing`，现造一个**新的明文库**——正是开关要拦的
+    // 事，而且比「存量明文库」更糟：存量至少是迁移源，这一格是开关打开之后
+    // 才开始的明文生产。语义选 `StoreKeyRequired` 而不是
+    // `PlaintextRequiresMigration`：盘上没有任何东西要迁移（连目录都没有），
+    // 缺的是 key——没有 key 建不出密文库，而开关不许降级建明文库。与
+    // `(None, Opaque)` 那一格同码同理由（同一个一次性闸，不新开码面）。
+    if require_encrypted.is_on() && key.is_none() && state == StoreFileState::Absent {
+        return refuse(StoreOpenError::KeyRequired);
+    }
+    // 4) 决策：这次是否带 key 打开（矩阵 a–d）。
+    let keyed = match (key, state) {
+        (None, StoreFileState::Opaque) => return refuse(StoreOpenError::KeyRequired),
+        (None, _) => false,
+        (Some(_), StoreFileState::Absent | StoreFileState::Opaque) => true,
+        (Some(_), StoreFileState::Plaintext) => {
+            // c：存量明文库 + 有 key。不设 key（存量照常可读、绝不重写），
+            // 迁移在 D 阶段；证据行每进程一次。
+            store_open::warn_plaintext_legacy_once();
+            false
+        }
+    };
+    // SqliteStore 要的是数据库文件路径，不是目录；sqlx 的连接串解析只剥
+    // `sqlite://`/`sqlite:` 前缀，传 `file:///…` 会把整串当文件名。路径来自
+    // 受信启动器，可入日志。
+    let Some(path_str) = path.to_str() else {
+        // 路径非 UTF-8：可重试类也要留一条固定行（以前裸返回，stderr 零行）。
+        return Err(StoreOpenError::Failed.reported());
+    };
+    // 5) 加密库先验真：错 key 在跑迁移之前就归一成 StoreKeyRejected（d）。
+    if keyed && state == StoreFileState::Opaque {
+        let Some(key) = key else {
+            // 决策表上不可达（keyed 且 Opaque 必有 key），仍按可重试类留痕：
+            // 真被走到时也要在 stderr 里看得见，而不是静默返回。
+            return Err(StoreOpenError::Failed.reported());
+        };
+        store_open::probe_keyed_store(&path, key)
+            .await
+            .inspect_err(|error| error.report_once())?;
+    }
+    // 6) 建目录 → 打开并跑迁移（既有动作，矩阵里唯一会落盘的一段）。
+    //
+    // 建目录失败（EACCES/EROFS/ENOSPC/ENOTDIR）以前是裸 `?`：stderr 零行，
+    // connector watchdog 看不到「盘写不了」。errno 只进滚动日志的 kind 字段
+    // （原始错误文本可能带路径，不进 stderr 固定行）。
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        tracing::warn!(
+            target: "engine.store",
+            stage = "create_store_dir",
+            kind = ?error.kind(),
+            "could not create store dir"
+        );
+        return Err(StoreOpenError::Failed.reported());
+    }
+    let options = match key {
+        Some(key) if keyed => store_connect_options_with_key(path_str, key),
+        _ => store_connect_options(path_str),
+    }
+    .map_err(|()| StoreOpenError::Failed.reported())?;
+    SqliteStore::open_with_options(options, OnNewIdentity::Trust)
         .await
         .map_err(|error| {
-            eprintln!("kt-signal-engine: sqlite store open failed: {error}");
+            // 终态与可重试**都**走同一条固定 stderr 行（每进程每码一条）：
+            // 可重试类以前只打一行自由文本（`sqlite store open failed: …`），
+            // connector watchdog 的分类器看不见，而且把原始错误文本（可能带
+            // 路径）写进了 stderr。两者现在都归一到
+            // `event=store_open_failed code=… retryable=…`。
+            let classified = store_open::classify_failure_message(&error.to_string(), keyed);
+            classified.report_once();
+            classified
         })
+}
+
+/// 终态拒绝的唯一出口：落一次固定证据行 + 回错误。
+///
+/// 早退点用这个；`?` 链上看 [`StoreOpenError::reported`]。两者同一道闸，
+/// 所以同一条失败路径不会落两行。
+fn refuse<T>(error: StoreOpenError) -> Result<T, StoreOpenError> {
+    Err(error.reported())
+}
+
+/// 回收本次已死链接的未注册 store（B1，issue #951）。
+///
+/// 只删能证明未注册的 lk-* 目录（store 可打开且 load_registration_data
+/// 为 None）：有注册数据、打不开或非 lk-* 一律保留——宁留孤儿，不删凭证。
+#[cfg_attr(not(test), allow(dead_code))]
+async fn remove_unregistered_link_store(store_dir: &Path) -> bool {
+    let Some(name) = store_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !name.starts_with("lk-") || !store_dir.try_exists().unwrap_or(false) {
+        return false;
+    }
+    let registration = match open_store(store_dir).await {
+        Ok(store) => store.load_registration_data().await,
+        Err(_) => return false,
+    };
+    if !matches!(registration, Ok(None)) {
+        return false;
+    }
+    tokio::fs::remove_dir_all(store_dir).await.is_ok()
+}
+
+/// 回收一个被新 startLink 顶掉、且从未提交为账号的 link store。
+///
+/// 与 [`remove_unregistered_link_store`] 不同：这里的记录已被 supersede
+/// 且 finish 未执行 `state.add_account`，store 里的注册数据属于引擎永远
+/// 不会承认的孤儿账号，必须连同目录一起清掉（用户重扫即可）。仍然只动
+/// `lk-*` 目录，绝不碰其他账号目录。
+async fn remove_link_store(store_dir: &Path) -> bool {
+    let Some(name) = store_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !name.starts_with("lk-") {
+        return false;
+    }
+    match tokio::fs::remove_dir_all(store_dir).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            // 删不掉要留痕：Windows 上池句柄未释放会 sharing violation，
+            // 静默吞掉会让未注册目录长期占盘且无人知晓。
+            tracing::warn!(
+                target: "engine.link",
+                stage = "remove_link_store",
+                error = %error,
+                "could not remove link store dir"
+            );
+            false
+        }
+    }
 }
 
 /// 回收「注册表缺失」时遗留的失败链接 store。
@@ -13293,6 +16271,176 @@ pub(crate) async fn open_registered_with_dir(
 /// 号码，self 不在手机 contacts 表是常态，compat §5）；其余号码走 contacts
 /// 数字位匹配（链接后手机端立即推送同步）。冷启动窗口内未命中返回 None
 /// （发送按内部失败处理，compat §5）。
+/// BUG-16 CDS 三级梯（2a 终极批，2026-11-13）：本地解析 miss 后的
+/// 号码→身份线上发现门。七条工程约束（dsh 04:57/04:59 定案）落点：
+/// ①灰度默认关（`KT_ENGINE_CDS_ENABLED` 非 0 才开）②CDS 自身失败
+/// （传输/认证/超时）→ `CdsUnavailable`(-32011 可重试)，**服务端答
+/// None 才是 UnregisteredRecipient**——绝不把网络问题说成未注册
+/// ③负缓存 TTL（服务端确证的 miss 5 分钟内不再打，CDS 上游限流）
+/// ④连续 3 次失败熔断 5 分钟（CDS 是网络+SGX 路径）⑤单次查询 10s
+/// 上限（对齐 libsignal 控制面 connect 预算，慢网不卡死正常发送）
+/// ⑥出口：vendor CDSI 批已让 discover_contacts 走 `ALL_PROXY`
+/// （socks5/http），引擎 `setup_proxy_env` 按账号落位——无需新改造
+/// ⑦探针 `engine.cds`（warn 级，engine 日志面只出 warn 的教训）。
+struct CdsGate {
+    enabled: bool,
+    negative: StdMutex<HashMap<String, std::time::Instant>>,
+    consecutive_failures: StdMutex<u32>,
+    open_until: StdMutex<Option<std::time::Instant>>,
+}
+
+/// 熔断阈值：连续失败 3 次开闸。
+const CDS_BREAKER_FAILURES: u32 = 3;
+/// 熔断 + 负缓存共用窗（秒）。
+const CDS_TTL_SECS: u64 = 300;
+/// 单次 CDS 查询上限（对齐 libsignal 控制面 connect 预算 10s）。
+const CDS_QUERY_TIMEOUT_SECS: u64 = 10;
+
+impl CdsGate {
+    fn from_env() -> Self {
+        Self {
+            enabled: std::env::var("KT_ENGINE_CDS_ENABLED")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
+            negative: StdMutex::new(HashMap::new()),
+            consecutive_failures: StdMutex::new(0),
+            open_until: StdMutex::new(None),
+        }
+    }
+
+    /// 纯决策（单测面）：本次 miss 后要不要发起 CDS。
+    fn should_query(&self, number: &str, now: std::time::Instant) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if let Some(open) = *self.open_until.lock().expect("cds breaker") {
+            if now < open {
+                return false;
+            }
+        }
+        match self.negative.lock().expect("cds negative").get(number) {
+            Some(until) => now >= *until,
+            None => true,
+        }
+    }
+
+    fn record_cds_miss(&self, number: &str, now: std::time::Instant) {
+        let until = now + std::time::Duration::from_secs(CDS_TTL_SECS);
+        self.negative
+            .lock()
+            .expect("cds negative")
+            .insert(number.to_string(), until);
+        *self.consecutive_failures.lock().expect("cds failures") = 0;
+    }
+
+    fn record_cds_failure(&self, now: std::time::Instant) {
+        let mut failures = self.consecutive_failures.lock().expect("cds failures");
+        *failures += 1;
+        if *failures >= CDS_BREAKER_FAILURES {
+            *self.open_until.lock().expect("cds breaker") =
+                Some(now + std::time::Duration::from_secs(CDS_TTL_SECS));
+            *failures = 0;
+        }
+    }
+
+    fn record_cds_success(&self, number: &str) {
+        self.negative.lock().expect("cds negative").remove(number);
+        *self.consecutive_failures.lock().expect("cds failures") = 0;
+    }
+}
+
+impl Service {
+    /// BUG-16 三级梯的发送侧入口：本地（UUID/本机号/contacts 数字位）
+    /// → CDS 线上发现（灰度/熔断/负缓存门后，单次 10s）→ 诚实失败。
+    /// UUID 形态与本机号首两臂永不进 CDS；本地命中也永不进 CDS——
+    /// 「只在本地解析 miss 后调一次」。
+    async fn resolve_recipient_for_send(
+        self: &Arc<Self>,
+        manager: &mut Manager<SqliteStore, Registered>,
+        recipient: &str,
+    ) -> Result<presage::libsignal_service::protocol::ServiceId, SendError> {
+        // 首臂：UUID 直解（与 resolve_recipient 同判据）。
+        if let Some(service_id) =
+            presage::libsignal_service::protocol::ServiceId::parse_from_service_id_string(
+                recipient.trim(),
+            )
+        {
+            return Ok(service_id);
+        }
+        // 本地梯（本机号 + contacts 数字位）。
+        if let Some(service_id) = resolve_recipient(manager, recipient).await {
+            return Ok(service_id);
+        }
+        // 裸号码 miss：CDS 门判（灰度关/熔断开/负缓存新鲜 → 本地语义
+        // 等价答 UnregisteredRecipient——灰度默认关时全程零行为变化）。
+        let now = std::time::Instant::now();
+        if !self.cds_gate.should_query(recipient, now) {
+            return Err(SendError::UnregisteredRecipient);
+        }
+        let started = std::time::Instant::now();
+        let lookup = tokio::time::timeout(
+            std::time::Duration::from_secs(CDS_QUERY_TIMEOUT_SECS),
+            manager.discover_contacts_by_phone_number([recipient]),
+        )
+        .await;
+        let outcome = match lookup {
+            // 查询自身超时：可重试面，不判未注册。
+            Err(_elapsed) => {
+                self.cds_gate.record_cds_failure(now);
+                tracing::warn!(
+                    target: "engine.cds",
+                    stage = "query",
+                    outcome = "timeout",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "CDS discovery timed out (retryable, never unregistered)"
+                );
+                return Err(SendError::CdsUnavailable);
+            }
+            Ok(Err(error)) => {
+                self.cds_gate.record_cds_failure(now);
+                tracing::warn!(
+                    target: "engine.cds",
+                    stage = "query",
+                    outcome = "error",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "CDS discovery failed (retryable, never unregistered)"
+                );
+                let _ = error;
+                return Err(SendError::CdsUnavailable);
+            }
+            Ok(Ok(rows)) => rows,
+        };
+        let service_id = outcome
+            .into_iter()
+            .find_map(|(_phone, service_id)| service_id);
+        match service_id {
+            Some(service_id) => {
+                self.cds_gate.record_cds_success(recipient);
+                tracing::warn!(
+                    target: "engine.cds",
+                    stage = "query",
+                    outcome = "hit",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "CDS discovery resolved the number to a Signal identity"
+                );
+                Ok(service_id)
+            }
+            None => {
+                // 服务端确证未注册：这才是 -32010 的名实相符面。
+                self.cds_gate.record_cds_miss(recipient, now);
+                tracing::warn!(
+                    target: "engine.cds",
+                    stage = "query",
+                    outcome = "cds_miss",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "CDS discovery confirms no Signal identity for this number"
+                );
+                Err(SendError::UnregisteredRecipient)
+            }
+        }
+    }
+}
+
 async fn resolve_recipient(
     manager: &Manager<SqliteStore, Registered>,
     recipient: &str,
@@ -13399,6 +16547,17 @@ fn mix_seed_step(seed: u64) -> u64 {
 /// 账号 store 目录名：`lk-<hex16>`（ADR 0004：链接开始即定名，免重命名竞态）。
 fn random_dir_name() -> String {
     format!("lk-{:016x}", mix_seed_step(mix_seed()))
+}
+
+/// 链接 attempt id（rotateLink 的入参键）：`la-<hex16><hex16>`。时间 + pid
+/// 熵的 splitmix64（无 rand 依赖，同 lk-* 目录命名纪律）。
+fn random_attempt_id() -> String {
+    let seed = mix_seed();
+    format!(
+        "la-{:016x}{:016x}",
+        mix_seed_step(seed),
+        mix_seed_step(mix_seed_step(seed))
+    )
 }
 
 /// 启动清扫：未登记 `accounts/lk-*` 目录的处置（P0-B，2026-10-21）。
@@ -14026,6 +17185,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use base64::Engine as _;
+    use presage::libsignal_service::content::Metadata;
     use presage::proto::attachment_pointer::Flags;
     use presage::proto::body_range::AssociatedValue;
     use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage, Preview};
@@ -14180,6 +17340,44 @@ mod tests {
     /// ACI）在首臂 parse 直解、不经号码臂（互斥由调用序保证，此处钉定
     /// parse 直解语义与本机 ACI 形态确实覆盖）。Manager 不可单测构造
     /// （RegistrationData 构造受限），判定逻辑以纯函数层验证。
+    /// BUG-16 CDS 门纯逻辑：灰度关全程不查；负缓存窗内不查；熔断开不查；
+    /// 窗过期/无记录才查。命中清负缓存与连败；miss 记负缓存；失败连败
+    /// 3 次开熔断 5 分钟。
+    #[test]
+    fn cds_gate_gating_and_bookkeeping() {
+        use std::time::{Duration, Instant};
+        let mut gate = CdsGate::from_env();
+        gate.enabled = true;
+        let t0 = Instant::now();
+
+        // 无记录 → 查。
+        assert!(gate.should_query("+15550000001", t0));
+        // miss → 负缓存 5 分钟内不再查。
+        gate.record_cds_miss("+15550000001", t0);
+        assert!(!gate.should_query("+15550000001", t0 + Duration::from_secs(60)));
+        assert!(gate.should_query("+15550000001", t0 + Duration::from_secs(301)));
+        // 命中 → 清负缓存,恢复可查。
+        gate.record_cds_success("+15550000001");
+        assert!(gate.should_query("+15550000001", t0));
+        // 连败 3 次 → 熔断开(任意号都不查),窗口过后恢复。
+        gate.record_cds_failure(t0);
+        gate.record_cds_failure(t0);
+        assert!(gate.should_query("+15550000002", t0));
+        gate.record_cds_failure(t0);
+        assert!(
+            !gate.should_query("+15550000002", t0),
+            "breaker open blocks"
+        );
+        assert!(
+            gate.should_query("+15550000002", t0 + Duration::from_secs(301)),
+            "breaker window expires"
+        );
+        // 灰度关(默认)→ 永不查(本地语义零变化)。
+        let mut off = CdsGate::from_env();
+        off.enabled = false;
+        assert!(!off.should_query("+15550000003", t0));
+    }
+
     #[test]
     fn self_recipient_resolution_arms() {
         // —— self-by-e164 臂 ——
@@ -14288,17 +17486,21 @@ mod tests {
             }
         ));
 
-        // 人机验证 428：直接臂 + sender 再包层臂（token/options 不出归型面）。
+        // 人机验证 428：直接臂 + sender 再包层臂。BUG-16 proof 批起
+        // token/options **透传**出归型面（push 自动求解/UX 弹码的寻址键）。
         assert!(matches!(
             send_error_of(presage::Error::ServiceError(
                 ServiceError::ProofRequiredError(
                     presage::libsignal_service::push_service::ProofRequired {
-                        token: String::new(),
-                        options: Vec::new(),
+                        token: "direct-token".to_owned(),
+                        options: vec!["pushChallenge".to_owned()],
                     }
                 )
             )),
-            SendError::ProofRequired
+            SendError::ProofRequired {
+                token: Some(ref token),
+                ref options,
+            } if token == "direct-token" && options.as_slice() == ["pushChallenge"],
         ));
         assert!(matches!(
             send_error_of(presage::Error::MessageSenderError(Box::new(
@@ -14307,7 +17509,10 @@ mod tests {
                     options: vec!["captcha".to_owned()],
                 }
             ))),
-            SendError::ProofRequired
+            SendError::ProofRequired {
+                token: Some(ref token),
+                ref options,
+            } if token == "proof-token" && options.as_slice() == ["captcha"],
         ));
 
         // 服务端 5xx → ServerUnavailable；<500（如 400）不算不可用。
@@ -14323,6 +17528,8 @@ mod tests {
         assert!(matches!(unhandled(503), SendError::ServerUnavailable));
         // <500（如 400）= 服务器明确拒绝（cause 全覆盖批 §5），非不可用。
         assert!(matches!(unhandled(400), SendError::WsRejected));
+        assert!(matches!(unhandled(499), SendError::AppExpired));
+        assert!(!unhandled(499).is_definite_failure());
     }
 
     /// send 链 cause 类全覆盖归型（2026-10-16 批，§5）：六族新变体的
@@ -14441,7 +17648,10 @@ mod tests {
             SendError::RateLimited {
                 retry_after_secs: None,
             },
-            SendError::ProofRequired,
+            SendError::ProofRequired {
+                token: None,
+                options: Vec::new(),
+            },
             SendError::ServerUnavailable,
             SendError::IdentityUnverified,
             SendError::WsTimeout,
@@ -15171,6 +18381,153 @@ mod tests {
         // 已置 GIF 再置：幂等（不翻倍不变形）。
         apply_outgoing_gif_flag(&mut plain);
         assert_eq!(plain.flags, Some(Flags::Gif as u32));
+    }
+
+    /// 出向声明尺寸（BUG-11 wire 批）：data URI 上 width=/height= 双参
+    /// 解析 + 上传后指针置位单点 + 收投影读回——三段闭合。
+    #[test]
+    fn outgoing_dimensions_parse_pair_and_boundaries() {
+        // 双参俱在：解析进 meta/ParsedAttachment（上传腿消费位）。
+        let parsed =
+            parse_attachment_data_uri("data:image/jpeg;width=1920;height=1080;base64,aGVsbG8=")
+                .expect("declared pair parses");
+        assert_eq!(parsed.dimensions, Some((1920, 1080)));
+        // 全缺 = 旧形状零变化。
+        let plain = parse_attachment_data_uri("data:image/jpeg;base64,aGVsbG8=").expect("parses");
+        assert_eq!(plain.dimensions, None);
+        // 双参同进退：半边在场 = 整条形状坏。
+        assert!(
+            parse_attachment_data_uri("data:image/jpeg;width=1920;base64,aGVsbG8=").is_none(),
+            "lone width must fail closed",
+        );
+        assert!(
+            parse_attachment_data_uri("data:image/jpeg;height=1080;base64,aGVsbG8=").is_none(),
+            "lone height must fail closed",
+        );
+        // 值域：1..=16384 正整数；0/超界/符号/非十进制/空串/小数一律整条拒。
+        for bad in ["0", "16385", "+12", "-12", "12.5", "abc", ""] {
+            let uri = format!("data:image/jpeg;width={bad};height=1080;base64,aGVsbG8=");
+            assert!(
+                parse_attachment_data_uri(&uri).is_none(),
+                "bad width {bad:?} must fail closed",
+            );
+            let uri = format!("data:image/jpeg;width=1920;height={bad};base64,aGVsbG8=");
+            assert!(
+                parse_attachment_data_uri(&uri).is_none(),
+                "bad height {bad:?} must fail closed",
+            );
+        }
+        // 边界两位可收（下界 1、上界常量）。
+        for (width, height) in [
+            (1_u32, 1_u32),
+            (MAX_ATTACHMENT_DIMENSION_PX, MAX_ATTACHMENT_DIMENSION_PX),
+        ] {
+            let uri = format!("data:video/mp4;width={width};height={height};base64,aGVsbG8=");
+            assert_eq!(
+                parse_attachment_data_uri(&uri)
+                    .expect("boundary parses")
+                    .dimensions,
+                Some((width, height)),
+            );
+        }
+    }
+
+    /// 上传返回后的指针置位与收投影读回（BUG-11 不变式：声明尺寸随指针
+    /// 出站，接收侧首帧即终态盒）。置位幂等，与 GIF/语音面共存不挤占。
+    #[test]
+    fn outgoing_dimensions_post_set_pointer_and_project_back() {
+        use presage::proto::AttachmentPointer;
+
+        let dims = (1280_u32, 720_u32);
+        let mut pointer = AttachmentPointer::default();
+        apply_outgoing_dimensions(&mut pointer, dims);
+        assert_eq!(pointer.width, Some(1280));
+        assert_eq!(pointer.height, Some(720));
+        // 幂等：重复置位不翻倍不变形。
+        apply_outgoing_dimensions(&mut pointer, dims);
+        assert_eq!((pointer.width, pointer.height), (Some(1280), Some(720)));
+
+        // 收投影面：同一对字段（P14 起已在投影里）如实读回——发送腿置位
+        // 即接收腿可消费（连接器/桌面零翻译）。
+        let projected = project_attachment_pointer(&pointer);
+        assert_eq!(projected["width"], json!(1280));
+        assert_eq!(projected["height"], json!(720));
+
+        // 未声明 = 两键不在（no-null 纪律，旧形状零变化）。
+        let projected = project_attachment_pointer(&AttachmentPointer::default());
+        assert!(projected.get("width").is_none());
+        assert!(projected.get("height").is_none());
+
+        // 与 GIF/语音面共存：三通道各自独立字段，互不挤占。
+        apply_outgoing_gif_flag(&mut pointer);
+        let metadata = voice_note::VoiceAudioMetadata {
+            waveform: vec![1_u8; 100],
+            duration_seconds: 2.0,
+        };
+        apply_outgoing_voice_metadata(&mut pointer, &metadata);
+        assert_eq!(
+            pointer.flags,
+            Some(presage::proto::attachment_pointer::Flags::Gif as u32)
+        );
+        assert_eq!(pointer.width, Some(1280));
+        assert_eq!(pointer.height, Some(720));
+        assert_eq!(pointer.audio_duration_seconds, Some(2.0));
+    }
+
+    /// URI -> 解析 -> 指针置位 -> 收投影：声明尺寸链路严格往返（发送腿与
+    /// 接收腿同一对 proto 字段，数据面零翻译）。
+    #[test]
+    fn outgoing_dimensions_round_trip_through_projection() {
+        let parsed =
+            parse_attachment_data_uri("data:image/png;width=640;height=480;base64,aGVsbG8=")
+                .expect("parses");
+        let mut pointer = presage::proto::AttachmentPointer::default();
+        apply_outgoing_dimensions(&mut pointer, parsed.dimensions.expect("declared"));
+        let projected = project_attachment_pointer(&pointer);
+        assert_eq!(projected["width"], json!(640));
+        assert_eq!(projected["height"], json!(480));
+    }
+
+    /// 上行走廊三通道置位面（GIF / 语音 / 声明尺寸）：faces 与 pointers
+    /// 按序对齐，各通道独立生效、缺省不置位——这是 upload_attachments_for_send
+    /// 的唯一后置位入口（去掉尺寸通道时本用例必红）。
+    #[test]
+    fn outgoing_attachment_faces_apply_gif_voice_and_dimensions() {
+        use presage::proto::AttachmentPointer;
+
+        let metadata = voice_note::VoiceAudioMetadata {
+            waveform: vec![3_u8; 100],
+            duration_seconds: 1.25,
+        };
+        let faces: Vec<OutgoingAttachmentFace> = vec![
+            (false, None, Some((800, 600))),
+            (true, Some(metadata), None),
+            (false, None, None),
+        ];
+        let mut pointers = vec![
+            AttachmentPointer::default(),
+            AttachmentPointer::default(),
+            AttachmentPointer::default(),
+        ];
+        apply_outgoing_attachment_faces(&mut pointers, &faces);
+        // 0：仅尺寸（普通图片附件形态）。
+        assert_eq!(
+            (pointers[0].width, pointers[0].height),
+            (Some(800), Some(600))
+        );
+        assert_eq!(pointers[0].flags, None);
+        assert!(pointers[0].audio_waveform.is_none());
+        // 1：GIF 旗标 + 语音元数据（无尺寸声明）。
+        assert_eq!(
+            pointers[1].flags,
+            Some(presage::proto::attachment_pointer::Flags::Gif as u32)
+        );
+        assert_eq!(pointers[1].audio_duration_seconds, Some(1.25));
+        assert_eq!((pointers[1].width, pointers[1].height), (None, None));
+        // 2：三通道全缺 = 旧形状零变化。
+        assert_eq!((pointers[2].width, pointers[2].height), (None, None));
+        assert_eq!(pointers[2].flags, None);
+        assert!(pointers[2].audio_duration_seconds.is_none());
     }
 
     #[test]
@@ -17755,6 +21112,116 @@ mod tests {
         assert_eq!(body.timestamp, Some(7_777));
     }
 
+    /// 诊断面：非法行必须报出具体判据名（顺序即官方短路顺序）。
+    #[test]
+    fn view_once_invalid_reason_names_the_failed_predicate() {
+        let image = presage::proto::AttachmentPointer {
+            content_type: Some("image/jpeg".to_owned()),
+            ..Default::default()
+        };
+        let audio = presage::proto::AttachmentPointer {
+            content_type: Some("audio/mp4".to_owned()),
+            ..Default::default()
+        };
+        let no_ct = presage::proto::AttachmentPointer::default();
+
+        let cases: Vec<(DataMessage, Option<&'static str>)> = vec![
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image.clone()],
+                    ..Default::default()
+                },
+                None,
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    body: Some("hi".to_owned()),
+                    attachments: vec![image.clone()],
+                    ..Default::default()
+                },
+                Some("body_non_empty"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![],
+                    ..Default::default()
+                },
+                Some("attachment_count"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image.clone(), audio.clone()],
+                    ..Default::default()
+                },
+                Some("attachment_count"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![no_ct],
+                    ..Default::default()
+                },
+                Some("content_type_missing"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![audio],
+                    ..Default::default()
+                },
+                Some("content_type_not_view_once"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image.clone()],
+                    quote: Some(Default::default()),
+                    ..Default::default()
+                },
+                Some("has_quote"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image.clone()],
+                    sticker: Some(Default::default()),
+                    ..Default::default()
+                },
+                Some("has_sticker"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image.clone()],
+                    contact: vec![Default::default()],
+                    ..Default::default()
+                },
+                Some("has_contact"),
+            ),
+            (
+                DataMessage {
+                    is_view_once: Some(true),
+                    attachments: vec![image],
+                    preview: vec![Default::default()],
+                    ..Default::default()
+                },
+                Some("has_preview"),
+            ),
+        ];
+
+        for (message, expected) in cases {
+            assert_eq!(
+                view_once_invalid_reason(&message),
+                expected,
+                "reason mismatch for {expected:?}"
+            );
+        }
+    }
+
     /// 阅后即焚 E2：收投影对 viewOnce:true 行跑官方 isValidTapToView 同构
     /// 校验，非法行补 viewOnceInvalid（metadata-only 只标记不擦除）；合法行
     /// 不带该键；非 view-once 行完全不受影响。
@@ -18048,17 +21515,14 @@ mod tests {
         assert_eq!(round2, value);
     }
 
-    /// 测试夹具：向 store 写一份合法注册数据（官方落库 JSON 形，ACI 直给；
-    /// 其余键值与往返测试同款合法值），返回 store 目录。store 连接随返回
-    /// drop（sqlx WAL 多连接安全，被测面 account_aci/list_accounts 自行
-    /// 重开，生产路径 open_registered 同模式）。
-    async fn seed_store_with_aci(data_dir: &Path, rel: &str, aci: &str) -> PathBuf {
+    /// 合法注册数据夹具（官方落库 JSON 形，ACI 直给；其余键值与往返测试
+    /// 同款合法值）。
+    fn link_test_registration_data(aci: &str) -> RegistrationData {
         use presage::libsignal_service::utils::TryIntoE164;
 
-        let store_dir = data_dir.join(rel);
         let e164 = "+15551234567".try_into_e164().expect("e164");
         let phone_number = presage::libsignal_service::utils::phonenumber_from_signal(&e164);
-        let data: RegistrationData = serde_json::from_str(
+        serde_json::from_str(
             &json!({
                 "signal_servers": "Production",
                 "device_name": "KT Signal Engine",
@@ -18073,7 +21537,16 @@ mod tests {
             })
             .to_string(),
         )
-        .expect("registration data deserializes");
+        .expect("registration data deserializes")
+    }
+
+    /// 测试夹具：向 store 写一份合法注册数据（官方落库 JSON 形，ACI 直给；
+    /// 其余键值与往返测试同款合法值），返回 store 目录。store 连接随返回
+    /// drop（sqlx WAL 多连接安全，被测面 account_aci/list_accounts 自行
+    /// 重开，生产路径 open_registered 同模式）。
+    async fn seed_store_with_aci(data_dir: &Path, rel: &str, aci: &str) -> PathBuf {
+        let store_dir = data_dir.join(rel);
+        let data = link_test_registration_data(aci);
         let mut store = open_store(&store_dir).await.expect("store opens");
         store
             .save_registration_data(&data)
@@ -18103,6 +21576,1374 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!empty.exists(), "未注册空 store 可以安全回收");
         assert!(registered.exists(), "含注册数据的 store 必须保留");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 把测试服务里所有 link 记录取走并收口（测试收尾；不等 30s URL 超时）。
+    async fn retire_all_links(service: &Arc<Service>) {
+        let records: Vec<Arc<PendingRecord>> = {
+            let mut inner = service.inner.lock().await;
+            inner.attempts.clear();
+            inner.links.drain().map(|(_, record)| record).collect()
+        };
+        for record in records {
+            let _ = retire_pending_record(record).await;
+        }
+    }
+
+    /// 等到某个 link 的结果槽落定（Ok/Err），避免测试与 spawn_local 抢时序。
+    async fn wait_link_result_resolved(service: &Arc<Service>, uri: &str) {
+        for _ in 0..400 {
+            let resolved = {
+                let inner = service.inner.lock().await;
+                inner
+                    .links
+                    .get(uri)
+                    .is_some_and(|record| !record.result.is_unresolved())
+            };
+            if resolved {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("link result did not resolve");
+    }
+
+    /// 停掉接收管线（防止测试收尾留下在途网络任务）。
+    async fn abort_pipelines(service: &Arc<Service>) {
+        let handles: Vec<_> = {
+            let mut pipelines = service.pipelines.lock().await;
+            pipelines.drain().map(|(_, handle)| handle).collect()
+        };
+        for handle in handles {
+            let _ = handle.shutdown.send(true);
+            handle.done.abort();
+        }
+    }
+
+    /// B1（issue #951）：URL 交付后 link_flow 终局失败 → 记录 state=lost
+    /// （带 lostAt），finishLink 确定性回 LinkError::Lost（wire -1 LINK_LOST），
+    /// 且该 lk-* 目录被删除；重复 finishLink 保持同一 lost 结论。
+    #[tokio::test]
+    async fn lost_link_flow_answers_link_lost_and_removes_store() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-lost-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=aaaaaaaa-2222-4333-8444-555555555555&pub_key=AAAA",
+                            )
+                            .expect("url"),
+                        );
+                        Err(LinkError::Lost)
+                    })
+                    .await
+                    .expect("start link").device_link_uri().to_owned();
+
+                let store_dir = {
+                    let inner = service.inner.lock().await;
+                    let record = inner.links.get(&uri).expect("link record");
+                    // 真实判别（不是 Pending|Lost 的恒真断言）：lost flow 从未
+                    // 执行 add_account，提交位必须仍是 None。
+                    assert!(
+                        record.committed.try_lock().expect("commit lock").is_none(),
+                        "lost flow must not be marked committed"
+                    );
+                    record.store_dir.clone()
+                };
+
+                let mut lost_at = None;
+                for _ in 0..200 {
+                    let seen = {
+                        let inner = service.inner.lock().await;
+                        inner
+                            .links
+                            .get(&uri)
+                            .map(|record| *record.state.lock().expect("state lock"))
+                    };
+                    if let Some(LinkSessionState::Lost { lost_at: at }) = seen {
+                        lost_at = Some(at);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let lost_at = lost_at.expect("lost state recorded");
+                assert!(lost_at > 0, "lostAt must be a real timestamp");
+
+                let err = match service.finish_link(&uri, "KT").await {
+                    Err(error) => error,
+                    Ok(_) => panic!("lost session must fail"),
+                };
+                assert!(matches!(err, LinkError::Lost), "first finish: {err:?}");
+
+                for _ in 0..200 {
+                    if !store_dir.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(!store_dir.exists(), "lost link store must be removed");
+
+                // 重复 finishLink（connector 超时重试）仍回同一确定错误。
+                let err = match service.finish_link(&uri, "KT").await {
+                    Err(error) => error,
+                    Ok(_) => panic!("repeat finish must fail"),
+                };
+                assert!(matches!(err, LinkError::Lost), "repeat finish: {err:?}");
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// B1：新 startLink 必须 abort 旧 link_flow——旧任务被取消后不得再写
+    /// 注册数据；旧未注册目录被回收，accounts/ 只留当前会话的一个 lk-*。
+    #[tokio::test]
+    async fn new_start_link_aborts_old_flow_without_registration_write() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-abort-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let wrote_registration = Arc::new(AtomicBool::new(false));
+                let wrote = Arc::clone(&wrote_registration);
+                let first_uri = service
+                    .start_link_with_flow(move |mut store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=aaaaaaaa-2222-4333-8444-555555555555&pub_key=AAAA",
+                            )
+                            .expect("url"),
+                        );
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        let data = link_test_registration_data(
+                            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                        );
+                        store
+                            .save_registration_data(&data)
+                            .await
+                            .map_err(|_| LinkError::Internal)?;
+                        wrote.store(true, Ordering::SeqCst);
+                        Ok(("+15550000001".to_owned(), None))
+                    })
+                    .await
+                    .expect("first start").device_link_uri().to_owned();
+                let first_dir = {
+                    let inner = service.inner.lock().await;
+                    inner
+                        .links
+                        .get(&first_uri)
+                        .expect("first record")
+                        .store_dir
+                        .clone()
+                };
+
+                let second_uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=bbbbbbbb-2222-4333-8444-555555555555&pub_key=BBBB",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("second start").device_link_uri().to_owned();
+                assert_ne!(first_uri, second_uri);
+
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    !wrote_registration.load(Ordering::SeqCst),
+                    "aborted old flow must not write registration data"
+                );
+                assert!(!first_dir.exists(), "superseded unregistered store removed");
+
+                let mut stores = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(data_dir.join("accounts")) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                            && name.starts_with("lk-")
+                        {
+                            stores.push(name);
+                        }
+                    }
+                }
+                assert_eq!(stores.len(), 1, "only the current link store remains: {stores:?}");
+
+                // 清掉第二个在途会话（测试收尾，不影响断言）。
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项：旧 flow 已产出 Ok 但未提交时，新 start 顶掉旧记录；
+    /// 旧 finish 不得返回 Ok（旧实现会回假的 Ok(number, aci:None) 且不
+    /// add_account），旧 store 必须随 supersede 回收，不留孤儿。
+    #[tokio::test]
+    async fn superseded_ok_flow_never_finishes_successfully_or_leaves_store() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-ok-superseded-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let first_uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=aaaaaaaa-2222-4333-8444-555555555555&pub_key=AAAA",
+                            )
+                            .expect("url"),
+                        );
+                        Ok(("+15550001111".to_owned(), None))
+                    })
+                    .await
+                    .expect("first start").device_link_uri().to_owned();
+                wait_link_result_resolved(&service, &first_uri).await;
+                let first_dir = {
+                    let inner = service.inner.lock().await;
+                    let record = inner.links.get(&first_uri).expect("first record");
+                    assert!(
+                        record.committed.try_lock().expect("commit lock").is_none(),
+                        "flow Ok must not imply committed"
+                    );
+                    record.store_dir.clone()
+                };
+
+                let second_uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=bbbbbbbb-2222-4333-8444-555555555555&pub_key=BBBB",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("second start").device_link_uri().to_owned();
+                assert_ne!(first_uri, second_uri);
+
+                match service.finish_link(&first_uri, "KT").await {
+                    Err(LinkError::UnknownUri) | Err(LinkError::Lost) => {}
+                    Ok(_) => panic!("superseded finish must not return Ok"),
+                    Err(other) => panic!("unexpected superseded finish error: {other:?}"),
+                }
+                let accounts = { service.state.lock().await.accounts().to_vec() };
+                assert!(
+                    accounts.is_empty(),
+                    "superseded flow must not add an account: {accounts:?}"
+                );
+                assert!(
+                    !first_dir.exists(),
+                    "superseded uncommitted store must be removed"
+                );
+                {
+                    let inner = service.inner.lock().await;
+                    assert!(inner.links.contains_key(&second_uri));
+                }
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项（旧 fake-Ok 窗口）：结果槽已 Ok，但记录已被新 start 取走 /
+    /// 顶掉；finish 不得把这条 Ok 冒充成功（旧实现在 "pending 不是自己" 时
+    /// 回 Ok(number, aci:None)，不 add_account → 孤儿 store）。
+    #[tokio::test]
+    async fn ok_result_with_superseded_record_never_finishes_successfully() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-fake-ok-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=dddddddd-2222-4333-8444-555555555555&pub_key=DDDD",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("start").device_link_uri().to_owned();
+                let record = {
+                    let inner = service.inner.lock().await;
+                    inner.links.get(&uri).expect("record").clone()
+                };
+                let first_dir = record.store_dir.clone();
+
+                // 让 finish 先查到记录并停在结果槽等待（poll 到 pending）。
+                let mut finish = Box::pin(service.finish_link(&uri, "KT"));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), finish.as_mut())
+                        .await
+                        .is_err(),
+                    "finish must be waiting for the result slot"
+                );
+
+                // 结果槽已 Ok，同时记录被新 start 取走（supersede）——旧实现
+                // 会在这里回假的 Ok 且不 add_account。
+                {
+                    let mut inner = service.inner.lock().await;
+                    record.result.complete(Ok(("+15550001111".to_owned(), None)));
+                    assert!(inner.links.remove(&uri).is_some(), "record removed");
+                }
+                let _ = retire_pending_record(Arc::clone(&record)).await;
+
+                let err = match finish.await {
+                    Err(error) => error,
+                    Ok(_) => panic!("Ok result of superseded record must not return Ok"),
+                };
+                assert!(
+                    matches!(err, LinkError::Lost),
+                    "superseded Ok result must be LINK_LOST: {err:?}"
+                );
+                assert!(service.state.lock().await.accounts().is_empty());
+                assert!(!first_dir.exists(), "superseded store must be removed");
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项：finish 已进入等待后被新 start 顶掉，必须回 LINK_LOST，
+    /// 不能拿到旧记录的结果冒充成功，也不能留下未提交 store。
+    #[tokio::test]
+    async fn pending_finish_superseded_by_new_start_returns_link_lost() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-waiting-superseded-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let first_uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=aaaaaaaa-2222-4333-8444-555555555555&pub_key=AAAA",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("first start").device_link_uri().to_owned();
+                let first_dir = {
+                    let inner = service.inner.lock().await;
+                    inner
+                        .links
+                        .get(&first_uri)
+                        .expect("first record")
+                        .store_dir
+                        .clone()
+                };
+
+                let finish_service = Arc::clone(&service);
+                let finish_uri = first_uri.clone();
+                let finish = tokio::task::spawn_local(async move {
+                    finish_service.finish_link(&finish_uri, "KT").await
+                });
+                // 让 finish 先查到记录并进入结果槽等待。
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert!(!finish.is_finished(), "finish should be waiting for confirmation");
+
+                let second_uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=bbbbbbbb-2222-4333-8444-555555555555&pub_key=BBBB",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("second start").device_link_uri().to_owned();
+                assert_ne!(first_uri, second_uri);
+
+                let err = match finish.await.expect("finish task") {
+                    Err(error) => error,
+                    Ok(_) => panic!("superseded waiting finish must not return Ok"),
+                };
+                assert!(
+                    matches!(err, LinkError::Lost),
+                    "superseded waiting finish: {err:?}"
+                );
+                assert!(service.state.lock().await.accounts().is_empty());
+                assert!(!first_dir.exists(), "superseded store must be removed");
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项：第一个 start 卡在 URL 等待时，第二个 start 必须能进入
+    /// （旧实现持 inner 锁跨 30s url_rx 等待，第二个会被串行阻塞）。
+    #[tokio::test]
+    async fn concurrent_start_link_is_not_blocked_by_slow_url_wait() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-concurrent-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let (gate_tx, gate_rx) = futures::channel::oneshot::channel::<()>();
+                let slow_service = Arc::clone(&service);
+                let slow = tokio::task::spawn_local(async move {
+                    slow_service
+                        .start_link_with_flow(move |_store, url_tx| async move {
+                            let _ = gate_rx.await;
+                            let _ = url_tx.send(
+                                url::Url::parse(
+                                    "sgnl://link?uuid=aaaaaaaa-2222-4333-8444-555555555555&pub_key=AAAA",
+                                )
+                                .expect("url"),
+                            );
+                            Err(LinkError::Internal)
+                        })
+                        .await
+                });
+                // 让第一个 start 进入 URL 等待（持锁实现会在这里卡住第二个）。
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(!slow.is_finished(), "first start must still wait for its URL");
+
+                let second_uri = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    service.start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=bbbbbbbb-2222-4333-8444-555555555555&pub_key=BBBB",
+                            )
+                            .expect("url"),
+                        );
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    }),
+                )
+                .await
+                .expect("second start must not block on the first URL wait")
+                .expect("second start").device_link_uri().to_owned();
+
+                let _ = gate_tx.send(());
+                let slow_result = slow.await.expect("slow start task");
+                assert!(
+                    matches!(slow_result, Err(LinkError::Internal)),
+                    "stale start must be discarded: {slow_result:?}"
+                );
+                {
+                    let inner = service.inner.lock().await;
+                    assert!(inner.links.contains_key(&second_uri));
+                    assert_eq!(inner.links.len(), 1, "stale start must not overwrite pending");
+                }
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 测试用 provisioning URL 夹具（与生产 QrLinkUrl 同形，不触网）。
+    fn test_link_url(uuid: &str) -> url::Url {
+        url::Url::parse(&format!(
+            "sgnl://link?uuid={uuid}-2222-4333-8444-555555555555&pub_key=AAAA"
+        ))
+        .expect("url")
+    }
+
+    /// 测试局部类型别名：link 状态机是 !Send（LocalSet 承载），不能用
+    /// futures 的 BoxFuture（它要求 Send）。
+    type LocalBox<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
+
+    /// 起一个 attempt（大 future 上堆）：Debug 构建下 link 状态机很大，
+    /// 内联等待会把 libtest 的 2 MiB 测试线程栈撑爆。
+    fn start_link_boxed<'a, F, Fut>(
+        service: &'a Arc<Service>,
+        flow: F,
+    ) -> LocalBox<'a, Result<LinkAttemptView, LinkError>>
+    where
+        F: FnOnce(SqliteStore, futures::channel::oneshot::Sender<url::Url>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<LinkOutcome, LinkError>> + 'static,
+    {
+        Box::pin(service.start_link_with_flow(flow))
+    }
+
+    /// rotateLink 的同款上堆封装（见 start_link_boxed）。
+    fn rotate_link_boxed<'a, F, Fut>(
+        service: &'a Arc<Service>,
+        attempt_id: &'a str,
+        flow: F,
+    ) -> LocalBox<'a, Result<LinkRotateView, LinkError>>
+    where
+        F: FnOnce(SqliteStore, futures::channel::oneshot::Sender<url::Url>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<LinkOutcome, LinkError>> + 'static,
+    {
+        Box::pin(service.rotate_link_with_flow(attempt_id, flow))
+    }
+
+    /// finishLink 的同款上堆封装（见 start_link_boxed）。
+    fn finish_link_boxed<'a>(
+        service: &'a Arc<Service>,
+        uri: &'a str,
+        name: &'a str,
+    ) -> LocalBox<'a, Result<LinkedAccount, LinkError>> {
+        Box::pin(service.finish_link(uri, name))
+    }
+
+    /// 双槽 QR 轮换（engine 侧 additive 契约）：startLink 回 attemptId + 第 0
+    /// 槽，rotateLink 铸第 1 槽；两个槽都能 finish（先 rotate 再提交新槽，或
+    /// 直接提交第 0 槽），跨槽共享 attempt 级提交位，只 add_account 一次。
+    ///
+    /// 审计必须项 2 的落点：契约测试（tests/contract.rs，假面）只覆盖 wire
+    /// 形状——fake 面首提交即清空 fake_link，表达不了跨槽幂等。本用例在**真面**
+    /// 做那两条断言：提交第 1 槽后只建 1 个账号，另一码（第 0 槽）replay 回
+    /// 同一账号（attempt 级提交位，不是假面形状）。
+    #[tokio::test]
+    async fn rotate_link_mints_second_slot_and_either_slot_can_finish() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                // attempt A：先 rotate，再用新槽（第 1 槽）finish。
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                })
+                .await
+                .expect("start");
+                assert_eq!(started.slots.len(), 1, "没有 rotate 就是单槽");
+                assert_eq!(started.slots[0].slot, 0);
+                let slot0_uri = started.device_link_uri().to_owned();
+
+                let rotated =
+                    rotate_link_boxed(&service, &started.attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                        Ok(("+15550004444".to_owned(), None))
+                    })
+                    .await
+                    .expect("rotate");
+                assert_eq!(rotated.slot, 1, "新槽落在 live 槽表末位");
+                assert_eq!(rotated.slots.len(), 2);
+                assert_eq!(rotated.slots[0].device_link_uri, slot0_uri);
+                assert_eq!(rotated.slots[0].slot, 0);
+                assert_eq!(rotated.slots[1].slot, 1);
+                assert_eq!(rotated.slots[1].device_link_uri, rotated.device_link_uri);
+
+                let linked = finish_link_boxed(&service, &rotated.device_link_uri, "KT")
+                    .await
+                    .expect("finish rotated slot");
+                assert_eq!(linked.number, "+15550004444");
+                // 第 0 槽随提交收口：幂等回同一账号，不会二次提交。
+                let replay = finish_link_boxed(&service, &slot0_uri, "KT")
+                    .await
+                    .expect("slot 0 idempotent replay");
+                assert_eq!(replay.number, linked.number);
+                assert_eq!(service.state.lock().await.accounts().len(), 1);
+                // 提交后 attempt 收口：rotate 不再接受。
+                let err =
+                    rotate_link_boxed(&service, &started.attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("eeeeeeee"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect_err("committed attempt must not rotate");
+                assert!(matches!(err, LinkError::AttemptNotFound), "{err:?}");
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 双槽轮换的另一半：rotate 之后**第 0 槽**仍然可提交（轮换不抢旧槽的
+    /// 手机确认），提交成功后轮换出去的新槽随 attempt 收口。
+    #[tokio::test]
+    async fn rotate_link_keeps_first_slot_committable() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-slot0-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("cccccccc"));
+                    Ok(("+15550005555".to_owned(), None))
+                })
+                .await
+                .expect("start");
+                let slot0_uri = started.device_link_uri().to_owned();
+                let rotated =
+                    rotate_link_boxed(&service, &started.attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("dddddddd"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate");
+
+                let linked = finish_link_boxed(&service, &slot0_uri, "KT")
+                    .await
+                    .expect("finish slot 0");
+                assert_eq!(linked.number, "+15550005555");
+                assert_eq!(service.state.lock().await.accounts().len(), 1);
+                // 轮换出去的新槽已随提交收口：幂等回同一账号。
+                let replay = finish_link_boxed(&service, &rotated.device_link_uri, "KT")
+                    .await
+                    .expect("rotated slot replay");
+                assert_eq!(replay.number, linked.number);
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 第 3 次 rotate 收回最旧槽：旧码 finish 确定性回 LINK_LOST（墓碑），
+    /// live 槽表恒 ≤2 且只剩最近铸的两个。
+    #[tokio::test]
+    async fn third_rotate_retires_oldest_slot_and_old_uri_is_link_lost() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-evict-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                })
+                .await
+                .expect("start link");
+                let attempt_id = started.attempt_id.clone();
+                let uri0 = started.device_link_uri().to_owned();
+
+                let first = rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                    futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                })
+                .await
+                .expect("rotate 1");
+                let uri1 = first.device_link_uri.clone();
+                let second =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("cccccccc"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate 2");
+                let third = rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("dddddddd"));
+                    futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                })
+                .await
+                .expect("rotate 3");
+
+                // live 槽表 = 最近铸的两个（第 3 次 rotate 收回最旧的 uri1）。
+                assert_eq!(third.slot, 1);
+                assert_eq!(third.slots.len(), 2, "live 槽上限 2");
+                assert_eq!(third.slots[0].device_link_uri, second.device_link_uri);
+                assert_eq!(third.slots[1].device_link_uri, third.device_link_uri);
+
+                for uri in [uri0.as_str(), uri1.as_str()] {
+                    match service.finish_link(uri, "KT").await {
+                        Err(error) => {
+                            assert!(matches!(error, LinkError::Lost), "retired slot: {error:?}");
+                        }
+                        Ok(account) => panic!("retired slot must fail: {}", account.number),
+                    }
+                }
+                {
+                    let inner = service.inner.lock().await;
+                    assert!(!inner.links.contains_key(&uri0));
+                    assert!(!inner.links.contains_key(&uri1));
+                    assert!(inner.links.contains_key(&second.device_link_uri));
+                    assert!(inner.links.contains_key(&third.device_link_uri));
+                }
+
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项 1（死槽出口）：startLink 的第 0 槽按 LINK_LOST 收口后，记录
+    /// 离开 links —— attempt 槽表必须同步摘掉它（attempt.slots ≡ live 槽表），
+    /// 随后 rotateLink 的应答只含新铸的活槽，且 slot 下标从 0 起（死槽不占位）。
+    #[tokio::test]
+    async fn lost_slot_leaves_live_table_so_rotate_response_has_no_dead_slot() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-lost-slot-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                // 第 0 槽：URL 交付后 provisioning 会话死亡（B1 的 LINK_LOST 面）。
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    Err(LinkError::Lost)
+                })
+                .await
+                .expect("start");
+                let attempt_id = started.attempt_id.clone();
+                let dead_uri = started.device_link_uri().to_owned();
+                wait_link_result_resolved(&service, &dead_uri).await;
+
+                // finish 走 lost 出口：摘记录 + 落墓碑。
+                let err = match finish_link_boxed(&service, &dead_uri, "KT").await {
+                    Err(error) => error,
+                    Ok(account) => panic!("lost slot must not commit: {}", account.number),
+                };
+                assert!(matches!(err, LinkError::Lost), "{err:?}");
+                {
+                    let inner = service.inner.lock().await;
+                    assert!(!inner.links.contains_key(&dead_uri), "记录必须离开 links");
+                    assert!(
+                        inner
+                            .attempts
+                            .get(&attempt_id)
+                            .is_some_and(|attempt| attempt.slots.is_empty()),
+                        "attempt 槽表必须同步摘掉死槽（≡ live 槽表），否则 rotate 应答会带死槽"
+                    );
+                }
+
+                let rotated =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate after lost slot");
+                assert_eq!(
+                    rotated.slots.len(),
+                    1,
+                    "死槽不占 live 槽表：只有新铸的那一格"
+                );
+                assert_eq!(rotated.slot, 0, "死槽不参与 slot 下标");
+                assert_eq!(rotated.slots[0].slot, 0);
+                assert_eq!(rotated.slots[0].device_link_uri, rotated.device_link_uri);
+                assert_ne!(rotated.device_link_uri, dead_uri);
+                assert!(
+                    rotated
+                        .slots
+                        .iter()
+                        .all(|slot| slot.device_link_uri != dead_uri),
+                    "应答槽表不得含死槽: {rotated:?}"
+                );
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项 1（淘汰面）：槽表里残留一格死槽（表头/相邻位置上的历史
+    /// 漏网——双保险的修剪面）时，rotateLink 必须修剪掉它，退休的只能是真正
+    /// 最旧的**活**槽：活槽不被误退休，死槽绝不出现在应答里，slot 下标紧排。
+    #[tokio::test]
+    async fn rotate_eviction_skips_dead_slot_and_keeps_live_slot() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-dead-skip-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                })
+                .await
+                .expect("start");
+                let attempt_id = started.attempt_id.clone();
+                let uri0 = started.device_link_uri().to_owned();
+
+                // 阶段 1：表里 1 个活槽 + 表尾一格死槽（漏 retain 的历史出口
+                // 留下的残留，它不在 links 里）。修剪掉死槽后只剩一个活槽，
+                // rotate 不该退休任何活槽，也不该把死槽回给调用方。
+                let stale_uri = test_link_url("ffffffff").to_string();
+                {
+                    let mut inner = service.inner.lock().await;
+                    let attempt = inner
+                        .attempts
+                        .get_mut(&attempt_id)
+                        .expect("attempt after start");
+                    attempt.slots.push(stale_uri.clone());
+                }
+
+                let first = rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                    Ok(("+15550008888".to_owned(), None))
+                })
+                .await
+                .expect("rotate 1");
+                let uri1 = first.device_link_uri.clone();
+                assert_eq!(first.slot, 1);
+                assert_eq!(first.slots.len(), 2, "死槽不占 live 槽表");
+                assert_eq!(first.slots[0].device_link_uri, uri0, "活槽不被误退休");
+                assert_eq!(first.slots[0].slot, 0);
+                assert_eq!(first.slots[1].device_link_uri, uri1);
+                assert_eq!(first.slots[1].slot, 1);
+                assert!(
+                    first
+                        .slots
+                        .iter()
+                        .all(|slot| slot.device_link_uri != stale_uri),
+                    "死槽不得出现在应答槽表: {first:?}"
+                );
+                {
+                    let inner = service.inner.lock().await;
+                    let attempt = inner.attempts.get(&attempt_id).expect("attempt alive");
+                    assert_eq!(attempt.slots, vec![uri0.clone(), uri1.clone()]);
+                }
+
+                // 阶段 2：另一种错位形态——死槽塞回表头。淘汰循环必须跳过它、
+                // 继续找真正最旧的**活**槽（uri0），而不是把死槽算成一次退休
+                // 就停下（那样表会涨到 3 格活槽）。
+                {
+                    let mut inner = service.inner.lock().await;
+                    let attempt = inner.attempts.get_mut(&attempt_id).expect("attempt alive");
+                    attempt.slots.insert(0, stale_uri.clone());
+                }
+
+                let second =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("cccccccc"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate 2");
+                let uri2 = second.device_link_uri.clone();
+
+                // 修剪死槽后 live 表 = [uri0, uri1] + 新槽 → 退休真正最旧的活槽
+                // uri0；若实现漏了修剪，死槽会被当成退休名额（表里留下三格活槽）
+                // 或直接退休错活槽。
+                assert_eq!(second.slot, 1);
+                assert_eq!(second.slots.len(), 2, "live 槽上限 2（死槽不计入）");
+                assert_eq!(second.slots[0].device_link_uri, uri1);
+                assert_eq!(second.slots[0].slot, 0);
+                assert_eq!(second.slots[1].device_link_uri, uri2);
+                assert_eq!(second.slots[1].slot, 1);
+                assert!(
+                    second
+                        .slots
+                        .iter()
+                        .all(|slot| slot.device_link_uri != stale_uri),
+                    "死槽不得出现在应答槽表: {second:?}"
+                );
+                {
+                    let inner = service.inner.lock().await;
+                    let attempt = inner.attempts.get(&attempt_id).expect("attempt alive");
+                    assert_eq!(attempt.slots, vec![uri1.clone(), uri2.clone()]);
+                }
+
+                // 被退休的是 uri0（Lost），活槽 uri1 仍然可提交。
+                let retired = match finish_link_boxed(&service, &uri0, "KT").await {
+                    Err(error) => error,
+                    Ok(account) => panic!("retired slot must not commit: {}", account.number),
+                };
+                assert!(matches!(retired, LinkError::Lost), "{retired:?}");
+                let linked = finish_link_boxed(&service, &uri1, "KT")
+                    .await
+                    .expect("live slot survives eviction");
+                assert_eq!(linked.number, "+15550008888");
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项 1（下标面）：两槽里第 0 槽死掉后，活槽仍然占 slot 0（死槽
+    /// 不参与下标），rotate 出来的新槽落在末位 —— 应答 slot 与槽表位置一一对应。
+    #[tokio::test]
+    async fn dead_slot_does_not_consume_slot_index() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-index-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    Err(LinkError::Lost)
+                })
+                .await
+                .expect("start");
+                let attempt_id = started.attempt_id.clone();
+                let uri0 = started.device_link_uri().to_owned();
+                wait_link_result_resolved(&service, &uri0).await;
+
+                let first = rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                    Ok(("+15550009999".to_owned(), None))
+                })
+                .await
+                .expect("rotate 1");
+                let uri1 = first.device_link_uri.clone();
+                assert_eq!(first.slots[0].device_link_uri, uri0, "死槽此刻还没收口");
+
+                // 第 0 槽按 LINK_LOST 收口：槽表里只剩 uri1，它必须落回 slot 0。
+                let err = match finish_link_boxed(&service, &uri0, "KT").await {
+                    Err(error) => error,
+                    Ok(account) => panic!("lost slot must not commit: {}", account.number),
+                };
+                assert!(matches!(err, LinkError::Lost), "{err:?}");
+                {
+                    let inner = service.inner.lock().await;
+                    let attempt = inner.attempts.get(&attempt_id).expect("attempt alive");
+                    assert_eq!(attempt.slots, vec![uri1.clone()], "死槽不留在槽表里");
+                }
+
+                let second =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("cccccccc"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate 2");
+                assert_eq!(second.slot, 1, "新槽永远落在 live 槽表末位");
+                assert_eq!(second.slots.len(), 2, "死槽不占下标");
+                assert_eq!(second.slots[0].device_link_uri, uri1);
+                assert_eq!(second.slots[0].slot, 0, "活槽回到 slot 0");
+                assert_eq!(second.slots[1].device_link_uri, second.device_link_uri);
+                assert_eq!(second.slots[1].slot, 1);
+                assert!(
+                    second.slots.iter().all(|slot| slot.device_link_uri != uri0),
+                    "死槽不得出现在应答槽表: {second:?}"
+                );
+
+                // 活槽仍可提交（下标重排不影响归属）。
+                let linked = finish_link_boxed(&service, &uri1, "KT")
+                    .await
+                    .expect("live slot committable");
+                assert_eq!(linked.number, "+15550009999");
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 两个槽的 finish 并发：attempt 级提交门单飞，只 add_account 一次，
+    /// 两个调用拿回同一账号。
+    #[tokio::test]
+    async fn concurrent_finishes_on_both_slots_commit_once() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-single-flight-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let started = start_link_boxed(&service, |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    Ok(("+15550006666".to_owned(), None))
+                })
+                .await
+                .expect("start");
+                let rotated =
+                    rotate_link_boxed(&service, &started.attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                        Ok(("+15550007777".to_owned(), None))
+                    })
+                    .await
+                    .expect("rotate");
+                let slot0 = started.device_link_uri().to_owned();
+                let slot1 = rotated.device_link_uri.clone();
+
+                // 两个槽的 finish 同时推进（同一任务里 join 轮询，不 spawn：commit
+                // 会拉起接收管线，LocalSet 轮询它需要比 libtest 2 MiB 更大的栈）。
+                let left_fut = finish_link_boxed(&service, &slot0, "KT");
+                let right_fut = finish_link_boxed(&service, &slot1, "KT");
+                let (left, right) = futures::future::join(left_fut, right_fut).await;
+                let left = left.expect("finish slot 0");
+                let right = right.expect("finish slot 1");
+                assert_eq!(left.number, right.number, "两个槽回同一账号");
+                assert!(
+                    left.number == "+15550006666" || left.number == "+15550007777",
+                    "committed number: {}",
+                    left.number
+                );
+                assert_eq!(
+                    service.state.lock().await.accounts().len(),
+                    1,
+                    "提交只发生一次"
+                );
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// rotate 不打断在飞 finish：要退休的槽上有 finish 在等手机确认时，只置
+    /// 退休旗不 abort；放手后那次提交照常成功（结果不丢）。
+    #[tokio::test]
+    async fn rotate_does_not_interrupt_inflight_finish() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-inflight-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+                let started = start_link_boxed(&service, move |_store, url_tx| async move {
+                    let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                    let _ = release_rx.await;
+                    Ok(("+15550008888".to_owned(), None))
+                })
+                .await
+                .expect("start");
+                let attempt_id = started.attempt_id.clone();
+                let slot0 = started.device_link_uri().to_owned();
+                let _first =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("bbbbbbbb"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate 1");
+
+                // finish 在飞：手动 poll 让它进入结果槽等待（不 spawn——commit 会
+                // 拉起接收管线，LocalSet 轮询它需要比 libtest 2 MiB 更大的栈）。
+                let mut finish = Box::pin(service.finish_link(&slot0, "KT"));
+                assert!(
+                    futures::poll!(finish.as_mut()).is_pending(),
+                    "finish waits for phone confirmation"
+                );
+
+                // 第 2 次 rotate 要收回第 0 槽（有在飞 finish）→ 只置退休旗，
+                // 绝不 abort 这次提交。
+                let _second =
+                    rotate_link_boxed(&service, &attempt_id, |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("cccccccc"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    })
+                    .await
+                    .expect("rotate 2");
+                assert!(
+                    futures::poll!(finish.as_mut()).is_pending(),
+                    "rotate must not interrupt the in-flight finish"
+                );
+
+                // 放手：旧槽 flow 照常产出号码，这次提交不得被轮换丢掉。
+                let _ = release_tx.send(());
+                let linked = finish.await.expect("in-flight finish commits");
+                assert_eq!(linked.number, "+15550008888");
+                assert_eq!(service.state.lock().await.accounts().len(), 1);
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// rotateLink 的 attemptId 不存在 → AttemptNotFound（wire 面 -1
+    /// LINK_ATTEMPT_NOT_FOUND，methods 层单测钉码位）。
+    #[tokio::test]
+    async fn rotate_unknown_attempt_returns_not_found() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-rotate-unknown-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let err = rotate_link_boxed(
+                    &service,
+                    "la-0000000000000000",
+                    |_store, url_tx| async move {
+                        let _ = url_tx.send(test_link_url("aaaaaaaa"));
+                        futures::future::pending::<Result<LinkOutcome, LinkError>>().await
+                    },
+                )
+                .await
+                .expect_err("unknown attempt");
+                assert!(matches!(err, LinkError::AttemptNotFound), "{err:?}");
+                assert!(service.inner.lock().await.attempts.is_empty());
+                assert!(service.inner.lock().await.links.is_empty());
+
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 审计必须项：正常 finish 仍成功；只有 add_account 成功后才返回 Ok，
+    /// 连接器重试返回同一提交结果。
+    #[tokio::test]
+    async fn finish_link_commits_account_once_and_returns_number() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-link-finish-ok-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), state, outbound);
+
+                let uri = service
+                    .start_link_with_flow(|_store, url_tx| async move {
+                        let _ = url_tx.send(
+                            url::Url::parse(
+                                "sgnl://link?uuid=cccccccc-2222-4333-8444-555555555555&pub_key=CCCC",
+                            )
+                            .expect("url"),
+                        );
+                        Ok(("+15550002222".to_owned(), None))
+                    })
+                    .await
+                    .expect("start").device_link_uri().to_owned();
+                wait_link_result_resolved(&service, &uri).await;
+
+                let linked = service.finish_link(&uri, "KT").await.expect("finish link");
+                assert_eq!(linked.number, "+15550002222");
+                assert!(linked.aci.is_none());
+                {
+                    let state = service.state.lock().await;
+                    assert!(
+                        state
+                            .accounts()
+                            .iter()
+                            .any(|entry| entry.number == linked.number),
+                        "finish must add the account"
+                    );
+                }
+
+                let retry = service.finish_link(&uri, "KT").await.expect("finish retry");
+                assert_eq!(retry.number, linked.number);
+                assert_eq!(retry.aci, linked.aci);
+
+                abort_pipelines(&service).await;
+                retire_all_links(&service).await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// 终局归型纯函数：URL 前失败仍 Internal；URL 后关闭/keepalive 超时 =
+    /// Lost；注册数据落库失败不是会话终局，仍 Internal。
+    /// 生产出口锁：link_flow 只用三个具名出口产出终局。若有人把
+    /// terminal_after_url_closed 的 true 改成 false（或把 before/timeout 弄
+    /// 反），这条测试必红——纯映射表测试拦不住这种改动。
+    #[test]
+    fn production_terminal_exits_keep_the_url_handoff_boundary() {
+        assert!(
+            matches!(terminal_after_url_closed(), LinkError::Lost),
+            "URL delivered + stream closed must be Lost"
+        );
+        assert!(
+            matches!(terminal_before_url(), LinkError::Internal),
+            "pre-URL failure must stay Internal"
+        );
+        assert!(
+            matches!(terminal_url_timeout(), LinkError::Internal),
+            "caller-dropped url_rx must stay Internal"
+        );
+    }
+
+    #[test]
+    fn link_terminal_classification_maps_url_state_and_cause() {
+        for cause in [
+            LinkTerminalCause::StreamClosed,
+            LinkTerminalCause::KeepaliveTimeout,
+            LinkTerminalCause::UrlTimeout,
+        ] {
+            assert!(
+                matches!(classify_link_terminal(false, cause), LinkError::Internal),
+                "pre-URL failure must stay internal: {cause:?}"
+            );
+        }
+        assert!(matches!(
+            classify_link_terminal(true, LinkTerminalCause::StreamClosed),
+            LinkError::Lost
+        ));
+        assert!(matches!(
+            classify_link_terminal(true, LinkTerminalCause::KeepaliveTimeout),
+            LinkError::Lost
+        ));
+        assert!(matches!(
+            classify_link_terminal(true, LinkTerminalCause::StoreWrite),
+            LinkError::Internal
+        ));
+        assert!(matches!(
+            classify_link_terminal(false, LinkTerminalCause::StoreWrite),
+            LinkError::Internal
+        ));
+
+        // 真实 link_device 终局错误 → 映射输入：超时归 keepalive，其余关闭
+        // 归 stream closed；两者在 URL 交付后都落 Lost。
+        assert_eq!(
+            provisioning_terminal_cause(&ProvisioningError::ServiceError(
+                ProvisioningServiceError::Timeout {
+                    reason: "keepalive"
+                }
+            )),
+            LinkTerminalCause::KeepaliveTimeout
+        );
+        assert_eq!(
+            provisioning_terminal_cause(&ProvisioningError::WsClosing),
+            LinkTerminalCause::StreamClosed
+        );
+    }
+
+    /// B1：lost 清理只删未注册目录；含注册数据的 store 必须保留。
+    #[tokio::test]
+    async fn lost_store_cleanup_keeps_registered_store() {
+        let root = std::env::temp_dir().join(format!(
+            "kt-engine-link-lost-cleanup-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let empty = root.join("accounts/lk-empty");
+        let store = open_store(&empty).await.expect("empty store opens");
+        drop(store);
+        let registered = seed_store_with_aci(
+            &root,
+            "accounts/lk-registered",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+
+        assert!(
+            remove_unregistered_link_store(&empty).await,
+            "unregistered lost store is removed"
+        );
+        assert!(
+            !remove_unregistered_link_store(&registered).await,
+            "registered store is never removed"
+        );
+        assert!(!empty.exists());
+        assert!(registered.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -18337,6 +23178,847 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&data_dir);
             })
             .await;
+    }
+
+    /// Duplicate 恢复臂 ack 时序（G1）：投影完成 → flush 栅栏 resolve → ack。
+    /// 旧实现 spawn 后立刻 ack（投影/flush 全在 ack 之后）；本测试钉死：
+    /// 投影未完成不得进 flush 栅栏，栅栏未 resolve 不得 ack。
+    #[tokio::test]
+    async fn duplicate_ack_waits_for_projection_and_flush() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let replay_events = Rc::clone(&events);
+        let flush_events = Rc::clone(&events);
+        let ack_events = Rc::clone(&events);
+        let replay = async move {
+            replay_events.borrow_mut().push("replay_begin");
+            tokio::task::yield_now().await;
+            replay_events.borrow_mut().push("projected");
+            DuplicateReplayOutcome::Projected
+        };
+        let flush = async move {
+            let seen = flush_events.borrow().clone();
+            assert_eq!(
+                seen,
+                vec!["replay_begin", "projected"],
+                "flush 不得早于 replay 投影完成"
+            );
+            flush_events.borrow_mut().push("flushed");
+            true
+        };
+        let ack = move || {
+            let seen = ack_events.borrow().clone();
+            assert_eq!(
+                seen,
+                vec!["replay_begin", "projected", "flushed"],
+                "ack 必须晚于投影与 flush 栅栏"
+            );
+            ack_events.borrow_mut().push("acked");
+        };
+        assert_eq!(
+            ack_after_duplicate_projection(replay, flush, ack).await,
+            DuplicateRecovery::Acked
+        );
+        assert_eq!(
+            events.borrow().clone(),
+            vec!["replay_begin", "projected", "flushed", "acked"]
+        );
+    }
+
+    /// replay 任务失败（spawn 失败/panic/abort，投影状态未知）→ 不排
+    /// flush、不 ack。
+    #[tokio::test]
+    async fn duplicate_ack_withheld_when_replay_task_fails() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let flush_called = Rc::new(Cell::new(false));
+        let ack_called = Rc::new(Cell::new(false));
+        let flush_flag = Rc::clone(&flush_called);
+        let ack_flag = Rc::clone(&ack_called);
+        let outcome = ack_after_duplicate_projection(
+            async { DuplicateReplayOutcome::Failed },
+            async move {
+                flush_flag.set(true);
+                true
+            },
+            move || ack_flag.set(true),
+        )
+        .await;
+        assert_eq!(outcome, DuplicateRecovery::ProjectionFailed);
+        assert!(!flush_called.get(), "replay 失败时不得等 flush 栅栏");
+        assert!(!ack_called.get(), "replay 失败时必须扣留 ack");
+    }
+
+    /// Phase1 Duplicate 重放夹具：账号目录 + 已开 store（先灌行再让
+    /// Service 自己开库重放）。
+    async fn duplicate_replay_fixture(
+        tag: &str,
+    ) -> (Arc<Service>, std::path::PathBuf, SqliteStore) {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-duplicate-{tag}-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store_dir = data_dir.join("accounts/dup");
+        let store = open_store(&store_dir).await.expect("store opens");
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        state
+            .lock()
+            .await
+            .add_account("+15550000001".to_owned(), Some("accounts/dup".to_owned()))
+            .expect("add account");
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), state, outbound);
+        (service, data_dir, store)
+    }
+
+    fn duplicate_test_content(sender: ServiceId, ts: u64, body: ContentBody) -> Content {
+        use presage::libsignal_service::protocol::DeviceId;
+        let timestamp = chrono::DateTime::from_timestamp_millis(ts as i64).expect("timestamp");
+        Content::from_body(
+            body,
+            Metadata {
+                sender,
+                destination: sender,
+                sender_device: DeviceId::new(1).expect("device id"),
+                pni_verified: None,
+                client_timestamp: timestamp,
+                server_timestamp: timestamp,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+                story: None,
+                ephemeral: None,
+                urgent: None,
+                report_spam_token: None,
+            },
+        )
+    }
+
+    fn group_text_content(sender: ServiceId, ts: u64, key: [u8; 32], text: &str) -> Content {
+        duplicate_test_content(
+            sender,
+            ts,
+            ContentBody::DataMessage(presage::proto::DataMessage {
+                body: Some(text.to_owned()),
+                timestamp: Some(ts),
+                group_v2: Some(presage::proto::GroupContextV2 {
+                    master_key: Some(key.to_vec()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+    }
+
+    /// Phase1：同 sender+ts 落两个群是合法形态。sender+ts 重放返回两行；
+    /// thread 精确重放各回各行，不互相顶替。
+    #[tokio::test]
+    async fn duplicate_replay_rebuilds_both_groups_sharing_sender_and_ts() {
+        use base64::Engine as _;
+
+        let (service, data_dir, store) = duplicate_replay_fixture("two-groups").await;
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let ts = 1_700_000_000_000u64;
+        let group_a = [1u8; 32];
+        let group_b = [2u8; 32];
+        let thread_a = presage::store::Thread::Group(group_a);
+        let thread_b = presage::store::Thread::Group(group_b);
+
+        store
+            .save_messages(vec![
+                (
+                    thread_a.clone(),
+                    group_text_content(sender, ts, group_a, "group-a"),
+                ),
+                (
+                    thread_b.clone(),
+                    group_text_content(sender, ts, group_b, "group-b"),
+                ),
+            ])
+            .await
+            .expect("seed two group rows");
+
+        // legacy dedupe key 只作查询参数：sender+ts 两行都能重放。
+        let key = crate::outbox_model::duplicate_dedupe_key(&sender.service_id_string(), ts);
+        let notifications = service
+            .replay_duplicate("+15550000001", &key)
+            .await
+            .expect("store readable")
+            .expect("both group rows replay");
+        assert_eq!(notifications.len(), 2, "两群同 sender+ts 都必须可重放");
+        let mut group_ids: Vec<String> = notifications
+            .iter()
+            .filter_map(|notification| {
+                notification["params"]["envelope"]["dataMessage"]["groupInfo"]["groupId"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        group_ids.sort();
+        let mut expected = vec![
+            base64::engine::general_purpose::STANDARD.encode(group_a),
+            base64::engine::general_purpose::STANDARD.encode(group_b),
+        ];
+        expected.sort();
+        assert_eq!(group_ids, expected, "两条通知分别属于两个群");
+
+        // 接收臂走 thread 精确重放：每次只投本 thread 的行。
+        let replay_a = service
+            .replay_duplicate_in_thread("+15550000001", &sender, ts, &thread_a)
+            .await
+            .expect("store readable")
+            .expect("group-a replay");
+        assert_eq!(replay_a.len(), 1);
+        assert_eq!(
+            replay_a[0]["params"]["envelope"]["dataMessage"]["message"],
+            "group-a"
+        );
+        let replay_b = service
+            .replay_duplicate_in_thread("+15550000001", &sender, ts, &thread_b)
+            .await
+            .expect("store readable")
+            .expect("group-b replay");
+        assert_eq!(replay_b.len(), 1);
+        assert_eq!(
+            replay_b[0]["params"]["envelope"]["dataMessage"]["message"],
+            "group-b"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Phase1：远端删除把行改写成 nil ACI 的 NullMessage 墓碑后，重放读面
+    /// 仍按 thread+ts 命中并重建 NullMessage；sender+ts 已不再匹配，且
+    /// 墓碑投影零消息（不会把删除的正文复活）。
+    #[tokio::test]
+    async fn duplicate_replay_after_remote_delete_is_null_message() {
+        let (service, data_dir, store) = duplicate_replay_fixture("remote-delete").await;
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let ts = 1_700_000_000_100u64;
+        let group_key = [3u8; 32];
+        let thread = presage::store::Thread::Group(group_key);
+
+        store
+            .save_message(
+                &thread,
+                group_text_content(sender, ts, group_key, "deleted"),
+            )
+            .await
+            .expect("seed original");
+
+        // 与 presage 远端删除臂同一变换：sender 置 nil ACI + NullMessage。
+        let mut existing = store.message(&thread, ts).await.unwrap().expect("row");
+        existing.metadata.sender = ServiceId::Aci(uuid::Uuid::nil().into());
+        existing.body = presage::proto::NullMessage::default().into();
+        store
+            .save_message(&thread, existing)
+            .await
+            .expect("tombstone");
+
+        let rebuilt = duplicate_replay_contents(&store, &sender, ts, Some(&thread))
+            .await
+            .expect("thread lookup");
+        assert_eq!(rebuilt.len(), 1);
+        assert!(
+            matches!(rebuilt[0].1.body, ContentBody::NullMessage(_)),
+            "远端删除后重放必须是 NullMessage"
+        );
+        assert!(
+            duplicate_replay_contents(&store, &sender, ts, None)
+                .await
+                .expect("sender lookup")
+                .is_empty(),
+            "墓碑不再匹配原 sender"
+        );
+
+        let notifications = service
+            .replay_duplicate_in_thread("+15550000001", &sender, ts, &thread)
+            .await
+            .expect("store readable")
+            .expect("tombstone replay");
+        assert!(notifications.is_empty(), "墓碑投影零消息，不复活正文");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Phase2：重投不产生重复行（线程级 INSERT OR REPLACE）；恢复拷贝表
+    /// 已 DROP，重放只读 thread_messages，重复调用稳定。
+    #[tokio::test]
+    async fn duplicate_redelivery_keeps_one_row() {
+        let (service, data_dir, store) = duplicate_replay_fixture("redelivery").await;
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let ts = 1_700_000_000_200u64;
+        let group_key = [4u8; 32];
+        let thread = presage::store::Thread::Group(group_key);
+        let content = || group_text_content(sender, ts, group_key, "once");
+
+        store
+            .save_messages(vec![(thread.clone(), content())])
+            .await
+            .expect("first delivery");
+        store
+            .save_messages(vec![(thread.clone(), content())])
+            .await
+            .expect("redelivery");
+
+        assert_eq!(
+            store.messages(&thread, ..).await.unwrap().count(),
+            1,
+            "重投不得产生重复行"
+        );
+
+        for _ in 0..2 {
+            let replay = service
+                .replay_duplicate_in_thread("+15550000001", &sender, ts, &thread)
+                .await
+                .expect("store readable")
+                .expect("replay");
+            assert_eq!(replay.len(), 1);
+            assert_eq!(
+                replay[0]["params"]["envelope"]["dataMessage"]["message"],
+                "once"
+            );
+        }
+        assert_eq!(store.messages(&thread, ..).await.unwrap().count(), 1);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Phase2 升级面：phase1 时代的 store.db（kt_outbox 在建、带一行）经引擎
+    /// open_store 的迁移链升级后表被 DROP 且迁移不碰其它数据；重投恢复改由
+    /// thread_messages 供数据，重放仍能重建原消息。
+    #[tokio::test]
+    async fn upgrade_drops_kt_outbox_and_replay_still_reads_thread_messages() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-duplicate-upgrade-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store_dir = data_dir.join("accounts/upgraded");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let db_path = store_dir
+            .join("store.db")
+            .to_str()
+            .expect("utf-8 path")
+            .to_owned();
+
+        // phase1 schema：迁移链停在 20261107000000（kt_outbox 在位），灌一行。
+        {
+            let pool =
+                sqlx::SqlitePool::connect_with(store_connect_options(&db_path).expect("options"))
+                    .await
+                    .expect("raw pool");
+            sqlx::migrate!("vendor/presage/presage-store-sqlite/migrations")
+                .run_to(20_261_107_000_000, &pool)
+                .await
+                .expect("phase1 migrations");
+            sqlx::query(
+                "INSERT INTO kt_outbox(dedupe_key, sender, client_timestamp, content, metadata_json, created_at)
+                 VALUES('dup:aci:1', 'aci', 1, x'0102', '{}', 1)",
+            )
+            .execute(&pool)
+            .await
+            .expect("legacy outbox row");
+            pool.close().await;
+        }
+
+        // 引擎真实打开路径：迁移链继续跑到 phase2 的 DROP。
+        let store = open_store(&store_dir).await.expect("store opens");
+        {
+            let pool =
+                sqlx::SqlitePool::connect_with(store_connect_options(&db_path).expect("options"))
+                    .await
+                    .expect("probe pool");
+            let present: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='kt_outbox'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("sqlite_master");
+            assert_eq!(present, 0, "升级后 kt_outbox 必须不存在");
+            pool.close().await;
+        }
+
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        state
+            .lock()
+            .await
+            .add_account(
+                "+15550000001".to_owned(),
+                Some("accounts/upgraded".to_owned()),
+            )
+            .expect("add account");
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), state, outbound);
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let ts = 1_700_000_001_000u64;
+        let group_key = [9u8; 32];
+        let thread = presage::store::Thread::Group(group_key);
+        store
+            .save_message(
+                &thread,
+                group_text_content(sender, ts, group_key, "after-upgrade"),
+            )
+            .await
+            .expect("seed message");
+
+        let replay = service
+            .replay_duplicate_in_thread("+15550000001", &sender, ts, &thread)
+            .await
+            .expect("store readable")
+            .expect("replay from thread_messages");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(
+            replay[0]["params"]["envelope"]["dataMessage"]["message"],
+            "after-upgrade"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Phase2 兼容面：receive.confirm 已无行可删——已知账号恒 true 且幂等，
+    /// 未知账号如实 false，dedupe key 形状不参与判定（旧 key/垃圾 key 同答）。
+    #[tokio::test]
+    async fn receive_confirm_stays_an_idempotent_noop() {
+        let (service, data_dir, store) = duplicate_replay_fixture("confirm-noop").await;
+        let key = "dup:11111111-2222-4333-8444-555555555555:1700000000000";
+        assert!(service.confirm_duplicate("+15550000001", key).await);
+        assert!(
+            service.confirm_duplicate("+15550000001", key).await,
+            "重复 confirm 必须幂等"
+        );
+        assert!(
+            service
+                .confirm_duplicate("+15550000001", "not-a-dup-key")
+                .await,
+            "dedupe key 形状不参与判定"
+        );
+        assert!(
+            !service.confirm_duplicate("+15559990000", key).await,
+            "未知账号仍如实回 false"
+        );
+        drop(service);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// 止血 b：store 查询成功且确认无行 → replay 返回 Ok(None)（无可投影）
+    /// → 计 duplicate_replay_unavailable，但按「确认无可投影 = 已投影」照常
+    /// flush 后 ack，不再扣留（否则服务器每轮重连重投同一信封）。
+    #[tokio::test]
+    async fn duplicate_key_miss_acks_after_flush() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-duplicate-key-miss-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store_dir = data_dir.join("accounts/dup-key-miss");
+        open_store(&store_dir).await.expect("store opens");
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        state
+            .lock()
+            .await
+            .add_account(
+                "+15550000000".to_owned(),
+                Some("accounts/dup-key-miss".to_owned()),
+            )
+            .expect("add account");
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), state, outbound);
+
+        // 真实 store miss（phase2）：key 能解析成 sender+ts，store 可读，
+        // 但 thread_messages 没有行 → replay_duplicate 返回 Ok(None)。
+        let notifications = service
+            .replay_duplicate(
+                "+15550000000",
+                "dup:11111111-2222-4333-8444-555555555555:1700000000000",
+            )
+            .await
+            .expect("confirming no row is not a store failure");
+        assert!(notifications.is_none(), "确认无行必须返回 Ok(None)");
+        let before = perf_metrics::snapshot_json()["counters"]["duplicate_replay_unavailable"]
+            .as_u64()
+            .unwrap_or(0);
+        let replay =
+            classify_duplicate_replay("+15550000000", Ok(DuplicateReplayOutcome::Unavailable));
+        assert_eq!(replay, DuplicateReplayOutcome::Unavailable);
+        assert_eq!(
+            perf_metrics::snapshot_json()["counters"]["duplicate_replay_unavailable"]
+                .as_u64()
+                .unwrap_or(0),
+            before + 1,
+            "key miss 走 unavailable 计数，不静默"
+        );
+
+        let flushes = Rc::new(Cell::new(0u32));
+        let acks = Rc::new(Cell::new(false));
+        let flush_flag = Rc::clone(&flushes);
+        let ack_flag = Rc::clone(&acks);
+        let outcome = ack_after_duplicate_projection(
+            async { replay },
+            async move {
+                flush_flag.set(flush_flag.get() + 1);
+                true
+            },
+            move || ack_flag.set(true),
+        )
+        .await;
+        assert_eq!(outcome, DuplicateRecovery::Acked);
+        assert_eq!(flushes.get(), 1, "无可投影也必须等 flush 栅栏");
+        assert!(acks.get(), "无可投影 = 已投影：flush 后照常 ack，不扣留");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// 终审修复：store 打不开是「无法确认行是否存在」，不是「无行」。
+    /// replay 必须返回 Err(StoreOpen)，接收臂按 Failed 扣留 ack（不 flush、
+    /// 不 ack），信封留服务器队列等下次重投。
+    #[tokio::test]
+    async fn duplicate_replay_store_open_failure_withholds_ack() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        fn counter(key: &str) -> u64 {
+            perf_metrics::snapshot_json()["counters"][key]
+                .as_u64()
+                .unwrap_or(0)
+        }
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-duplicate-open-fail-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store_dir = data_dir.join("accounts/dup-open-fail");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        // store.db 做成目录：SQLite 无法把它当数据库文件打开（open 失败）。
+        std::fs::create_dir_all(store_dir.join("store.db")).expect("blocker dir");
+
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        state
+            .lock()
+            .await
+            .add_account(
+                "+15550000002".to_owned(),
+                Some("accounts/dup-open-fail".to_owned()),
+            )
+            .expect("add account");
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), state, outbound);
+        let key = "dup:11111111-2222-4333-8444-555555555555:1700000000000";
+
+        let direct = service.replay_duplicate("+15550000002", key).await;
+        assert_eq!(
+            direct.err(),
+            Some(DuplicateReplayError::StoreOpen),
+            "store 打不开必须上抛，不能折叠成 Ok(None)"
+        );
+
+        let before = counter("duplicate_replay_failed");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let outcome = Service::spawn_duplicate_replay(
+                    &service,
+                    "+15550000002",
+                    DuplicateReplayTarget::Key(key.to_owned()),
+                )
+                .await;
+                assert_eq!(outcome, DuplicateReplayOutcome::Failed);
+
+                let flushes = Rc::new(Cell::new(0u32));
+                let acks = Rc::new(Cell::new(false));
+                let flush_flag = Rc::clone(&flushes);
+                let ack_flag = Rc::clone(&acks);
+                let recovery = ack_after_duplicate_projection(
+                    async { outcome },
+                    async move {
+                        flush_flag.set(flush_flag.get() + 1);
+                        true
+                    },
+                    move || ack_flag.set(true),
+                )
+                .await;
+                assert_eq!(recovery, DuplicateRecovery::ProjectionFailed);
+                assert_eq!(flushes.get(), 0, "读面失败时不得排 flush 栅栏");
+                assert!(!acks.get(), "读面失败时必须扣留 ack");
+            })
+            .await;
+        assert_eq!(
+            counter("duplicate_replay_failed"),
+            before + 1,
+            "读面失败必须计数，不能静默"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// 终审修复：store 能打开但行查询失败（表被破坏）同样是「行状态未知」。
+    /// replay 返回 Err(StoreRead) → Failed 扣留 ack；绝不能当 Ok(None) 在
+    /// flush 后 ack（那样投影永久丢失）。
+    #[tokio::test]
+    async fn duplicate_replay_store_read_failure_withholds_ack() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        fn counter(key: &str) -> u64 {
+            perf_metrics::snapshot_json()["counters"][key]
+                .as_u64()
+                .unwrap_or(0)
+        }
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-duplicate-read-fail-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let store_dir = data_dir.join("accounts/dup-read-fail");
+        let store = open_store(&store_dir).await.expect("store opens");
+        drop(store);
+        // 迁移已记账但 thread_messages 被删：再次 open_store 不会重跑迁移，
+        // 查询直接报错——这一路径必须是 Failed，而不是「无行」。
+        let db_path = store_dir
+            .join("store.db")
+            .to_str()
+            .expect("utf-8 path")
+            .to_owned();
+        {
+            let pool =
+                sqlx::SqlitePool::connect_with(store_connect_options(&db_path).expect("options"))
+                    .await
+                    .expect("raw pool");
+            sqlx::query("DROP TABLE thread_messages")
+                .execute(&pool)
+                .await
+                .expect("drop thread_messages");
+            pool.close().await;
+        }
+
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        state
+            .lock()
+            .await
+            .add_account(
+                "+15550000003".to_owned(),
+                Some("accounts/dup-read-fail".to_owned()),
+            )
+            .expect("add account");
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), state, outbound);
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let ts = 1_700_000_002_000u64;
+        let thread = presage::store::Thread::Group([7u8; 32]);
+
+        let direct = service
+            .replay_duplicate_in_thread("+15550000003", &sender, ts, &thread)
+            .await;
+        assert_eq!(
+            direct.err(),
+            Some(DuplicateReplayError::StoreRead),
+            "查询失败必须上抛，不能折叠成 Ok(None)"
+        );
+
+        let before = counter("duplicate_replay_failed");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let outcome = Service::spawn_duplicate_replay(
+                    &service,
+                    "+15550000003",
+                    DuplicateReplayTarget::Thread {
+                        sender,
+                        timestamp: ts,
+                        thread: thread.clone(),
+                    },
+                )
+                .await;
+                assert_eq!(outcome, DuplicateReplayOutcome::Failed);
+
+                let flushes = Rc::new(Cell::new(0u32));
+                let acks = Rc::new(Cell::new(false));
+                let flush_flag = Rc::clone(&flushes);
+                let ack_flag = Rc::clone(&acks);
+                let recovery = ack_after_duplicate_projection(
+                    async { outcome },
+                    async move {
+                        flush_flag.set(flush_flag.get() + 1);
+                        true
+                    },
+                    move || ack_flag.set(true),
+                )
+                .await;
+                assert_eq!(recovery, DuplicateRecovery::ProjectionFailed);
+                assert_eq!(flushes.get(), 0, "读面失败时不得排 flush 栅栏");
+                assert!(!acks.get(), "读面失败时必须扣留 ack");
+            })
+            .await;
+        assert_eq!(
+            counter("duplicate_replay_failed"),
+            before + 1,
+            "读面失败必须计数，不能静默"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// 正常重投：store 行重建成功 → 投影通知入队 → Projected → flush → ack。
+    #[tokio::test]
+    async fn duplicate_replay_success_projects_and_acks() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let (service, data_dir, store) = duplicate_replay_fixture("success-ack").await;
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let ts = 1_700_000_003_000u64;
+        let group_key = [8u8; 32];
+        let thread = presage::store::Thread::Group(group_key);
+        store
+            .save_message(
+                &thread,
+                group_text_content(sender, ts, group_key, "project-me"),
+            )
+            .await
+            .expect("seed row");
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let outcome = Service::spawn_duplicate_replay(
+                    &service,
+                    "+15550000001",
+                    DuplicateReplayTarget::Thread {
+                        sender,
+                        timestamp: ts,
+                        thread,
+                    },
+                )
+                .await;
+                assert_eq!(outcome, DuplicateReplayOutcome::Projected, "正常行必须投影");
+
+                let flushes = Rc::new(Cell::new(0u32));
+                let acks = Rc::new(Cell::new(false));
+                let flush_flag = Rc::clone(&flushes);
+                let ack_flag = Rc::clone(&acks);
+                let recovery = ack_after_duplicate_projection(
+                    async { outcome },
+                    async move {
+                        flush_flag.set(flush_flag.get() + 1);
+                        true
+                    },
+                    move || ack_flag.set(true),
+                )
+                .await;
+                assert_eq!(recovery, DuplicateRecovery::Acked);
+                assert_eq!(flushes.get(), 1);
+                assert!(acks.get());
+            })
+            .await;
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// flush 栅栏不可解（出口死亡）→ 不 ack，调用方按 StdioDead 停管线。
+    #[tokio::test]
+    async fn duplicate_ack_withheld_when_flush_barrier_dead() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let ack_called = Rc::new(Cell::new(false));
+        let ack_flag = Rc::clone(&ack_called);
+        let outcome = ack_after_duplicate_projection(
+            async { DuplicateReplayOutcome::Projected },
+            async { false },
+            move || ack_flag.set(true),
+        )
+        .await;
+        assert_eq!(outcome, DuplicateRecovery::OutputDead);
+        assert!(!ack_called.get(), "栅栏不可解时必须扣留 ack");
+    }
+
+    /// replay 任务 panic 不得静默：走 JoinError::is_panic 分类，计数 +1 且
+    /// 返回 Failed（ack 扣留）。
+    #[tokio::test]
+    async fn duplicate_replay_panic_is_counted() {
+        fn counter(key: &str) -> u64 {
+            perf_metrics::snapshot_json()["counters"][key]
+                .as_u64()
+                .unwrap_or(0)
+        }
+        let before = counter("duplicate_replay_panic");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let spawned = tokio::task::spawn_local(async {
+                    panic!("duplicate replay exploded");
+                });
+                let outcome = classify_duplicate_replay("+15550000000", spawned.await);
+                assert_eq!(outcome, DuplicateReplayOutcome::Failed);
+            })
+            .await;
+        assert_eq!(
+            counter("duplicate_replay_panic"),
+            before + 1,
+            "panic 必须计数，不能静默"
+        );
+    }
+
+    /// replay spawn 失败（LocalSet 上下文缺失）不得静默：catch 后计失败并
+    /// 返回 Failed（ack 扣留），收流任务本身不带 panic 退出。
+    #[tokio::test]
+    async fn duplicate_replay_spawn_failure_is_counted() {
+        fn counter(key: &str) -> u64 {
+            perf_metrics::snapshot_json()["counters"][key]
+                .as_u64()
+                .unwrap_or(0)
+        }
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-duplicate-spawn-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), state, outbound);
+        let before = counter("duplicate_replay_spawn_failed");
+        // 故意的：不建 LocalSet —— spawn_local 按 tokio 契约 panic，
+        // spawn_duplicate_replay 的 catch_unwind 把它收成可计数失败。
+        let outcome = Service::spawn_duplicate_replay(
+            &service,
+            "+15550000000",
+            DuplicateReplayTarget::Key("dup:aci:1".to_owned()),
+        )
+        .await;
+        assert_eq!(outcome, DuplicateReplayOutcome::Failed);
+        assert_eq!(
+            counter("duplicate_replay_spawn_failed"),
+            before + 1,
+            "spawn 失败必须计数，不能静默"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// receive 信封投影 serverGuid 位（reportSpam 面）：metadata.server_guid
@@ -22596,6 +28278,14 @@ mod tests {
         assert!(initial_sync_due(Some(INITIAL_SYNC_WINDOW_MS)), "超窗重臂");
     }
 
+    #[test]
+    fn forced_initial_sync_is_one_shot_per_link() {
+        let account = "+15559990001";
+        force_initial_sync_on_next_stream(account);
+        assert!(take_forced_initial_sync(account));
+        assert!(!take_forced_initial_sync(account));
+    }
+
     /// T-9b 结果事件消费方测试替身：通道恰一帧且为 `engine.storagePull`
     /// 通知，方法名/jsonrpc/account/trigger/双腿位逐键验型（形状钉定）。
     fn expect_storage_pull_notice(
@@ -22911,8 +28601,55 @@ mod tests {
         assert!(conversation_write_observation(&bad).is_none());
     }
 
-    /// whitelist 会话级缓存（修1）：TTL 内命中、过期未命中、失效单点、
-    /// 跨账号隔离（deadline 形可拨针，无真实等待）。
+    /// storage.write Contact 臂增量（修4）：明文里的 whitelisted 位直接出
+    /// (aci, 位)，免全量重拉；DELETE 无载荷 / 坏 record → None（调用方保守
+    /// 失效，不清位）。
+    #[test]
+    fn contact_whitelist_write_delta_extracts_contact_bit() {
+        fn contact_record(aci: &str, whitelisted: bool) -> Vec<u8> {
+            crate::proto::storage::StorageRecord {
+                record: Some(crate::proto::storage::storage_record::Record::Contact(
+                    crate::proto::storage::ContactRecord {
+                        aci: aci.to_owned(),
+                        whitelisted,
+                        ..Default::default()
+                    },
+                )),
+            }
+            .encode_to_vec()
+        }
+
+        let denied = storage_write::StorageItemUpdate::Insert {
+            key: vec![1u8; 16],
+            record: contact_record("11111111-2222-4333-8444-555555555555", false),
+            kind: storage_sync::StorageRecordKind::Contact,
+        };
+        assert_eq!(
+            contact_whitelist_write_delta(&denied),
+            Some(("11111111-2222-4333-8444-555555555555".to_owned(), false))
+        );
+        let allowed = storage_write::StorageItemUpdate::Update {
+            key: vec![2u8; 16],
+            record: contact_record("11111111-2222-4333-8444-555555555555", true),
+            kind: storage_sync::StorageRecordKind::Contact,
+        };
+        assert_eq!(
+            contact_whitelist_write_delta(&allowed),
+            Some(("11111111-2222-4333-8444-555555555555".to_owned(), true))
+        );
+        let delete = storage_write::StorageItemUpdate::Delete { key: vec![3u8; 16] };
+        assert!(contact_whitelist_write_delta(&delete).is_none());
+        let bad = storage_write::StorageItemUpdate::Insert {
+            key: vec![4u8; 16],
+            record: vec![0xff, 0xff],
+            kind: storage_sync::StorageRecordKind::Contact,
+        };
+        assert!(contact_whitelist_write_delta(&bad).is_none());
+    }
+
+    /// whitelist 会话级缓存（修1 + 修4 条目形状）：TTL 内命中、过期未命中、
+    /// 失效单点、跨账号隔离、写面增量落条目（deadline 形可拨针，无真实
+    /// 等待）。
     #[test]
     fn whitelist_cache_ttl_and_invalidation() {
         let cache = StdMutex::new(WhitelistCache::new());
@@ -22925,8 +28662,43 @@ mod tests {
         map.insert("aci-b".to_owned(), true);
         whitelist_cache_put(&cache, "acct", map);
         let hit = whitelist_cache_get(&cache, "acct").expect("TTL 内命中");
-        assert_eq!(hit.get("aci-a"), Some(&false), "位值逐条保真");
-        assert_eq!(hit.get("aci-b"), Some(&true));
+        assert_eq!(hit.map.get("aci-a"), Some(&false), "位值逐条保真");
+        assert_eq!(hit.map.get("aci-b"), Some(&true));
+        assert!(!hit.refresh_due, "回填面不排刷新");
+        // 写面增量：位 true 出拒集、位 false 入拒集（条目在 → 原地更新）。
+        whitelist_cache_apply_delta(
+            &cache,
+            "acct",
+            &[("aci-a".to_owned(), true), ("aci-c".to_owned(), false)],
+        );
+        let hit = whitelist_cache_get(&cache, "acct").expect("TTL 内命中");
+        assert!(!hit.map.contains_key("aci-a"));
+        assert_eq!(hit.map.get("aci-c"), Some(&false));
+        // 后台刷新节流闸（修4）：新鲜条目不排刷新；陈旧态首拍放行并推进
+        // 窗口，窗内再问不放行（失败不刷屏），拨针过窗后再次放行。
+        assert!(
+            !whitelist_refresh_allowed(&cache, "acct"),
+            "新鲜条目不排刷新"
+        );
+        whitelist_cache_put_with(
+            &cache,
+            "acct",
+            HashMap::new(),
+            std::time::Instant::now() + WHITELIST_CACHE_TTL,
+            true,
+        );
+        assert!(whitelist_refresh_allowed(&cache, "acct"), "陈旧态首拍放行");
+        assert!(
+            !whitelist_refresh_allowed(&cache, "acct"),
+            "窗内不重复轰网络"
+        );
+        cache
+            .lock()
+            .expect("whitelist cache lock")
+            .get_mut("acct")
+            .expect("entry")
+            .next_refresh_at = std::time::Instant::now() - WHITELIST_REFRESH_RETRY_WINDOW;
+        assert!(whitelist_refresh_allowed(&cache, "acct"), "过窗再放行");
         // 拨针过期：deadline 拨到过去 → 未命中（fail-open 面由调用方空
         // map 语义兜住，缓存只管时限）。
         cache
@@ -22934,7 +28706,7 @@ mod tests {
             .expect("whitelist cache lock")
             .get_mut("acct")
             .expect("entry")
-            .1 = std::time::Instant::now() - WHITELIST_CACHE_TTL;
+            .deadline = std::time::Instant::now() - WHITELIST_CACHE_TTL;
         assert!(
             whitelist_cache_get(&cache, "acct").is_none(),
             "TTL 过期未命中"
@@ -22948,6 +28720,287 @@ mod tests {
             whitelist_cache_get(&cache, "other").is_some(),
             "他账号不受牵连"
         );
+    }
+
+    /// 磁盘层测试临时目录（进程内序号；用例各自清场）。
+    fn whitelist_temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let unique = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "kt-engine-whitelist-face-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// 磁盘 map 桩（ACI 全小写，与落盘口径一致）。
+    fn persisted_map(
+        entries: &[(&str, bool)],
+        updated_at_ms: u64,
+    ) -> whitelist_store::PersistedWhitelist {
+        whitelist_store::PersistedWhitelist {
+            map: entries
+                .iter()
+                .map(|(aci, bit)| ((*aci).to_owned(), *bit))
+                .collect(),
+            updated_at_ms,
+        }
+    }
+
+    /// 修4 验收①：冷启动有持久化 map（窗内）→ 发送路径**零** Storage 全量
+    /// 拉取（fetch 计数 = 0），直接应答磁盘 map，且不排后台刷新。
+    #[tokio::test]
+    async fn cold_start_with_persisted_map_never_pulls_storage() {
+        let now = 1_700_000_000_000u64;
+        let persisted = persisted_map(&[("aci-a", false)], now - 60_000);
+        let calls = std::cell::Cell::new(0usize);
+        let resolution = resolve_whitelist_miss(Some(persisted), now, || {
+            calls.set(calls.get() + 1);
+            async { Some(HashMap::new()) }
+        })
+        .await;
+        assert_eq!(calls.get(), 0, "有持久化 map：send 不触发全量拉取");
+        assert_eq!(resolution.source, WhitelistSource::Persisted);
+        assert_eq!(resolution.source.probe_word(), "persisted");
+        assert!(!resolution.refresh_due, "窗内新鲜：不排刷新");
+        assert!(resolution.fetched.is_none(), "无拉取 = 无落盘材料");
+        assert_eq!(resolution.map.get("aci-a"), Some(&false), "位逐条保真");
+        assert_eq!(
+            resolution.cache_ttl_ms,
+            whitelist_store::FRESH_WINDOW_MS - 60_000,
+            "内存 deadline 对齐磁盘剩余新鲜寿命"
+        );
+    }
+
+    /// 修5（时钟回拨 / 异常时间戳）：`updatedAtMs` 落在未来且越过允许偏差
+    /// （[`whitelist_store::MAX_FUTURE_SKEW_MS`]）**不得当新鲜**——未来时刻
+    /// 只可能是时钟回拨 / 手工改表 / 旧快照复制，认可它等于让陈旧拒集无限
+    /// 续命。判陈旧后行为与「过期」同构：旧 map 照常应答、inline 零拉取、
+    /// 排后台刷新（发送路径仍不阻塞）。偏差窗内的未来时刻（毫秒级抖动）按
+    /// 新鲜：不排刷新、deadline 满窗，不为抖动白拉一次网络。
+    #[tokio::test]
+    async fn future_persisted_timestamp_is_stale_and_still_answers_from_disk() {
+        let now = 1_700_000_000_000u64;
+        for future in [
+            now + whitelist_store::MAX_FUTURE_SKEW_MS + 1,
+            now + 86_400_000,
+            u64::MAX - 1,
+        ] {
+            let persisted = persisted_map(&[("aci-a", false)], future);
+            let calls = std::cell::Cell::new(0usize);
+            let resolution = resolve_whitelist_miss(Some(persisted), now, || {
+                calls.set(calls.get() + 1);
+                async { Some(HashMap::new()) }
+            })
+            .await;
+            assert_eq!(calls.get(), 0, "未来时间戳不 inline 拉取（不阻塞发送）");
+            assert_eq!(resolution.source, WhitelistSource::Persisted);
+            assert!(resolution.refresh_due, "越界未来 = 陈旧 = 排后台刷新");
+            assert!(resolution.fetched.is_none());
+            assert_eq!(
+                resolution.map.get("aci-a"),
+                Some(&false),
+                "陈旧仍用旧 map 应答，拒集判定面不变"
+            );
+            assert_eq!(
+                resolution.cache_ttl_ms,
+                whitelist_store::FRESH_WINDOW_MS,
+                "陈旧按整窗缓存，等后台刷新翻新"
+            );
+        }
+        // 偏差窗内的未来时刻：新鲜面（不排刷新，deadline 取剩余寿命 = 满窗）。
+        let near_future = persisted_map(
+            &[("aci-a", false)],
+            now + whitelist_store::MAX_FUTURE_SKEW_MS,
+        );
+        let calls = std::cell::Cell::new(0usize);
+        let resolution = resolve_whitelist_miss(Some(near_future), now, || {
+            calls.set(calls.get() + 1);
+            async { Some(HashMap::new()) }
+        })
+        .await;
+        assert_eq!(calls.get(), 0);
+        assert!(!resolution.refresh_due, "偏差窗内抖动不算陈旧");
+        assert_eq!(
+            resolution.cache_ttl_ms,
+            whitelist_store::FRESH_WINDOW_MS,
+            "抖动按刚写完计，满窗剩余"
+        );
+    }
+
+    /// 修5 装载面：账号启动从磁盘铺内存缓存时同样按未来边界判定——越界未来
+    /// 快照只标 `refresh_due`（下一次发送排后台刷新），不触发任何 inline 拉取。
+    #[tokio::test]
+    async fn seeded_cache_from_future_snapshot_is_refresh_due() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-whitelist-seed-skew-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir, Arc::clone(&state), outbound);
+        let account = "+8618827970450";
+
+        let now = now_ms();
+        let dir = whitelist_temp_dir("seed-skew");
+        assert!(whitelist_store::save(
+            &dir,
+            account,
+            &[("aci-a".to_owned(), false)].into_iter().collect(),
+            now + 86_400_000,
+        ));
+        seed_profile_sharing_whitelist(&service, account, &dir);
+        let hit = whitelist_cache_get(&service.whitelist_cache, account).expect("种子入缓存");
+        assert_eq!(hit.map.get("aci-a"), Some(&false), "拒集照常应答");
+        assert!(hit.refresh_due, "未来越界快照 = 待后台刷新");
+        assert!(
+            whitelist_refresh_allowed(&service.whitelist_cache, account),
+            "首拍放行后台刷新"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 修4 验收②：持久化 map 过期（越新鲜窗 / 写面陈旧标记）→ 只用旧 map
+    /// 应答并排**后台**刷新，inline 零拉取（不阻塞首条发送）。
+    #[tokio::test]
+    async fn expired_persisted_map_only_schedules_background_refresh() {
+        let now = 1_700_000_000_000u64;
+        for updated_at in [
+            now - whitelist_store::FRESH_WINDOW_MS - 1,
+            whitelist_store::STALE_MARK_MS,
+        ] {
+            let persisted = persisted_map(&[("aci-a", false)], updated_at);
+            let calls = std::cell::Cell::new(0usize);
+            let resolution = resolve_whitelist_miss(Some(persisted), now, || {
+                calls.set(calls.get() + 1);
+                async { Some(HashMap::new()) }
+            })
+            .await;
+            assert_eq!(calls.get(), 0, "过期不 inline 拉取（只排后台刷新）");
+            assert_eq!(resolution.source, WhitelistSource::Persisted);
+            assert!(resolution.refresh_due, "陈旧态必须排后台刷新");
+            assert!(resolution.fetched.is_none());
+            assert_eq!(resolution.map.get("aci-a"), Some(&false));
+            assert_eq!(resolution.cache_ttl_ms, whitelist_store::FRESH_WINDOW_MS);
+        }
+    }
+
+    /// 修4 验收③：完全无持久化 map → bootstrap 恰好一次同步拉取；成功
+    /// 落盘后再次（重启）读回即为零拉取。
+    #[tokio::test]
+    async fn missing_map_bootstraps_once_then_reuses_persisted_snapshot() {
+        let now = 1_700_000_000_000u64;
+        let calls = std::cell::Cell::new(0usize);
+        let resolution = resolve_whitelist_miss(None, now, || {
+            calls.set(calls.get() + 1);
+            async {
+                let mut map = HashMap::new();
+                map.insert("aci-a".to_owned(), false);
+                Some(map)
+            }
+        })
+        .await;
+        assert_eq!(calls.get(), 1, "无持久化 map：bootstrap 恰好一次");
+        assert_eq!(resolution.source, WhitelistSource::Bootstrap);
+        assert_eq!(resolution.source.probe_word(), "miss");
+        assert!(!resolution.refresh_due);
+        assert_eq!(resolution.map.get("aci-a"), Some(&false));
+        let fetched = resolution.fetched.expect("bootstrap 成功留落盘材料");
+
+        // 落盘 → 模拟进程重启读回 → 第二次读面零拉取。
+        let dir = whitelist_temp_dir("bootstrap");
+        assert!(whitelist_store::persist_fetch(
+            &dir,
+            "+8618827970450",
+            Some(&fetched),
+            now
+        ));
+        let persisted = whitelist_store::load(&dir, "+8618827970450").expect("重启可读");
+        let calls = std::cell::Cell::new(0usize);
+        let second = resolve_whitelist_miss(Some(persisted), now + 1_000, || {
+            calls.set(calls.get() + 1);
+            async { None }
+        })
+        .await;
+        assert_eq!(calls.get(), 0, "bootstrap 之后不再拉取");
+        assert_eq!(second.source, WhitelistSource::Persisted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 修4 验收④：拉取失败不毒缓存——不产生落盘材料、不覆盖/删除磁盘旧
+    /// map；发送面按 fail-open 空 map 照常注入。
+    #[tokio::test]
+    async fn failed_bootstrap_never_poisons_the_persisted_cache() {
+        let now = 1_700_000_000_000u64;
+        let calls = std::cell::Cell::new(0usize);
+        let resolution = resolve_whitelist_miss(None, now, || {
+            calls.set(calls.get() + 1);
+            async { None }
+        })
+        .await;
+        assert_eq!(calls.get(), 1);
+        assert_eq!(resolution.source, WhitelistSource::Bootstrap);
+        assert!(resolution.fetched.is_none(), "失败不留落盘材料");
+        assert!(resolution.map.is_empty(), "fail-open：空 map 照常应答");
+
+        let account = "+8618827970450";
+        let dir = whitelist_temp_dir("failed");
+        let old: HashMap<String, bool> = [("aci-old".to_owned(), false)].into_iter().collect();
+        assert!(whitelist_store::save(&dir, account, &old, now - 1_000));
+        assert!(
+            !whitelist_store::persist_fetch(&dir, account, resolution.fetched.as_ref(), now),
+            "失败不落盘"
+        );
+        assert_eq!(
+            whitelist_store::load(&dir, account)
+                .expect("old map stays")
+                .map,
+            old,
+            "失败保留旧 map"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 修4：拒集落盘读回后闸判定与内存面逐条同义（显式 false 不注入，
+    /// 缺记录/位 true 注入）——重启不改变 profile_key 注入语义。
+    #[test]
+    fn persisted_deny_set_keeps_profile_key_gate_decision_after_restart() {
+        use presage::libsignal_service::prelude::Uuid;
+        use presage::libsignal_service::protocol::Aci;
+
+        let account = "+8618827970450";
+        let dir = whitelist_temp_dir("gate");
+        let denied = ServiceId::Aci(Aci::from(Uuid::from_u128(7)));
+        let missing = ServiceId::Aci(Aci::from(Uuid::from_u128(8)));
+        let allowed = ServiceId::Aci(Aci::from(Uuid::from_u128(9)));
+        let mut map = HashMap::new();
+        map.insert(denied.service_id_string().to_lowercase(), false);
+        map.insert(allowed.service_id_string().to_lowercase(), true);
+        assert!(whitelist_store::save(
+            &dir,
+            account,
+            &map,
+            1_700_000_000_000
+        ));
+        let loaded = whitelist_store::load(&dir, account).expect("map");
+        assert!(
+            !include_profile_key_for(&loaded.map, &denied),
+            "显式 false 不注入"
+        );
+        assert!(
+            include_profile_key_for(&loaded.map, &allowed),
+            "位 true 注入"
+        );
+        assert!(
+            include_profile_key_for(&loaded.map, &missing),
+            "缺记录注入（fail-open 零变化）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// DERM 新鲜度窗口（官方 retryRespondMaxAge=14 天同语义）：窗口内
@@ -23415,6 +29468,8 @@ mod tests {
         assert!(!receive_close_is_terminal(Some(3001)));
         assert!(!receive_close_is_terminal(None));
         assert!(StreamOutcome::Terminated.is_terminal());
+        // M6 C 阶段：store 终态与 1000/4409 同语义——停环、不退避重连。
+        assert!(StreamOutcome::StoreTerminal.is_terminal());
     }
 
     /// 重连排程：manager 不可用（Recoverable）按官方 Fibonacci 逐级重试，
@@ -23457,6 +29512,11 @@ mod tests {
         assert_eq!(schedule.next_delay(StreamOutcome::Unbound), None);
         assert_eq!(schedule.next_delay(StreamOutcome::Terminated), None);
         assert_eq!(schedule.next_delay(StreamOutcome::StdioDead), None);
+        assert_eq!(
+            schedule.next_delay(StreamOutcome::StoreTerminal),
+            None,
+            "错 key/缺 key/库损坏不进 Fibonacci 退避重连（设计 F9）"
+        );
     }
 
     /// 最小复现（2026-10-21 静默接收事故）：manager 在启动期不可用
@@ -23464,6 +29524,15 @@ mod tests {
     /// 存活，直到显式停机——旧路径无日志、无重启，现场只看到「没消息」。
     /// paused 时钟下按 1s/2s/3s/5s… 推进，断言至少发生 3 次真实尝试且任务
     /// 未静默退出。
+    ///
+    /// 已知缺陷（2026-11-10 终审）：本用例默认 2MiB 测试线程栈单跑即
+    /// 栈溢出（SIGABRT，与并行无关），故 `#[ignore]` 出常规门禁；CI 串行 +
+    /// RUST_MIN_STACK=8388608 也不覆盖本用例。复现/回归口径（单跑）：
+    /// `RUST_MIN_STACK=8388608 cargo test --bin kt-signal-engine
+    /// service::tests::receive_loop_retries_unavailable_manager_until_shutdown
+    /// -- --exact --ignored`（去掉 RUST_MIN_STACK 即复现溢出）。根因修复后
+    /// 移除 ignore。
+    #[ignore = "known stack overflow; tracked"]
     #[tokio::test(start_paused = true)]
     async fn receive_loop_retries_unavailable_manager_until_shutdown() {
         use std::sync::atomic::Ordering;
@@ -23578,6 +29647,109 @@ mod tests {
         assert_eq!(delay(20).as_secs(), 600);
     }
 
+    /// 评审阻塞项 2（映射面）：store 打开**终态**必须让证书维护任务停手，
+    /// 只有可重试失败（`StoreOpenError::Failed`）才继续按退避轮询。
+    ///
+    /// 以前的实现不看分类，一律 `failures += 1`，于是错 key/缺 key/库损坏
+    /// 的账号会按 60s→600s **无限重开磁盘**——固定 stderr 行说「终态」，
+    /// 后台任务却在推翻它。
+    #[test]
+    fn certificate_tick_terminal_store_open_stops_the_task() {
+        let mut maintenance = CertificateMaintenance::new();
+        for terminal in [
+            StoreOpenError::CipherUnavailable,
+            StoreOpenError::KeyInvalid,
+            StoreOpenError::KeyRequired,
+            StoreOpenError::KeyRejected,
+            StoreOpenError::Corrupt(store_open::CorruptDetail::Unreadable),
+            StoreOpenError::Corrupt(store_open::CorruptDetail::Truncated),
+            StoreOpenError::Corrupt(store_open::CorruptDetail::Malformed),
+            StoreOpenError::PlaintextRequiresMigration,
+        ] {
+            assert_eq!(
+                note_cert_store_open_failure(&mut maintenance, terminal),
+                CertTickOutcome::StoreTerminal,
+                "{} 是终态，维护任务必须停",
+                terminal.code()
+            );
+            assert_eq!(maintenance.failures, 0, "终态不进退避记账");
+        }
+        assert_eq!(
+            note_cert_store_open_failure(&mut maintenance, StoreOpenError::Failed),
+            CertTickOutcome::Continue,
+            "权限/EIO 这类可重试失败照旧轮询"
+        );
+        assert_eq!(maintenance.failures, 1, "可重试失败记一次退避");
+    }
+
+    /// 评审阻塞项 2（行为面）：终态下维护任务**只碰一次盘**就收口，绝不
+    /// 再按 60s→600s 重开。
+    #[tokio::test(start_paused = true)]
+    async fn certificate_maintenance_loop_stops_after_terminal_store_open() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let opens = Rc::new(Cell::new(0_u32));
+        let counted = Rc::clone(&opens);
+        let (_tx, rx) = watch::channel(false);
+        let mut task = Box::pin(certificate_maintenance_loop(
+            PathBuf::from("/nonexistent/account"),
+            rx,
+            move |_dir| {
+                counted.set(counted.get() + 1);
+                async { Err(StoreOpenError::KeyRejected) }
+            },
+        ));
+
+        // 与生产同序：先等一个轮询间隔，再开库检查。
+        assert!(futures::poll!(task.as_mut()).is_pending());
+        tokio::time::advance(CERT_CHECK_INTERVAL).await;
+        match futures::poll!(task.as_mut()) {
+            std::task::Poll::Ready(exit) => assert_eq!(exit, CertTaskExit::StoreTerminal),
+            std::task::Poll::Pending => panic!("store 终态必须让证书维护任务收口"),
+        }
+        assert_eq!(opens.get(), 1, "终态只碰一次盘，不再重开");
+    }
+
+    /// 评审阻塞项 2（对照面）：可重试失败不终止任务——按 600s→60s→120s
+    /// 的既有退避继续轮询，停旗即收口。
+    #[tokio::test(start_paused = true)]
+    async fn certificate_maintenance_loop_keeps_retrying_transient_store_failures() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let opens = Rc::new(Cell::new(0_u32));
+        let counted = Rc::clone(&opens);
+        let (tx, rx) = watch::channel(false);
+        let mut task = Box::pin(certificate_maintenance_loop(
+            PathBuf::from("/nonexistent/account"),
+            rx,
+            move |_dir| {
+                counted.set(counted.get() + 1);
+                async { Err(StoreOpenError::Failed) }
+            },
+        ));
+
+        assert!(futures::poll!(task.as_mut()).is_pending());
+        tokio::time::advance(CERT_CHECK_INTERVAL).await;
+        assert!(
+            futures::poll!(task.as_mut()).is_pending(),
+            "可重试失败不得终止维护任务"
+        );
+        assert_eq!(opens.get(), 1);
+        // 失败后下一拍是 60s（1→16min 指数退避），不是又等 600s。
+        tokio::time::advance(CERT_FAILURE_BACKOFF).await;
+        assert!(futures::poll!(task.as_mut()).is_pending());
+        assert_eq!(opens.get(), 2, "可重试失败继续开库检查");
+
+        tx.send(true).expect("shutdown sent");
+        assert_eq!(
+            futures::poll!(task.as_mut()),
+            std::task::Poll::Ready(CertTaskExit::Shutdown)
+        );
+        assert_eq!(opens.get(), 2, "停旗后不再开库");
+    }
+
     /// identified 保险丝（止血批③，官方 Desktop identified fallback 同
     /// 语义）：证书获取失败（调用方映射 None）→ 无 unidentified access →
     /// MessageSender 走 identified 分支（sender.rs "sending identified"），
@@ -23621,6 +29793,38 @@ mod tests {
         assert_eq!(decoded.timestamp, Some(5));
     }
 
+    #[test]
+    fn connection_state_notification_reports_4401_without_unlink() {
+        let value = connection_state_notification("acct", "invalidated", Some(4401));
+        assert_eq!(value["method"], "connectionState");
+        assert_eq!(value["params"]["account"], "acct");
+        assert_eq!(value["params"]["state"], "invalidated");
+        assert_eq!(value["params"]["closeCode"], 4401);
+    }
+    #[test]
+    fn connection_close_classification_is_official() {
+        assert_eq!(
+            classify_connection_close(Some(1000)),
+            ConnectionClose::Normal
+        );
+        assert_eq!(
+            classify_connection_close(Some(4000)),
+            ConnectionClose::LocalHandover
+        );
+        assert_eq!(
+            classify_connection_close(Some(4409)),
+            ConnectionClose::ConnectedElsewhere
+        );
+        assert_eq!(
+            classify_connection_close(Some(4401)),
+            ConnectionClose::Invalidated
+        );
+        assert_eq!(
+            classify_connection_close(Some(1006)),
+            ConnectionClose::Reconnect
+        );
+        assert_eq!(classify_connection_close(None), ConnectionClose::Reconnect);
+    }
     /// B4 Unbound 停环：建流错误归型——Unauthorized 两层归型面（直接
     /// ServiceError 与 sender 再包层）判 Unbound；404 NotFound / 其他
     /// presage 错误不误报（维持退避重连，send_error_of 同纪律）。
@@ -25769,5 +31973,585 @@ mod tests {
             started.elapsed() >= Duration::from_millis(50),
             "gate must wait the full budget before releasing"
         );
+    }
+
+    // —— M5：附件上行计划（decode 前形状/条数/字节上界）——
+
+    #[test]
+    fn attachment_plan_keeps_32_entry_cap_and_predecode_byte_upper_bound() {
+        let small = "data:image/png;base64,aGVsbG8=";
+        let entries =
+            |count: usize| -> Vec<String> { (0..count).map(|_| small.to_owned()).collect() };
+
+        let full_batch = entries(32);
+        let (plan, image_index) =
+            attachment_upload_plan(&full_batch, None).expect("32 entries allowed");
+        assert_eq!(plan.len(), 32);
+        assert_eq!(image_index, None);
+        // 预留口径 = payload 长度（decode 前上界），不是解码后长度。
+        let reserved: u64 = plan
+            .iter()
+            .map(|(_, meta)| meta.decoded_upper_bound())
+            .sum();
+        assert_eq!(reserved, 32 * "aGVsbG8=".len() as u64);
+
+        let too_many = entries(33);
+        assert!(
+            attachment_upload_plan(&too_many, None).is_err(),
+            "33 entries must fail closed"
+        );
+
+        let single = entries(1);
+        let (with_preview, index) =
+            attachment_upload_plan(&single, Some(small)).expect("preview joins the plan");
+        assert_eq!(with_preview.len(), 2);
+        assert_eq!(index, Some(1));
+
+        // 单条 100MB 帽的 decode 前带宽判定（小数字钉边界，不分配
+        // 100MB 字符串）：16 字节 payload 解码下界 12 字节不超 10+2；
+        // 20 字节 payload 解码下界 15 字节 > 12 → 确定超限。
+        assert!(!payload_exceeds_decoded_cap(16, 10));
+        assert!(payload_exceeds_decoded_cap(20, 10));
+        // 100MB 附件的 base64 payload（约 133,333,336 B）必须不被误拒。
+        assert!(!payload_exceeds_decoded_cap(
+            133_333_336,
+            ATTACHMENT_MAX_BYTES
+        ));
+        assert!(payload_exceeds_decoded_cap(
+            133_333_340,
+            ATTACHMENT_MAX_BYTES
+        ));
+
+        // 全局闸对“整批计划总量超预算”的拒绝在 decode 前发生：320MiB
+        // 预算下 32 × 16MiB payload 上界（512MiB）直接被拒。
+        let gate = attachment_gate::AttachmentGate::new(
+            attachment_gate::MAX_CONCURRENT_UPLOADS,
+            attachment_gate::GLOBAL_BYTE_BUDGET,
+        );
+        let reserved_over = 32 * 16 * 1024 * 1024u64;
+        assert!(reserved_over > attachment_gate::GLOBAL_BYTE_BUDGET);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            assert!(matches!(
+                gate.acquire(reserved_over).await,
+                Err(SendError::AttachmentBudgetExceeded)
+            ));
+        });
+    }
+
+    /// BUG-6 缓存命中面：同账号连续两次 storage 调用只 open_store 一次，
+    /// 第二次拿到同一目录/同一 device_id；跨账号各开各的（不串号）。
+    #[tokio::test]
+    async fn storage_context_cache_reuses_store_across_calls() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-cache-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006001";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-cache-a",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-cache-a".to_owned()))
+            .expect("add account");
+
+        let first = storage_context(&service, account).await.expect("first");
+        let second = storage_context(&service, account).await.expect("second");
+        assert_eq!(
+            service.storage_contexts.open_count(),
+            1,
+            "缓存命中：第二次不得再 open_store"
+        );
+        assert_eq!(service.storage_contexts.cached_len().await, 1);
+        assert_eq!(first.account_dir, second.account_dir);
+        assert_eq!(first.device_id, second.device_id);
+
+        // 跨账号隔离：第二条账号独立开库，互不复用。
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-cache-b",
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(
+                "+15550006002".to_owned(),
+                Some("accounts/bug6-cache-b".to_owned()),
+            )
+            .expect("add second account");
+        let other = storage_context(&service, "+15550006002")
+            .await
+            .expect("other");
+        assert_eq!(other.account_dir, data_dir.join("accounts/bug6-cache-b"));
+        assert_eq!(service.storage_contexts.open_count(), 2, "每账号各开一次");
+        assert_eq!(service.storage_contexts.cached_len().await, 2);
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// BUG-6 解绑失效面：deleteAccount 摘除缓存条目（目录删除前句柄已放），
+    /// 删除后再调 storage 只能答 UnknownAccount，且不得再开库。
+    #[tokio::test]
+    async fn delete_account_invalidates_storage_context_cache() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-cache-del-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006011";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-del",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-del".to_owned()))
+            .expect("add account");
+
+        let cached = storage_context(&service, account).await.expect("cached");
+        assert_eq!(service.storage_contexts.cached_len().await, 1);
+        drop(cached);
+
+        let removed = service.delete_account(account).await.expect("delete");
+        assert!(removed);
+        assert_eq!(
+            service.storage_contexts.cached_len().await,
+            0,
+            "解绑后缓存条目必须移除"
+        );
+        assert!(matches!(
+            storage_context(&service, account).await,
+            Err(storage_sync::StorageSyncError::UnknownAccount)
+        ));
+        assert_eq!(
+            service.storage_contexts.cached_len().await,
+            0,
+            "未知账号不得重建条目"
+        );
+        assert_eq!(
+            service.storage_contexts.open_count(),
+            1,
+            "删除路径不得再开库"
+        );
+        assert!(
+            !data_dir.join("accounts/bug6-del").exists(),
+            "缓存句柄先摘，目录已删除"
+        );
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// BUG-6 并发单飞面：两个并发 storage 调用同时未命中时，OnceCell 只让
+    /// 一个执行 open_store，另一个等同一结果（缓存锁不跨 await 持锁）。
+    #[tokio::test]
+    async fn concurrent_storage_context_calls_open_store_once() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let data_dir = std::env::temp_dir().join(format!(
+                    "kt-engine-storage-cache-conc-{:016x}",
+                    mix_seed_step(mix_seed())
+                ));
+                let _ = std::fs::remove_dir_all(&data_dir);
+                let state = Arc::new(AsyncMutex::new(
+                    EngineState::load(&data_dir).expect("state"),
+                ));
+                let (outbound, _rx) = outbound::test_hub();
+                let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+                let account = "+15550006021";
+                seed_store_with_aci(
+                    &data_dir,
+                    "accounts/bug6-conc",
+                    "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                )
+                .await;
+                state
+                    .lock()
+                    .await
+                    .add_account(account.to_owned(), Some("accounts/bug6-conc".to_owned()))
+                    .expect("add account");
+
+                let first_service = Arc::clone(&service);
+                let first_account = account.to_owned();
+                let first = tokio::task::spawn_local(async move {
+                    storage_context(&first_service, &first_account).await
+                });
+                // 让第一个调用推进到 open_store 的 await 点，第二个再到达。
+                tokio::task::yield_now().await;
+                let second_service = Arc::clone(&service);
+                let second_account = account.to_owned();
+                let second = tokio::task::spawn_local(async move {
+                    storage_context(&second_service, &second_account).await
+                });
+                let first = first.await.expect("first task").expect("first context");
+                let second = second.await.expect("second task").expect("second context");
+                assert_eq!(
+                    service.storage_contexts.open_count(),
+                    1,
+                    "并发单飞：只允许一次 open_store"
+                );
+                assert_eq!(first.account_dir, second.account_dir);
+                assert_eq!(service.storage_contexts.cached_len().await, 1);
+
+                drop(service);
+                let _ = std::fs::remove_dir_all(&data_dir);
+            })
+            .await;
+    }
+
+    /// BUG-6 换绑失效面：同号重链换新 store 目录（目录指纹变化）→ 旧上下文
+    /// 作废，下次 storage 调用按新目录重建（旧库句柄释放）。
+    #[tokio::test]
+    async fn storage_context_rebuilds_after_account_dir_change() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-cache-relink-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006031";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-old",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-old".to_owned()))
+            .expect("add account");
+        let old = storage_context(&service, account)
+            .await
+            .expect("old context");
+        let old_dir = old.account_dir.clone();
+        assert_eq!(old_dir, data_dir.join("accounts/bug6-old"));
+        assert_eq!(service.storage_contexts.open_count(), 1);
+        drop(old);
+
+        // 同号重链：注册表目录换成新链接的 store（旧目录句柄必须释放）。
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-new",
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-new".to_owned()))
+            .expect("relink account");
+        let new = storage_context(&service, account)
+            .await
+            .expect("new context");
+        assert_eq!(new.account_dir, data_dir.join("accounts/bug6-new"));
+        assert_ne!(new.account_dir, old_dir);
+        assert_eq!(
+            service.storage_contexts.open_count(),
+            2,
+            "目录指纹变化必须重建上下文"
+        );
+        assert_eq!(
+            service.storage_contexts.cached_len().await,
+            1,
+            "同号仍只一条"
+        );
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// BUG-6 收尾（用户验收）：缓存命中后 sticker/folders/pinned 三连查
+    /// 全部为进程内 clone——warm p95 < 50ms（真机 before 见台账：
+    /// 贴纸 1307~3627ms / 文件夹 1439~3249ms / 置顶 1416~2888ms）。
+    /// 通过写穿/种子投影构造「已 warm」状态，逐次量三条 RPC 的耗时。
+    #[tokio::test]
+    async fn storage_record_cache_warm_three_queries_p95_under_50ms() {
+        fn percentile(samples: &[Duration], percent: usize) -> Duration {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            sorted[(sorted.len() * percent / 100).min(sorted.len() - 1)]
+        }
+        fn p95(samples: &[Duration]) -> Duration {
+            percentile(samples, 95)
+        }
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-record-cache-p95-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006041";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-record-p95",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(
+                account.to_owned(),
+                Some("accounts/bug6-record-p95".to_owned()),
+            )
+            .expect("add account");
+
+        // warm 前置：写穿/水合面已把三条投影落进账号缓存（生产由首轮读或
+        // 写面完成；测试直接种子，避免网络面）。
+        let context = storage_context(&service, account).await.expect("context");
+        let seeded_at = now_ms();
+        context.records.store_pinned(
+            seeded_at,
+            vec![storage_sync::PinnedEntry {
+                id: None,
+                raw: Default::default(),
+            }],
+        );
+        context.records.store_records(
+            storage_sync::StorageRecordKind::ChatFolder,
+            seeded_at,
+            vec![serde_json::json!({ "id": "folder-1", "name": "工作" })],
+        );
+        context.records.store_sticker_packs(
+            seeded_at,
+            vec![storage_sticker::StickerPackSync {
+                pack_id: vec![0xab; 16],
+                pack_key: Some(vec![0xcd; 32]),
+                position: Some(1),
+                deleted_at_timestamp_ms: None,
+            }],
+        );
+        assert_eq!(context.records.cached_slots(), 3);
+
+        const ROUNDS: usize = 200;
+        let mut sticker = Vec::with_capacity(ROUNDS);
+        let mut folders = Vec::with_capacity(ROUNDS);
+        let mut pinned = Vec::with_capacity(ROUNDS);
+        let mut three = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            let started = Instant::now();
+            let started_sticker = Instant::now();
+            let packs = service.sticker_pack_syncs(account).await.expect("packs");
+            sticker.push(started_sticker.elapsed());
+            assert_eq!(packs.len(), 1);
+            let started_folders = Instant::now();
+            let folder_rows = service.chat_folders(account).await.expect("folders");
+            folders.push(started_folders.elapsed());
+            assert_eq!(folder_rows.len(), 1);
+            let started_pinned = Instant::now();
+            let pinned_rows = service.pinned_conversations(account).await.expect("pinned");
+            pinned.push(started_pinned.elapsed());
+            assert_eq!(pinned_rows.len(), 1);
+            three.push(started.elapsed());
+        }
+
+        let limit = Duration::from_millis(50);
+        // BUG-6 台账取证：warm 三连查分位（--nocapture 时可见）。
+        println!(
+            "BUG-6 warm p50/p95: sticker {:?}/{:?}, folders {:?}/{:?}, pinned {:?}/{:?}, three-query {:?}/{:?}",
+            percentile(&sticker, 50),
+            p95(&sticker),
+            percentile(&folders, 50),
+            p95(&folders),
+            percentile(&pinned, 50),
+            p95(&pinned),
+            percentile(&three, 50),
+            p95(&three)
+        );
+        assert!(
+            p95(&sticker) < limit,
+            "getStickerPackSyncs warm p95 {:?}",
+            p95(&sticker)
+        );
+        assert!(
+            p95(&folders) < limit,
+            "chatFolders.list warm p95 {:?}",
+            p95(&folders)
+        );
+        assert!(
+            p95(&pinned) < limit,
+            "getPinnedConversations warm p95 {:?}",
+            p95(&pinned)
+        );
+        assert_eq!(context.records.fills(), 0, "warm 三连查全部命中，不得回源");
+        assert_eq!(
+            context.records.hits(),
+            (ROUNDS * 3) as u64,
+            "每轮三条查询各命中一次"
+        );
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// BUG-6 收尾（用户护栏 2）：storage-pull-settled 是记录缓存的唯一事件
+    /// 失效点——manifest 拉取落定调用的 invalidate_records 必须清空贴纸/
+    /// 文件夹/置顶三槽（下一轮读懒回源，不在事件里主动预取）。
+    #[tokio::test]
+    async fn storage_pull_settled_invalidates_storage_record_cache() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-record-cache-pull-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006051";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-record-pull",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(
+                account.to_owned(),
+                Some("accounts/bug6-record-pull".to_owned()),
+            )
+            .expect("add account");
+
+        let context = storage_context(&service, account).await.expect("context");
+        let at = now_ms();
+        context.records.store_pinned(
+            at,
+            vec![storage_sync::PinnedEntry {
+                id: None,
+                raw: Default::default(),
+            }],
+        );
+        context.records.store_records(
+            storage_sync::StorageRecordKind::ChatFolder,
+            at,
+            vec![serde_json::json!({ "id": "folder-1" })],
+        );
+        context.records.store_sticker_packs(
+            at,
+            vec![storage_sticker::StickerPackSync {
+                pack_id: vec![0xab; 16],
+                pack_key: Some(vec![0xcd; 32]),
+                position: Some(1),
+                deleted_at_timestamp_ms: None,
+            }],
+        );
+        assert_eq!(context.records.cached_slots(), 3);
+
+        // pull_storage_manifest 落定路径调用同一入口（此处直接调用以避开
+        // 网络面；生产单点在 pull_storage_manifest 内）。
+        service.storage_contexts.invalidate_records(account).await;
+        assert_eq!(
+            context.records.cached_slots(),
+            0,
+            "storage-pull-settled 必须清空贴纸/文件夹/置顶三槽"
+        );
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// BUG-6 收尾（用户护栏 1）：换号/同号重链 = 新 store 目录 → 新记录
+    /// 缓存（旧条目随旧上下文不可达）；同账号不同目录不得复用旧 A 的数据。
+    #[tokio::test]
+    async fn account_dir_change_evicts_storage_record_cache() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-record-cache-relink-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006061";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-rec-old",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-rec-old".to_owned()))
+            .expect("add account");
+        let old = storage_context(&service, account).await.expect("old");
+        old.records.store_sticker_packs(
+            now_ms(),
+            vec![storage_sticker::StickerPackSync {
+                pack_id: vec![0xaa; 16],
+                pack_key: Some(vec![0xbb; 32]),
+                position: Some(1),
+                deleted_at_timestamp_ms: None,
+            }],
+        );
+        assert_eq!(old.records.cached_slots(), 1);
+
+        // 同号重链：目录指纹变化 → 全新记录缓存（旧 A 的包列表不可达）。
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/bug6-rec-new",
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/bug6-rec-new".to_owned()))
+            .expect("relink account");
+        let new = storage_context(&service, account).await.expect("new");
+        assert_eq!(new.account_dir, data_dir.join("accounts/bug6-rec-new"));
+        assert_eq!(
+            new.records.cached_slots(),
+            0,
+            "换号/重链后不得复用旧账号的记录缓存"
+        );
+        assert_eq!(new.records.fills(), 0);
+
+        // 失效入口只作用于新上下文（旧 Arc 已不可达）。
+        service.storage_contexts.invalidate_records(account).await;
+        assert_eq!(new.records.cached_slots(), 0);
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

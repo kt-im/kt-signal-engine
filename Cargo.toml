@@ -1,14 +1,32 @@
 [package]
 name = "kt-signal-engine"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "AGPL-3.0-only"
 publish = false
 description = "KT Signal protocol engine sidecar (libsignal-based, AGPL-3.0)"
 
+[features]
+# M6 P0 store 静态加密**能力门禁**（设计：docs/plan/engine-store-encryption.md
+# §2.1 / §7 P0）：本仓唯一 feature，**必须默认开**——`PRAGMA key` 在纯
+# SQLite 上是静默 no-op，漏开就会「代码在跑、测试全绿、库还是明文」（该文档
+# 失败模式 F5）。
+#
+# 这个 feature 现在**只是门**（空 feature，不转发任何依赖特性）：SQLCipher 的
+# 链接改由下方按目标的 `[target.*.dependencies]` 决定。旧写法
+# `sqlcipher = ["libsqlite3-sys/bundled-sqlcipher"]` 在 Windows 上必炸——
+# libsqlite3-sys 0.36 build.rs:171-173 在 windows + `bundled-sqlcipher` +
+# 非 `bundled-sqlcipher-vendored-openssl` 且找不到 OPENSSL_DIR 时直接 panic。
+# 编译期兜底 = src/main.rs 顶部 `compile_error!`（`--no-default-features`
+# 直接编译失败）；运行时兜底 = src/store_cipher.rs + open_store。
+default = ["sqlcipher"]
+sqlcipher = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# E: same sqlx line as vendored presage-store-sqlite (SQLCipher bundled there).
+sqlx = { version = "0.9.0", features = ["json", "sqlite", "runtime-tokio"] }
 
 # presage 全家桶按 rev 钉定（ADR 0003：服务层 = presage + libsignal-service，
 # 传递钉 libsignal tag v0.99.0）。许可：两者均 AGPL-3.0-only，与本仓一致。
@@ -27,10 +45,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 base64 = "0.22"
 url = "2.5"
-
-# store 的 sqlite 后端走 bundled 纯 sqlite（无系统依赖、无 sqlcipher/openssl）；
-# 版本以 Cargo.lock 实际解析的 sqlx 同版为准，特性经由全图归一生效。
-libsqlite3-sys = { version = "0.36", features = ["bundled"] }
 
 # 出口代理：libsignal-service 的 HTTP/WS 传输就是 reqwest（缺省读系统/环境变量
 # 代理），本仓显式引入只为把 `socks` feature 并入全图——使 ALL_PROXY=socks5://…
@@ -140,6 +154,30 @@ usernames = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", d
 # 姿态发裸附件（覆盖矩阵见 docs/jsonrpc-compat.md §5 同日批）。
 ogg = "0.9"
 opus-decoder = "0.1"
+
+# store 的 sqlite 后端（SQLCipher）：**按目标**声明，feature 全图归一，
+# 一条声明会把某个平台带进 libsqlite3-sys build.rs 的 panic 分支。两段都
+# 隐含 `bundled`（libsqlite3-sys 0.36 Cargo.toml:46-50），版本以 Cargo.lock
+# 实际解析的 sqlx 同版为准（sqlx-sqlite 传递同版，`links = "sqlite3"` 全图
+# 只能有一个包，特性在这里归一）。
+
+# 非 Windows（macOS / Linux）：bundled SQLite + SQLCipher，crypto 走平台
+# 自带实现——macOS 是 CommonCrypto（-DSQLCIPHER_CRYPTO_CC + Security/
+# CoreFoundation，build.rs:220-223），**不引 OpenSSL**，产物与换 feature 前
+# 一致；Linux 走系统 `libcrypto`（release matrix 无 Linux，仅编译面）。
+[target.'cfg(not(windows))'.dependencies]
+libsqlite3-sys = { version = "0.36", features = ["bundled", "bundled-sqlcipher"] }
+
+# Windows 专用（`cfg(windows)` 分支，只在 x86_64-pc-windows-msvc 上生效）：
+# MSVC 没有 CommonCrypto，单用 `bundled-sqlcipher` 会让 build.rs 在
+# `is_windows && !bundled-sqlcipher-vendored-openssl` 分支 panic
+# （"Missing environment variable OPENSSL_DIR"，build.rs:171-173），所以这里
+# **必须**是 vendored OpenSSL：`openssl-sys`/`openssl-src` 作为 build-time
+# 依赖入图、静态链进产物，Windows runner 需要 Perl + CMake。依赖报备（用途/
+# 许可/代价）见 docs/plan/engine-store-encryption.md §2.1 与 §7 P0
+# 「Windows 依赖报备（AGENTS.md：依赖最小化）」。
+[target.'cfg(windows)'.dependencies]
+libsqlite3-sys = { version = "0.36", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [dev-dependencies]
 # 接收重连/维护超时单测用 paused 时钟（tokio test-util；仅测试编译面合并，

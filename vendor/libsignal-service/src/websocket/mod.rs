@@ -12,12 +12,13 @@ use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use reqwest::Method;
-use reqwest_websocket::{CloseCode, Message as WsMessage, WebSocket};
+use reqwest_websocket::{CloseCode, WebSocket};
 use tokio::sync::Notify;
-use tokio::time::{timeout, Instant};
+use tokio::time::Instant;
 use tracing::debug;
 
 use crate::configuration::SignalServers;
+use crate::messagepipe::{FrameLatencySampler, WsFrameStamp};
 use crate::prelude::PushService;
 use crate::proto::{
     web_socket_message, WebSocketMessage, WebSocketRequestMessage,
@@ -150,7 +151,7 @@ enum KeepAliveSendOutcome {
 
 /// Why a frame write did not complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WsWriteError {
+pub(crate) enum WsWriteError {
     Failed,
     TimedOut,
 }
@@ -222,9 +223,16 @@ impl KeepAliveState {
 
 pub use request::WebSocketRequestMessageBuilder;
 
+#[cfg(feature = "cdsi")]
+pub mod chat_adapter;
+
+#[cfg(feature = "cdsi")]
+pub mod link;
+
 type RequestStreamItem = (
     WebSocketRequestMessage,
     oneshot::Sender<WebSocketResponseMessage>,
+    WsFrameStamp,
 );
 
 pub struct SignalRequestStream {
@@ -270,6 +278,8 @@ pub struct SignalWebSocket<C: WebSocketType> {
         oneshot::Sender<Result<WebSocketResponseMessage, ServiceError>>,
     )>,
     kill: Arc<Notify>,
+    /// Instance id for correlating inbound-frame logs with the owning socket.
+    socket_id: u32,
 }
 
 // Manual impl (no `C: Clone` bound): every field is cloneable for any `C`.
@@ -282,8 +292,28 @@ impl<C: WebSocketType> Clone for SignalWebSocket<C> {
             inner: Arc::clone(&self.inner),
             request_sink: self.request_sink.clone(),
             kill: Arc::clone(&self.kill),
+            socket_id: self.socket_id,
         }
     }
+}
+
+/// Monotonic id handed to each socket facade so frame logs name their owner.
+fn next_socket_id() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Read-only latency evidence: one line per sampled inbound frame.
+fn log_frame_received(socket_id: u32, stamp: &WsFrameStamp) {
+    tracing::warn!(
+        target: "engine.latency",
+        stage = "ws_frame_received",
+        socket_id,
+        seq = stamp.seq(),
+        frame_bytes = stamp.frame_bytes(),
+        "websocket frame received"
+    );
 }
 
 struct SignalWebSocketInner {
@@ -294,6 +324,7 @@ struct SignalWebSocketInner {
 }
 
 struct SignalWebSocketProcess {
+    socket_id: u32,
     /// Whether to enable keep-alive or not (and send a request to this path)
     keep_alive_path: String,
 
@@ -319,11 +350,14 @@ struct SignalWebSocketProcess {
     /// Keepalive cadence/response deadlines and the last successful response.
     keepalive: KeepAliveState,
 
+    /// Read-only frame-received sampling for the latency probe.
+    latency: FrameLatencySampler,
+
     outgoing_responses: FuturesUnordered<
         BoxFuture<'static, Result<WebSocketResponseMessage, Canceled>>,
     >,
 
-    ws: WebSocket,
+    link: crate::websocket::link::WsLink,
 
     // KT (single-connection): shared facade state (close-code bookkeeping)
     // and the termination signal for the kill-before-create handover.
@@ -335,9 +369,29 @@ impl SignalWebSocketProcess {
     async fn process_frame(
         &mut self,
         frame: Bytes,
+        frame_stamp: WsFrameStamp,
     ) -> Result<(), ServiceError> {
         use prost::Message;
-        let msg = WebSocketMessage::decode(frame)?;
+        tracing::warn!(
+            target: "signal.pipe",
+            stage = "process_frame_enter",
+            seq = frame_stamp.seq(),
+            frame_bytes = frame_stamp.frame_bytes(),
+            "process_frame entered"
+        );
+        let msg = match WebSocketMessage::decode(frame) {
+            Ok(msg) => msg,
+            Err(error) => {
+                tracing::warn!(
+                    target: "signal.pipe",
+                    stage = "decode_failed",
+                    seq = frame_stamp.seq(),
+                    error = %error,
+                    "websocket frame failed to decode"
+                );
+                return Err(error.into());
+            }
+        };
         if let Some(request) = &msg.request {
             tracing::trace!(
                 msg_type =? msg.r#type(),
@@ -363,6 +417,16 @@ impl SignalWebSocketProcess {
         }
 
         use web_socket_message::Type;
+        tracing::warn!(
+            target: "signal.pipe",
+            stage = "frame_branch",
+            seq = frame_stamp.seq(),
+            frame_bytes = frame_stamp.frame_bytes(),
+            kind = ?msg.r#type(),
+            has_request = msg.request.is_some(),
+            has_response = msg.response.is_some(),
+            "frame classified"
+        );
         match (msg.r#type(), msg.request, msg.response) {
             (Type::Unknown, _, _) => Err(ServiceError::InvalidFrame {
                 reason: "unknown frame type",
@@ -370,11 +434,20 @@ impl SignalWebSocketProcess {
             (Type::Request, Some(request), _) => {
                 let (sink, recv) = oneshot::channel();
                 tracing::trace!("sending request with body");
-                self.request_sink.send((request, sink)).await.map_err(
-                    |_| ServiceError::WsClosing {
+                self.request_sink
+                    .send((request, sink, frame_stamp.clone()))
+                    .await
+                    .map_err(|_| ServiceError::WsClosing {
                         reason: "request handler failed",
-                    },
-                )?;
+                    })?;
+                tracing::warn!(
+                    target: "signal.pipe",
+                    stage = "request_stream_sent",
+                    socket_id = self.socket_id,
+                    seq = frame_stamp.seq(),
+                    frame_bytes = frame_stamp.frame_bytes(),
+                    "frame pushed to request stream"
+                );
                 self.outgoing_responses.push(Box::pin(recv));
 
                 Ok(())
@@ -456,20 +529,13 @@ impl SignalWebSocketProcess {
         message: WebSocketMessage,
         stage: &'static str,
     ) -> Result<(), WsWriteError> {
-        use prost::Message;
-        let buffer = message.encode_to_vec();
-        match timeout(
-            SEND_TIMEOUT,
-            self.ws.send(WsMessage::Binary(buffer.into())),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                tracing::warn!(stage, %error, "websocket frame write failed");
+        match self.link.send_frame(message, SEND_TIMEOUT).await {
+            Ok(()) => Ok(()),
+            Err(WsWriteError::Failed) => {
+                tracing::warn!(stage, "websocket frame write failed");
                 Err(WsWriteError::Failed)
             },
-            Err(_) => {
+            Err(WsWriteError::TimedOut) => {
                 tracing::warn!(stage, "websocket frame write timed out");
                 Err(WsWriteError::TimedOut)
             },
@@ -489,17 +555,13 @@ impl SignalWebSocketProcess {
         // `WebSocket::close` consumes the socket, so send the official 3001
         // close frame through the sink and then close it; both steps are
         // bounded so a dead transport cannot wedge this task.
-        let _ = timeout(CLOSE_TIMEOUT, async {
-            let _ = self
-                .ws
-                .send(WsMessage::Close {
-                    code: CloseCode::Library(CLOSE_CODE_TIMEOUT),
-                    reason: reason.to_owned(),
-                })
-                .await;
-            let _ = futures::SinkExt::close(&mut self.ws).await;
-        })
-        .await;
+        self.link
+            .close(
+                CloseCode::Library(CLOSE_CODE_TIMEOUT),
+                reason,
+                CLOSE_TIMEOUT,
+            )
+            .await;
         self.keepalive.in_flight = None;
         self.outgoing_requests.clear();
     }
@@ -612,47 +674,46 @@ impl SignalWebSocketProcess {
                     // not reconnect a link that a newer local dial replaced.
                     self.shared.lock().unwrap().last_close_code =
                         Some(CLOSE_CODE_LOCAL_HANDOVER);
-                    let _ = timeout(
-                        CLOSE_TIMEOUT,
-                        self.ws.send(WsMessage::Close {
-                            code: CloseCode::Away,
-                            reason: String::new(),
-                        }),
-                    )
-                    .await;
+                    self.link
+                        .close(CloseCode::Away, "", CLOSE_TIMEOUT)
+                        .await;
                     self.outgoing_requests.clear();
                     break;
                 }
                 // Incoming websocket message
-                web_socket_item = self.ws.next().fuse() => {
-                    use reqwest_websocket::Message;
-                    match web_socket_item {
-                        Some(Ok(Message::Close { code, reason })) => {
-                            let code = u16::from(code);
-                            tracing::warn!(%code, reason, "websocket closed");
-                            if code == CLOSE_CODE_CONNECTED_ELSEWHERE {
+                event = self.link.next_event().fuse() => {
+                    use crate::websocket::link::WsEvent;
+                    match event {
+                        WsEvent::Closed(code) => {
+                            tracing::warn!(?code, "websocket closed");
+                            if code == Some(CLOSE_CODE_CONNECTED_ELSEWHERE) {
                                 tracing::warn!("websocket closed with 4409 (connected elsewhere): another client took over this device connection"); // KT (single-connection)
                             }
-                            self.shared.lock().unwrap().last_close_code = Some(code);
+                            self.shared.lock().unwrap().last_close_code = code;
                             break;
                         },
-                        Some(Ok(Message::Binary(frame))) => {
-                            self.process_frame(frame).await?;
+                        WsEvent::Frame(frame, frame_stamp) => {
+                            if self
+                                .latency
+                                .should_log_received(std::time::Instant::now())
+                            {
+                                log_frame_received(self.socket_id, &frame_stamp);
+                            }
+                            if let Err(error) = self.process_frame(frame, frame_stamp).await {
+                                tracing::warn!(
+                                    target: "signal.pipe",
+                                    stage = "process_frame_failed",
+                                    seq = frame_stamp.seq(),
+                                    error = %error,
+                                    "process loop exiting on frame error"
+                                );
+                                return Err(error);
+                            }
                         }
-                        Some(Ok(Message::Ping(_))) => {
-                            tracing::trace!("received ping");
+                        WsEvent::Chat(_) => {
+                            tracing::warn!("official chat event reached legacy process; ignoring");
                         }
-                        Some(Ok(Message::Pong(_))) => {
-                            tracing::trace!("received pong");
-                        }
-                        Some(Ok(Message::Text(_))) => {
-                            tracing::trace!("received text (unsupported, skipping)");
-                        }
-                        Some(Err(e)) => {
-                            tracing::warn!(%e, "websocket read failed; link is dead");
-                            return Err(e.into());
-                        }
-                        None => {
+                        WsEvent::End => {
                             tracing::warn!("websocket stream ended; link is dead");
                             return Err(ServiceError::WsClosing {
                                 reason: "end of web request stream; socket closing"
@@ -713,12 +774,22 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         }));
         let kill = Arc::new(Notify::new());
 
+        let socket_id = next_socket_id();
+        tracing::warn!(
+            target: "signal.pipe",
+            stage = "ws_instance",
+            socket_id,
+            kind = "legacy",
+            "websocket facade created"
+        );
         let process = SignalWebSocketProcess {
+            socket_id,
             keep_alive_path,
             requests: outgoing_requests,
             request_sink: incoming_request_sink,
             outgoing_requests: HashMap::default(),
             keepalive: KeepAliveState::new(Instant::now()),
+            latency: FrameLatencySampler::new(),
             // Initializing the FuturesUnordered with a `pending` future means it will never fuse
             // itself, so an "empty" FuturesUnordered will still allow new futures to be added.
             outgoing_responses: vec![
@@ -726,7 +797,7 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             ]
             .into_iter()
             .collect(),
-            ws,
+            link: crate::websocket::link::WsLink::Legacy(ws),
             shared: Arc::clone(&inner),
             kill: Arc::clone(&kill),
         };
@@ -744,9 +815,61 @@ impl<C: WebSocketType> SignalWebSocket<C> {
                 unidentified_push_service,
                 inner,
                 kill,
+                socket_id,
             },
             process,
         )
+    }
+
+    /// Builds a facade backed by the official chat connection.
+    #[cfg(feature = "cdsi")]
+    pub fn new_official(
+        socket: crate::websocket::chat_adapter::OfficialSocket,
+        unidentified_push_service: PushService,
+    ) -> (Self, impl Future<Output = ()>) {
+        let (incoming_sink, incoming_stream) = mpsc::unbounded();
+        let (outgoing_sink, outgoing_requests) = mpsc::channel(1);
+        let inner = Arc::new(Mutex::new(SignalWebSocketInner {
+            stream: Some(SignalRequestStream {
+                inner: incoming_stream,
+            }),
+            last_close_code: None,
+        }));
+        let kill = Arc::new(Notify::new());
+
+        let socket_id = next_socket_id();
+        tracing::warn!(
+            target: "signal.pipe",
+            stage = "ws_instance",
+            socket_id,
+            kind = "official",
+            "websocket facade created"
+        );
+        let task = run_official(
+            socket,
+            outgoing_requests,
+            incoming_sink,
+            Arc::clone(&inner),
+            Arc::clone(&kill),
+            socket_id,
+        );
+
+        (
+            Self {
+                _type: PhantomData,
+                request_sink: outgoing_sink,
+                unidentified_push_service,
+                inner,
+                kill,
+                socket_id,
+            },
+            task,
+        )
+    }
+
+    /// Instance id of this socket facade, for log correlation.
+    pub fn socket_id(&self) -> u32 {
+        self.socket_id
     }
 
     pub fn servers(&self) -> SignalServers {
@@ -1023,5 +1146,118 @@ mod keepalive_tests {
         }
         assert!(!KeepAliveStep::Send.is_close());
         assert!(!KeepAliveStep::Wait.is_close());
+    }
+}
+
+#[cfg(feature = "cdsi")]
+async fn run_official(
+    mut socket: crate::websocket::chat_adapter::OfficialSocket,
+    mut requests: mpsc::Receiver<(
+        WebSocketRequestMessage,
+        oneshot::Sender<Result<WebSocketResponseMessage, ServiceError>>,
+    )>,
+    request_sink: mpsc::UnboundedSender<RequestStreamItem>,
+    shared: Arc<Mutex<SignalWebSocketInner>>,
+    kill: Arc<Notify>,
+    socket_id: u32,
+) {
+    use crate::websocket::chat_adapter::ChatEvent;
+
+    let chat = socket.chat();
+    let mut latency = FrameLatencySampler::new();
+    let mut acks: FuturesUnordered<BoxFuture<'static, ()>> =
+        std::iter::once(Box::pin(futures::future::pending()) as BoxFuture<'static, ()>)
+            .collect();
+
+    loop {
+        futures::select! {
+            _ = kill.notified().fuse() => {
+                shared.lock().unwrap().last_close_code =
+                    Some(CLOSE_CODE_LOCAL_HANDOVER);
+                socket.disconnect().await;
+                break;
+            }
+            request = requests.next() => {
+                match request {
+                    Some((request, responder)) => {
+                        let chat = Arc::clone(&chat);
+                        acks.push(Box::pin(async move {
+                            let response = chat
+                                .send(
+                                    match request.try_into() {
+                                        Ok(request) => request,
+                                        Err(_) => {
+                                            let _ = responder.send(Err(ServiceError::Timeout {
+                                                reason: "official chat request conversion failed",
+                                            }));
+                                            return;
+                                        }
+                                    },
+                                    REQUEST_RESPONSE_TIMEOUT,
+                                )
+                                .await
+                                .map_err(|_| ServiceError::Timeout {
+                                    reason: "official chat request failed",
+                                })
+                                .and_then(|response| response.try_into().map_err(|_| {
+                                    ServiceError::Timeout {
+                                        reason: "official chat response conversion failed",
+                                    }
+                                }));
+                            let _ = responder.send(response);
+                        }));
+                    }
+                    None => break,
+                }
+            }
+            event = socket.next().fuse() => {
+                match event {
+                    Some(ChatEvent::Incoming(incoming)) => {
+                        if latency
+                            .should_log_received(std::time::Instant::now())
+                        {
+                            log_frame_received(socket_id, &incoming.frame_stamp);
+                        }
+                        let (ack_tx, ack_rx) = oneshot::channel();
+                        let seq = incoming.frame_stamp.seq();
+                        if request_sink
+                            .unbounded_send((
+                                incoming.message,
+                                ack_tx,
+                                incoming.frame_stamp,
+                            ))
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        tracing::warn!(
+                            target: "signal.pipe",
+                            stage = "pipe_enqueued",
+                            socket_id,
+                            seq,
+                            "frame enqueued for the request stream"
+                        );
+                        let responder = incoming.responder;
+                        acks.push(Box::pin(async move {
+                            if let Ok(response) = ack_rx.await {
+                                let status = response
+                                    .status
+                                    .and_then(|status| u16::try_from(status).ok())
+                                    .and_then(|status| reqwest::StatusCode::from_u16(status).ok())
+                                    .unwrap_or(reqwest::StatusCode::OK);
+                                let _ = responder.send_response(status);
+                            }
+                        }));
+                    }
+                    Some(ChatEvent::Finished(code)) => {
+                        shared.lock().unwrap().last_close_code = code;
+                        break;
+                    }
+                    Some(ChatEvent::Other) => {}
+                    None => break,
+                }
+            }
+            _ = acks.next() => {}
+        }
     }
 }

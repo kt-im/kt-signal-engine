@@ -1,7 +1,7 @@
 # ADR 0004：P1b 链接流程——presage 公开入口 + finishLink 后改名
 
-状态：已采纳（P1b，替代已否决的 vendored provisioning 方案） ｜ 依据：ADR
-0002/0003、`docs/jsonrpc-compat.md` §1/§3
+状态：已采纳（P1b，替代已否决的 vendored provisioning 方案） ｜ 后续：ADR 0008
+（双槽轮换） ｜ 依据：ADR 0002/0003、`docs/jsonrpc-compat.md` §1/§3
 
 ## 背景
 
@@ -59,3 +59,11 @@ pub(crate)，provisioning WS 的消费面在 crate 外**无法**公共组装—�
 - 升级 presage pin 时需复核：link_secondary_device 形状、
   RegistrationData 字段、接收管线 set_account_attributes 行为
   （compat §5 与本 ADR 同步）。
+
+## 关联
+
+- **ADR 0008（链接双槽 QR 轮换）**：本 ADR 的会话模型是「一次 `startLink` 一个
+  provisioning 会话」，0008 把它推广为 attempt/双槽模型（attempt 级提交、每槽
+  独立 `PendingRecord`、live 上限 2、退休两级），wire 只增 `linkAttemptId` /
+  `slots` 两键。本 ADR 的协议面决策全部不变：presage 公开入口、finishLink 后
+  改名、占位名窗口、TOFU 信任、账号目录布局、发送管线。

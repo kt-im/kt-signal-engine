@@ -55,10 +55,18 @@ impl MessageReceiver {
             const MAX_DOWNLOAD_RETRIES: u8 = 3;
             let mut retries = 0;
 
+            let get_started = std::time::Instant::now();
             let mut stream = loop {
                 let r = self.service.get_attachment(blob).await;
                 match r {
-                    Ok(download) => break download.stream,
+                    Ok(download) => {
+                        tracing::warn!(
+                            stage = "contact_attachment_get",
+                            elapsed_ms = get_started.elapsed().as_millis() as u64,
+                            "contact attachment stream opened"
+                        );
+                        break download.stream;
+                    },
                     Err(ServiceError::Timeout { .. }) => {
                         tracing::warn!("get_attachment timed out, retrying");
                         retries += 1;
@@ -72,11 +80,18 @@ impl MessageReceiver {
                 }
             };
 
+            let read_started = std::time::Instant::now();
             let mut ciphertext = Vec::new();
             stream
                 .read_to_end(&mut ciphertext)
                 .await
                 .expect("streamed attachment");
+            tracing::warn!(
+                stage = "contact_attachment_read",
+                elapsed_ms = read_started.elapsed().as_millis() as u64,
+                bytes = ciphertext.len(),
+                "contact attachment body read"
+            );
 
             let key_material = blob.key();
             assert_eq!(
