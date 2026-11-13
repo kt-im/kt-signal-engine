@@ -666,6 +666,12 @@ const ATTACHMENT_MAX_COUNT: usize = 32;
 /// 单附件字节上限：官方桌面 100MB CDN 上限同源，超出 fail-closed。
 const ATTACHMENT_MAX_BYTES: usize = 100_000_000;
 
+/// 出向声明尺寸上限（BUG-11 wire 批）：一张图片/视频的像素边长上界，
+/// 与 connector `MAX_ATTACHMENT_DIMENSION_PX` 同值（16 384 = 现阶段任何
+/// 官方 Signal 客户端上传的最大纹理边）。超出按形状坏 fail-closed，绝不
+/// 把渲染面用不上的数字写进指针（connector 侧同名常量同轮）。
+pub(crate) const MAX_ATTACHMENT_DIMENSION_PX: u32 = 16_384;
+
 struct ParsedAttachment {
     spec: presage::libsignal_service::sender::AttachmentSpec,
     bytes: Vec<u8>,
@@ -673,6 +679,13 @@ struct ParsedAttachment {
     /// 不能走 spec 面；由 upload_attachments_for_send 在上传后按本位对返回
     /// 指针置 Flags.GIF（官方消息组装期置位同构，见 apply_outgoing_gif_flag）。
     is_gif: bool,
+    /// `;width=<px>;height=<px>` 出向声明尺寸（BUG-11 wire 批）：connector
+    /// 把桌面测量到的图片/视频自然尺寸带在上行 data URI 上，上传返回后按
+    /// GIF 旗标同款「指针后置位」写 AttachmentPointer.width/height（proto
+    /// 9/10 位，官方发送侧携带位）——接收投影 project_attachment_pointer
+    /// 同位读回，接收侧首帧即终态盒，桌面测量链降级为纯兜底。双参同进退：
+    /// 解析面半边在场即整条形状坏（见 parse_attachment_meta）。
+    dimensions: Option<(u32, u32)>,
 }
 
 /// 出向 GIF 旗标单点：官方 GIF 消息 = 普通附件 DataMessage.attachments[].flags
@@ -698,6 +711,52 @@ fn apply_outgoing_voice_metadata(
     pointer.audio_duration_seconds = Some(metadata.duration_seconds);
 }
 
+/// 上传返回指针的客户端陈述面（parsed 序对齐）：GIF 旗标、语音元数据、
+/// 声明尺寸三通道；None = 该条不带该陈述（普通文件/预览图/旧形状）。
+type OutgoingAttachmentFace = (
+    bool,
+    Option<voice_note::VoiceAudioMetadata>,
+    Option<(u32, u32)>,
+);
+
+/// 逐条置位上行走廊的客户端陈述（GIF/语音/尺寸三通道单点）：上传返回序
+/// 与 parsed 序一一对应（presage join_all 保序），任一通道缺省 = 该字段
+/// 不置位（旧形状逐字节不变）。三条通道各自独立字段，互不挤占。
+fn apply_outgoing_attachment_faces(
+    pointers: &mut [presage::proto::AttachmentPointer],
+    faces: &[OutgoingAttachmentFace],
+) {
+    for (pointer, (is_gif, voice_metadata, dimensions)) in pointers.iter_mut().zip(faces) {
+        if *is_gif {
+            apply_outgoing_gif_flag(pointer);
+        }
+        if let Some(metadata) = voice_metadata {
+            apply_outgoing_voice_metadata(pointer, metadata);
+        }
+        if let Some(dimensions) = dimensions {
+            apply_outgoing_dimensions(pointer, *dimensions);
+        }
+    }
+}
+
+/// 出向声明尺寸置位单点（BUG-11 wire 批）：普通附件 data URI 的
+/// `;width=<px>;height=<px>` 两参数在上传返回后落到
+/// `AttachmentPointer.width=9`/`height=10`（vendored proto 两位，官方
+/// uploadAttachment 组装的发送态指针同一对字段）。与 GIF 旗标/语音元数据
+/// 同款「上传后置位」：尺寸是发送侧的测量陈述，CDN 上行面零涉及（加密/
+/// padding/digest 全官方原语），上传返回指针直接置位与官方消息组装期置位
+/// 同构。返回值随 DataMessage 出站后，收端 project_attachment_pointer
+/// 直接读出 width/height（该两位自 P14 起已在收投影面），接收侧首帧即
+/// 终态盒——桌面「声明→测量缓存→盘面探针→兜底」链降级为纯兜底。重复置位
+/// 幂等（纯赋值）。
+fn apply_outgoing_dimensions(
+    pointer: &mut presage::proto::AttachmentPointer,
+    dimensions: (u32, u32),
+) {
+    pointer.width = Some(dimensions.0);
+    pointer.height = Some(dimensions.1);
+}
+
 /// 出向 caption 置位单点（2026-10-15 媒体 story caption 批）：caption 走
 /// presage spec 上行面直通——vendored `AttachmentSpec.caption`（官方
 /// `MAX_BODY_ATTACHMENT_BYTE_LENGTH` 帽闸在 methods 参数面）由
@@ -721,18 +780,24 @@ fn apply_outgoing_caption(parsed: &mut [ParsedAttachment], caption: Option<&str>
 /// 预留——32×100MB 的整批请求在解码前就被拒，而不是先吃满内存。
 ///
 /// data URI 唯一形状 = connector 上游形状
-/// `data:<mediatype>[;filename=<percent-encoded>][;voice=true][;gif=true];base64,<payload>`
+/// `data:<mediatype>[;filename=<percent-encoded>][;voice=true][;gif=true][;width=<px>;height=<px>];base64,<payload>`
 /// （RFC 2397 扩展 filename 参数同款；voice 参数映射官方 VOICE_MESSAGE
 /// flags，presage voice_note→AttachmentPointer.flags 官方同构；gif 参数映射
 /// 官方 Flags.GIF=8 位，参数面无 mediatype 闸——官方 Tenor GIF 即
-/// video/mp4 载体带 GIF 位，媒体类自判归消费方，收投影 isGif 同口径）。
+/// video/mp4 载体带 GIF 位，媒体类自判归消费方，收投影 isGif 同口径；
+/// width/height 参数（BUG-11 wire 批）是发送侧测量到的自然像素尺寸，上传
+/// 返回后置位指针同名字段，双参同进退——半边在场即整条形状坏，半对尺寸
+/// 对渲染面零信息量且会让收端拿到不可用的声明）。
 /// mediatype 缺省 application/octet-stream；非 base64 / 坏 percent /
-/// 坏 voice/gif 值一律 None（fail-closed）。
+/// 坏 voice/gif/width/height 值一律 None（fail-closed）。
 struct AttachmentMeta {
     content_type: String,
     filename: Option<String>,
     is_voice: bool,
     is_gif: bool,
+    /// 出向声明尺寸（`;width=`/`;height=` 双参）：None = 未声明（普通
+    /// 旧形状零变化），Some = 两参俱在且各自在 1..=MAX_ATTACHMENT_DIMENSION_PX。
+    dimensions: Option<(u32, u32)>,
     payload_offset: usize,
     payload_len: usize,
 }
@@ -766,6 +831,8 @@ fn parse_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
     let mut is_base64 = false;
     let mut is_voice = false;
     let mut is_gif = false;
+    let mut width = None;
+    let mut height = None;
     for param in parts {
         if param.eq_ignore_ascii_case("base64") {
             is_base64 = true;
@@ -787,8 +854,19 @@ fn parse_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
                 "false" => {}
                 _ => return None,
             }
+        } else if let Some(value) = param.strip_prefix("width=") {
+            width = Some(parse_outgoing_dimension(value)?);
+        } else if let Some(value) = param.strip_prefix("height=") {
+            height = Some(parse_outgoing_dimension(value)?);
         }
     }
+    // 出向声明尺寸双参同进退（voice 元数据同款纪律）：只有半边 = 形状坏，
+    // 整条 fail-closed。全缺 = 旧形状零变化（普通文件/语音/贴纸/预览图）。
+    let dimensions = match (width, height) {
+        (None, None) => None,
+        (Some(width), Some(height)) => Some((width, height)),
+        _ => return None,
+    };
     if !is_base64 {
         return None;
     }
@@ -803,9 +881,23 @@ fn parse_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
         filename,
         is_voice,
         is_gif,
+        dimensions,
         payload_offset,
         payload_len: payload.len(),
     })
+}
+
+/// 出向声明尺寸参数值位解析（width=/height=）：十进制正整数，上界
+/// MAX_ATTACHMENT_DIMENSION_PX。空串、带正负号（u32::parse 会接受前导
+/// 加号，故先过全数字闸）、非十进制、0、超界一律 None——调用方把 None
+/// 翻成整条形状坏（fail-closed，voice/gif 坏值同姿态），绝不把不可用的
+/// 声明写进指针。
+fn parse_outgoing_dimension(value: &str) -> Option<u32> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let parsed: u32 = value.parse().ok()?;
+    (parsed > 0 && parsed <= MAX_ATTACHMENT_DIMENSION_PX).then_some(parsed)
 }
 
 /// 第二段：真正 base64 decode（调用方已持有全局闸租约并在 decode 前按
@@ -830,6 +922,7 @@ fn decode_attachment(uri: &str, meta: &AttachmentMeta) -> Option<ParsedAttachmen
         },
         bytes,
         is_gif: meta.is_gif,
+        dimensions: meta.dimensions,
     })
 }
 
@@ -14672,12 +14765,15 @@ fn project_contact_entry(number: &str, name: &str, profile: Option<(&str, Option
 /// send 附件上行：官方 CDN v4 面零 fork（presage upload_attachments，加密/
 /// padding/digest/上传全官方原语）。任何一条失败整体 fail-closed（半发的
 /// 引用消息比拒绝更糟）。预览图（若有）与附件同批上传，按序取回。上传
-/// 返回后按 parsed 序对齐置位两类客户端线上陈述（presage join_all 保序，
+/// 返回后按 parsed 序对齐置位三类客户端线上陈述（presage join_all 保序，
 /// input 序 = output 序）：GIF 旗标（`;gif=true` → Flags.GIF，见
-/// apply_outgoing_gif_flag）与语音波形+时长（`;voice=true` → 官方算法
+/// apply_outgoing_gif_flag）、语音波形+时长（`;voice=true` → 官方算法
 /// 生成 audioWaveform/audioDurationSeconds，见 apply_outgoing_voice_
-/// metadata）；贴纸图走 upload_sticker_image 单条面不经此处（官方贴纸
-/// 指针无 GIF 位、无语音元数据）。
+/// metadata）与普通附件声明尺寸（`;width=<px>;height=<px>` →
+/// AttachmentPointer.width/height，见 apply_outgoing_dimensions；BUG-11
+/// wire 批，无两参 = 旧形状逐字节不变）；贴纸图走 upload_sticker_image
+/// 单条面不经此处（官方贴纸指针无 GIF 位、无语音元数据；贴纸尺寸走
+/// spec 上行面）。
 ///
 /// `caption`（2026-10-15 媒体 story caption 批）：story 媒体腿 caption 走
 /// spec 上行面直通（apply_outgoing_caption 置位首条正文附件 spec，vendored
@@ -14719,7 +14815,7 @@ async fn upload_attachments_for_send(
         .collect::<Option<Vec<_>>>()
         .ok_or(SendError::Internal)?;
     apply_outgoing_caption(&mut parsed, caption);
-    let mut outgoing_faces = Vec::with_capacity(parsed.len());
+    let mut outgoing_faces: Vec<OutgoingAttachmentFace> = Vec::with_capacity(parsed.len());
     let mut batch = Vec::with_capacity(parsed.len());
     for item in parsed {
         // 语音元数据生成（2026-10-14 批）：`;voice=true` 附件在解码面
@@ -14731,7 +14827,7 @@ async fn upload_attachments_for_send(
         } else {
             None
         };
-        outgoing_faces.push((item.is_gif, voice_metadata));
+        outgoing_faces.push((item.is_gif, voice_metadata, item.dimensions));
         batch.push((item.spec, item.bytes));
     }
     let uploads = manager
@@ -14745,14 +14841,7 @@ async fn upload_attachments_for_send(
     for result in uploads {
         pointers.push(result.map_err(|_| SendError::AttachmentUpload)?);
     }
-    for (pointer, (is_gif, voice_metadata)) in pointers.iter_mut().zip(outgoing_faces) {
-        if is_gif {
-            apply_outgoing_gif_flag(pointer);
-        }
-        if let Some(metadata) = voice_metadata {
-            apply_outgoing_voice_metadata(pointer, &metadata);
-        }
-    }
+    apply_outgoing_attachment_faces(&mut pointers, &outgoing_faces);
     let image = image_index.map(|index| pointers.remove(index));
     Ok((pointers, image))
 }
@@ -17410,6 +17499,153 @@ mod tests {
         // 已置 GIF 再置：幂等（不翻倍不变形）。
         apply_outgoing_gif_flag(&mut plain);
         assert_eq!(plain.flags, Some(Flags::Gif as u32));
+    }
+
+    /// 出向声明尺寸（BUG-11 wire 批）：data URI 上 width=/height= 双参
+    /// 解析 + 上传后指针置位单点 + 收投影读回——三段闭合。
+    #[test]
+    fn outgoing_dimensions_parse_pair_and_boundaries() {
+        // 双参俱在：解析进 meta/ParsedAttachment（上传腿消费位）。
+        let parsed =
+            parse_attachment_data_uri("data:image/jpeg;width=1920;height=1080;base64,aGVsbG8=")
+                .expect("declared pair parses");
+        assert_eq!(parsed.dimensions, Some((1920, 1080)));
+        // 全缺 = 旧形状零变化。
+        let plain = parse_attachment_data_uri("data:image/jpeg;base64,aGVsbG8=").expect("parses");
+        assert_eq!(plain.dimensions, None);
+        // 双参同进退：半边在场 = 整条形状坏。
+        assert!(
+            parse_attachment_data_uri("data:image/jpeg;width=1920;base64,aGVsbG8=").is_none(),
+            "lone width must fail closed",
+        );
+        assert!(
+            parse_attachment_data_uri("data:image/jpeg;height=1080;base64,aGVsbG8=").is_none(),
+            "lone height must fail closed",
+        );
+        // 值域：1..=16384 正整数；0/超界/符号/非十进制/空串/小数一律整条拒。
+        for bad in ["0", "16385", "+12", "-12", "12.5", "abc", ""] {
+            let uri = format!("data:image/jpeg;width={bad};height=1080;base64,aGVsbG8=");
+            assert!(
+                parse_attachment_data_uri(&uri).is_none(),
+                "bad width {bad:?} must fail closed",
+            );
+            let uri = format!("data:image/jpeg;width=1920;height={bad};base64,aGVsbG8=");
+            assert!(
+                parse_attachment_data_uri(&uri).is_none(),
+                "bad height {bad:?} must fail closed",
+            );
+        }
+        // 边界两位可收（下界 1、上界常量）。
+        for (width, height) in [
+            (1_u32, 1_u32),
+            (MAX_ATTACHMENT_DIMENSION_PX, MAX_ATTACHMENT_DIMENSION_PX),
+        ] {
+            let uri = format!("data:video/mp4;width={width};height={height};base64,aGVsbG8=");
+            assert_eq!(
+                parse_attachment_data_uri(&uri)
+                    .expect("boundary parses")
+                    .dimensions,
+                Some((width, height)),
+            );
+        }
+    }
+
+    /// 上传返回后的指针置位与收投影读回（BUG-11 不变式：声明尺寸随指针
+    /// 出站，接收侧首帧即终态盒）。置位幂等，与 GIF/语音面共存不挤占。
+    #[test]
+    fn outgoing_dimensions_post_set_pointer_and_project_back() {
+        use presage::proto::AttachmentPointer;
+
+        let dims = (1280_u32, 720_u32);
+        let mut pointer = AttachmentPointer::default();
+        apply_outgoing_dimensions(&mut pointer, dims);
+        assert_eq!(pointer.width, Some(1280));
+        assert_eq!(pointer.height, Some(720));
+        // 幂等：重复置位不翻倍不变形。
+        apply_outgoing_dimensions(&mut pointer, dims);
+        assert_eq!((pointer.width, pointer.height), (Some(1280), Some(720)));
+
+        // 收投影面：同一对字段（P14 起已在投影里）如实读回——发送腿置位
+        // 即接收腿可消费（连接器/桌面零翻译）。
+        let projected = project_attachment_pointer(&pointer);
+        assert_eq!(projected["width"], json!(1280));
+        assert_eq!(projected["height"], json!(720));
+
+        // 未声明 = 两键不在（no-null 纪律，旧形状零变化）。
+        let projected = project_attachment_pointer(&AttachmentPointer::default());
+        assert!(projected.get("width").is_none());
+        assert!(projected.get("height").is_none());
+
+        // 与 GIF/语音面共存：三通道各自独立字段，互不挤占。
+        apply_outgoing_gif_flag(&mut pointer);
+        let metadata = voice_note::VoiceAudioMetadata {
+            waveform: vec![1_u8; 100],
+            duration_seconds: 2.0,
+        };
+        apply_outgoing_voice_metadata(&mut pointer, &metadata);
+        assert_eq!(
+            pointer.flags,
+            Some(presage::proto::attachment_pointer::Flags::Gif as u32)
+        );
+        assert_eq!(pointer.width, Some(1280));
+        assert_eq!(pointer.height, Some(720));
+        assert_eq!(pointer.audio_duration_seconds, Some(2.0));
+    }
+
+    /// URI -> 解析 -> 指针置位 -> 收投影：声明尺寸链路严格往返（发送腿与
+    /// 接收腿同一对 proto 字段，数据面零翻译）。
+    #[test]
+    fn outgoing_dimensions_round_trip_through_projection() {
+        let parsed =
+            parse_attachment_data_uri("data:image/png;width=640;height=480;base64,aGVsbG8=")
+                .expect("parses");
+        let mut pointer = presage::proto::AttachmentPointer::default();
+        apply_outgoing_dimensions(&mut pointer, parsed.dimensions.expect("declared"));
+        let projected = project_attachment_pointer(&pointer);
+        assert_eq!(projected["width"], json!(640));
+        assert_eq!(projected["height"], json!(480));
+    }
+
+    /// 上行走廊三通道置位面（GIF / 语音 / 声明尺寸）：faces 与 pointers
+    /// 按序对齐，各通道独立生效、缺省不置位——这是 upload_attachments_for_send
+    /// 的唯一后置位入口（去掉尺寸通道时本用例必红）。
+    #[test]
+    fn outgoing_attachment_faces_apply_gif_voice_and_dimensions() {
+        use presage::proto::AttachmentPointer;
+
+        let metadata = voice_note::VoiceAudioMetadata {
+            waveform: vec![3_u8; 100],
+            duration_seconds: 1.25,
+        };
+        let faces: Vec<OutgoingAttachmentFace> = vec![
+            (false, None, Some((800, 600))),
+            (true, Some(metadata), None),
+            (false, None, None),
+        ];
+        let mut pointers = vec![
+            AttachmentPointer::default(),
+            AttachmentPointer::default(),
+            AttachmentPointer::default(),
+        ];
+        apply_outgoing_attachment_faces(&mut pointers, &faces);
+        // 0：仅尺寸（普通图片附件形态）。
+        assert_eq!(
+            (pointers[0].width, pointers[0].height),
+            (Some(800), Some(600))
+        );
+        assert_eq!(pointers[0].flags, None);
+        assert!(pointers[0].audio_waveform.is_none());
+        // 1：GIF 旗标 + 语音元数据（无尺寸声明）。
+        assert_eq!(
+            pointers[1].flags,
+            Some(presage::proto::attachment_pointer::Flags::Gif as u32)
+        );
+        assert_eq!(pointers[1].audio_duration_seconds, Some(1.25));
+        assert_eq!((pointers[1].width, pointers[1].height), (None, None));
+        // 2：三通道全缺 = 旧形状零变化。
+        assert_eq!((pointers[2].width, pointers[2].height), (None, None));
+        assert_eq!(pointers[2].flags, None);
+        assert!(pointers[2].audio_duration_seconds.is_none());
     }
 
     #[test]
