@@ -1137,6 +1137,14 @@ fn push_lost_link_tombstone(inner: &mut Inner, uri: &str, lost_at: u64) {
 pub(crate) enum SendError {
     /// 账号不在本引擎注册表中（连接器只对 listAccounts 结果发送，正常不到达）。
     UnknownAccount,
+    /// 号码寻址的直聊收件人在本机解析不出（resolve_recipient 对裸号码
+    /// 走 contacts 数字位匹配 miss——UUID 首臂直解、本机号次臂直解，
+    /// 到不了此臂的输入只可能是「号码不在引擎 contacts」）。BUG-16 刀2b
+    /// 上移批（2026-11-13）：此前折叠 Internal(-32603)，connector 无法把
+    /// 「身份未解析」和「引擎内部炸」区分开（boot_send_integrity 契约
+    /// 实证）。专用面 -32010 + UNREGISTERED_RECIPIENT（数字码无歧义，
+    /// 不与 -1 通用 upstream 面撞码）；确定性失败不重试。
+    UnregisteredRecipient,
     /// 目标群已终止（官方 shouldSendToConversation terminated 位硬拒；错误
     /// 面 `-1` + `SEND_TARGET_TERMINATED`，compat §3）。
     TargetTerminated,
@@ -1581,6 +1589,7 @@ fn presage_error_variant_face(
 pub(crate) fn send_error_variant_face(error: &SendError) -> &'static str {
     match error {
         SendError::UnknownAccount => "SendError::UnknownAccount",
+        SendError::UnregisteredRecipient => "SendError::UnregisteredRecipient",
         SendError::TargetTerminated => "SendError::TargetTerminated",
         SendError::AnnouncementsOnly => "SendError::AnnouncementsOnly",
         SendError::Unbound => "SendError::Unbound",
@@ -4721,7 +4730,7 @@ impl Service {
                 let probe_resolve_t0 = std::time::Instant::now();
                 let service_id = resolve_recipient(&manager, number)
                     .await
-                    .ok_or(SendError::Internal)?;
+                    .ok_or(SendError::UnregisteredRecipient)?;
                 tracing::warn!(
                     target: "send_latency_probe",
                     stage = "engine.resolve",
@@ -4851,7 +4860,7 @@ impl Service {
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
                 .await
-                .ok_or(SendError::Internal)?;
+                .ok_or(SendError::UnregisteredRecipient)?;
             // P9 身份拒发闸（撤回同为内容面）。
             identity_send_gate(&account_dir, &service_id)?;
             // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -5021,7 +5030,7 @@ impl Service {
         // 目的地 = story 作者会话（号码/UUID 双形态收敛同一 ServiceId）。
         let service_id = resolve_recipient(&manager, story_author)
             .await
-            .ok_or(SendError::Internal)?;
+            .ok_or(SendError::UnregisteredRecipient)?;
         // P9 身份拒发闸（story 反应同为直聊内容发送）。
         identity_send_gate(&account_dir, &service_id)?;
         // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -5117,7 +5126,7 @@ impl Service {
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
                 .await
-                .ok_or(SendError::Internal)?;
+                .ok_or(SendError::UnregisteredRecipient)?;
             // P9 身份拒发闸（回应面同为直聊内容发送）。
             identity_send_gate(&account_dir, &service_id)?;
             // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -5457,7 +5466,7 @@ impl Service {
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
                 .await
-                .ok_or(SendError::Internal)?;
+                .ok_or(SendError::UnregisteredRecipient)?;
             // P9 身份拒发闸（pin/unpin 同为直聊内容发送）。
             identity_send_gate(&account_dir, &service_id)?;
             // P9 profileSharing 闸（S3）：未同意 → 不注入本机 profile_key。
@@ -5497,7 +5506,7 @@ impl Service {
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
                 .await
-                .ok_or(SendError::Internal)?;
+                .ok_or(SendError::UnregisteredRecipient)?;
             if service_id == own {
                 continue;
             }
@@ -5543,7 +5552,7 @@ impl Service {
         let mut manager = lock_registered_for_send(&shared).await;
         let service_id = resolve_recipient(&manager, recipient)
             .await
-            .ok_or(SendError::Internal)?;
+            .ok_or(SendError::UnregisteredRecipient)?;
         // P9 身份拒发闸（官方 conversationJobQueue 对 untrusted 目标取消
         // Receipts 任务同位——conversationJobQueue.preload.ts:1141-1146；
         // 自动 delivery receipt flush 复用本面，失败静默弃批）。
@@ -5950,7 +5959,7 @@ impl Service {
         let mut manager = lock_registered_for_send(&shared).await;
         let service_id = resolve_recipient(&manager, recipient)
             .await
-            .ok_or(SendError::Internal)?;
+            .ok_or(SendError::UnregisteredRecipient)?;
         // P9 身份拒发闸（直聊通话信令臂；群臂走群发送通路不在此闸）。
         identity_send_gate(&account_dir, &service_id)?;
         let timestamp = now_ms();
@@ -6025,7 +6034,7 @@ impl Service {
             CallEventConversation::Direct(recipient) => {
                 let service_id = resolve_recipient(&manager, recipient)
                     .await
-                    .ok_or(SendError::Internal)?;
+                    .ok_or(SendError::UnregisteredRecipient)?;
                 aci_to_bytes(&service_id.service_id_string()).ok_or(SendError::Internal)?
             }
             CallEventConversation::Group(bytes) | CallEventConversation::AdHoc(bytes) => {
@@ -6094,7 +6103,7 @@ impl Service {
         let mut manager = lock_registered_for_send(&shared).await;
         let service_id = resolve_recipient(&manager, recipient)
             .await
-            .ok_or(SendError::Internal)?;
+            .ok_or(SendError::UnregisteredRecipient)?;
         // P9 身份拒发闸（直聊内容面同纪律）。
         identity_send_gate(&account_dir, &service_id)?;
         let timestamp = now_ms();
@@ -6170,7 +6179,7 @@ impl Service {
         for number in recipients {
             let service_id = resolve_recipient(&manager, number)
                 .await
-                .ok_or(SendError::Internal)?;
+                .ok_or(SendError::UnregisteredRecipient)?;
             // P9 身份拒发闸（编辑同为内容面）。
             identity_send_gate(&account_dir, &service_id)?;
             let include_profile_key = include_profile_key_for(&whitelist, &service_id);
@@ -7078,7 +7087,7 @@ impl Service {
         let mut manager = lock_registered_for_send(&shared).await;
         let service_id = resolve_recipient(&manager, recipient)
             .await
-            .ok_or(SendError::Internal)?;
+            .ok_or(SendError::UnregisteredRecipient)?;
         let mut store = manager.store().clone();
         // 未注册联系人拒绝：contacts 表必须已有该收件人行（UUID 形态直通
         // 也不例外——无行 = presage 持久化面静默 no-op，宁拒不哑改）。

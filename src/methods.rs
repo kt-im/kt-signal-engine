@@ -5498,6 +5498,10 @@ fn send_story_success_body(
 pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'static str) {
     use crate::service::SendError;
     match error {
+        // BUG-16 刀2b 上移批（2026-11-13）：号码寻址本地解析 miss 的专用
+        // 面——-32010 数字码（不与 -1 通用 upstream 面撞码），connector 只
+        // 映射这一个码，-32603 全透传（boot_send_integrity 契约保持）。
+        SendError::UnregisteredRecipient => (-32010, "UNREGISTERED_RECIPIENT"),
         SendError::TargetTerminated => (-1, "SEND_TARGET_TERMINATED"),
         SendError::AnnouncementsOnly => (-1, "SEND_TARGET_ANNOUNCEMENTS_ONLY"),
         SendError::Unbound => (-32603, USER_UNBOUND_MESSAGE),
@@ -5544,6 +5548,16 @@ mod tests {
         let internal = finish_link_error(&Value::from(9), LinkError::Internal);
         assert_eq!(internal["error"]["code"], json!(-32603));
         assert_eq!(internal["error"]["message"], json!("Internal error"));
+    }
+
+    /// BUG-16 刀2b 上移：号码寻址本地解析 miss 必须是 -32010 +
+    /// UNREGISTERED_RECIPIENT（确定性专用面），不能折叠 -32603——connector
+    /// 只按这个数字码分类，-32603 保持通用内部错误全透传。
+    #[test]
+    fn send_error_face_pins_unregistered_recipient() {
+        let (code, message) = send_error_face(&crate::service::SendError::UnregisteredRecipient);
+        assert_eq!(code, -32010);
+        assert_eq!(message, "UNREGISTERED_RECIPIENT");
     }
 
     /// 双槽 QR 轮换（engine 侧 additive，2026-11-11 批）：rotateLink 的
