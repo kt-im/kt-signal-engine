@@ -13792,6 +13792,7 @@ async fn link_flow(
                 // URL 都没拿到：startLink 自己的 URL 等待臂收口（Internal）。
                 _ => return Err(terminal_before_url()),
             };
+            let url_delivered_at = std::time::Instant::now();
             if url_tx.send(qr_link_url(url)).is_err() {
                 // 调用方已超时/丢弃 url_rx：没有可 finish 的会话，按未交付
                 // URL 收口，不把死会话记成 lost（startLink 会 abort 本任务）。
@@ -13799,7 +13800,19 @@ async fn link_flow(
             }
             // B1：URL 已交付后，流结束/WS 关闭/超时全部是终局 Lost。
             match event_rx.next().await {
-                Some(SecondaryDeviceProvisioning::NewDeviceRegistration(data)) => Ok(data),
+                Some(SecondaryDeviceProvisioning::NewDeviceRegistration(data)) => {
+                    // BUG-5 尾巴（link 分段计时 · 2026-11-13）：42s 黑盒的第
+                    // 一段——QR 交付 → 手机扫码/确认/密钥交换/注册消息上传
+                    // 完成真机实测 42s 级（108 次样本），本段拆出「用户+上游」
+                    // 与本机 commit 的占比。纯日志，零行为。
+                    tracing::info!(
+                        target: "engine.link",
+                        stage = "provisioning-wait",
+                        qr_to_registration_ms = url_delivered_at.elapsed().as_millis() as u64,
+                        "QR delivered → NewDeviceRegistration received"
+                    );
+                    Ok(data)
+                }
                 // URL 已交付后任何非注册事件（流结束/关闭）= Lost。
                 _ => Err(terminal_after_url_closed()),
             }
@@ -13876,6 +13889,9 @@ async fn link_flow(
 
     // serde 数据面构造（官方 store 落库格式）：pub(crate) 字段的唯一合法
     // 构造路径；键面与序列化形态由往返单测锁死。
+    // BUG-5 尾巴（link 分段计时 · 2026-11-13）：第二段起点——注册数据到手
+    // 后的本机收口（serde 构造 + store 三连写 + load_registered 门禁）。
+    let commit_started_at = std::time::Instant::now();
     let number = e164_string(&phonenumber_from_signal(&phone_number));
     let servers =
         serde_json::to_value(SignalServers::Production).map_err(|_| link_store_error())?;
@@ -13940,6 +13956,14 @@ async fn link_flow(
     // 任务 cancel + 进度清缺）必须先于新任务启动，spawn 留在本函数会被
     // finish_link 确定性误杀（真机四连「永久同步中」根因）。导出面 future
     // 非 Send（上游 FramesReader 持 Rc 状态），spawn 仍在 LocalSet 承载。
+    // BUG-5 尾巴（link 分段计时 · 2026-11-13）：第二段终点——与第一段
+    // provisioning-wait 相加即 finish 全程，42s 黑盒从此有账可查。纯日志。
+    tracing::info!(
+        target: "engine.link",
+        stage = "registration-commit",
+        commit_ms = commit_started_at.elapsed().as_millis() as u64,
+        "registration data in hand → store written + load_registered verified"
+    );
     let pending_transfer = ephemeral_backup_key.map(|backup_key| PendingTransferDownload {
         aci: service_ids.aci,
         credentials: ServiceCredentials {
