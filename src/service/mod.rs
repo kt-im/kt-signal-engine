@@ -1382,10 +1382,20 @@ pub(crate) fn send_error_of(error: presage::Error<<SqliteStore as Store>::Error>
             MessageSenderError::ServiceError(service_error) => {
                 service_error_face(service_error, "PresageError::MessageSenderError::")
             }
-            MessageSenderError::ProofRequired { token, options } => SendError::ProofRequired {
-                token: Some(token),
-                options,
-            },
+            MessageSenderError::ProofRequired { token, options } => {
+                // BUG-16 proof 观测（2026-11-13）：send 链真正的归型臂（sender
+                // 求解失败/非 push 挑战原样上抛时到这里）。只落类型词表——token
+                // 与号码绝不入日志。
+                tracing::warn!(
+                    target: "engine.proof",
+                    options = ?options,
+                    "send surfaced a proof challenge (auto-solve did not clear it)"
+                );
+                SendError::ProofRequired {
+                    token: Some(token),
+                    options,
+                }
+            }
             // P9 身份拒发闸：sender 对 process_prekey_bundle 失败统一再包
             // UntrustedIdentity（vendor sender.rs），协议层拒发（旧钥会话/
             // 换钥 bundle）落到此臂；ProtocolError 面的裸
