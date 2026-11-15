@@ -321,6 +321,19 @@ async fn dispatch(
     service: Arc<Service>,
 ) -> Value {
     let Request { id, method, params } = request;
+    // 发送前预热（perf，2026-11-15）：**只对群会话**预热 MRM 连接——MRM 是群投递
+    // 通道，纯 1:1 的账号不该白养一条（auditor 审计点①）。
+    if let (Some(account), Some(group_id)) = (
+        params.get("account").and_then(Value::as_str),
+        params
+            .get("groupId")
+            .or_else(|| params.get("group"))
+            .and_then(Value::as_str),
+    ) {
+        if crate::service::decode_group_id(group_id).is_some() {
+            crate::service::group_mrm::maybe_warm(&service, account);
+        }
+    }
     // S2a 打点在 respond 单点包裹（本函数臂内多 `return`，不在此计时）。
     match method.as_str() {
         // startLink：旧端只读 deviceLinkUri（= 第 0 槽），linkAttemptId +
@@ -1523,6 +1536,8 @@ async fn dispatch(
             match (account, recipient, timestamps) {
                 (Some(account), Some(recipient), Some(Some(timestamps))) => {
                     state.lock().await.append_dispatch(method, params);
+                    // 打开会话 = 发送前信号：顺带预热 MRM 连接（覆盖「不打字直接发」）。
+                    crate::service::group_mrm::warm_connection(&service, account);
                     match service
                         .send_receipt(account, recipient, &timestamps, kind)
                         .await
