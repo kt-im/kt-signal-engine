@@ -2,6 +2,7 @@ use std::{collections::HashSet, time::SystemTime};
 
 use base64::prelude::*;
 use chrono::prelude::*;
+use futures::StreamExt;
 use libsignal_core::{curve::CurveError, InvalidDeviceId};
 use libsignal_protocol::{
     process_prekey_bundle, Aci, DeviceId, IdentityKey, IdentityKeyPair,
@@ -11,7 +12,6 @@ use libsignal_protocol::{
 use rand::{rng, CryptoRng, Rng};
 use tracing::{debug, error, info, trace, warn};
 use tracing_futures::Instrument;
-use futures::StreamExt;
 use uuid::Uuid;
 use zkgroup::GROUP_IDENTIFIER_LEN;
 
@@ -72,6 +72,21 @@ pub type SendMessageResult = Result<SentMessage, MessageSenderError>;
 /// 官方 Signal-Desktop 对群成员用 Promise.all 且无显式上限；我们对单条 WS
 /// 连接保守取 4：足以把 N 次串行往返压成 1-2 次，又不至于把连接打满。
 const GROUP_FANOUT_CONCURRENCY: usize = 4;
+
+/// KT fork（2026-11-15 perf 批）：有界并发、保序的 fan-out 接缝。
+///
+/// 语义等同 futures::stream::iter(sends).buffered(limit).collect()；单独抽成函数
+/// 是为了能脱离网络单测两条不变量：并发不超过 limit、输出顺序与输入顺序一致。
+pub async fn fanout_bounded<I, Fut, R>(futures_iter: I, limit: usize) -> Vec<R>
+where
+    I: Iterator<Item = Fut>,
+    Fut: std::future::Future<Output = R>,
+{
+    futures::stream::iter(futures_iter)
+        .buffered(limit.max(1))
+        .collect()
+        .await
+}
 
 #[derive(Debug, Clone)]
 pub struct SentMessage {
@@ -869,10 +884,8 @@ where
             },
         );
 
-        let mut results: Vec<SendMessageResult> = futures::stream::iter(sends)
-            .buffered(GROUP_FANOUT_CONCURRENCY)
-            .collect()
-            .await;
+                let mut results: Vec<SendMessageResult> =
+            fanout_bounded(sends, GROUP_FANOUT_CONCURRENCY).await;
 
         // 并发腿只做一次投递，不复制上游的修复循环：失败的收件人交回
         // try_send_message 串行重放，401 换道 / 设备修复 / proof / push
