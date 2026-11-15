@@ -243,8 +243,7 @@ fn ensure_keepalive(slot: &Arc<MrmSlot>) {
                 .await
             {
                 Ok(_) => {
-                    slot.last_used_ms
-                        .store(epoch_ms(), Ordering::Relaxed);
+                    slot.last_used_ms.store(epoch_ms(), Ordering::Relaxed);
                     "ok"
                 }
                 Err(_) => {
@@ -267,8 +266,8 @@ pub(crate) fn maybe_warm(service: &Arc<super::Service>, account: &str) {
     let Some(slot) = service.mrm_pool.slot_for(account) else {
         return;
     };
-    let fresh = epoch_ms().saturating_sub(slot.last_used_ms.load(Ordering::Relaxed))
-        <= MRM_STALE_AFTER_MS;
+    let fresh =
+        epoch_ms().saturating_sub(slot.last_used_ms.load(Ordering::Relaxed)) <= MRM_STALE_AFTER_MS;
     if fresh
         && slot
             .connection
@@ -296,8 +295,10 @@ pub(crate) fn warm_connection(service: &Arc<super::Service>, account: &str) {
             let guard = slot.connection.lock().await;
             match guard.as_ref() {
                 None => true,
-                Some(_) => now.saturating_sub(slot.last_used_ms.load(Ordering::Relaxed))
-                    > MRM_STALE_AFTER_MS,
+                Some(_) => {
+                    now.saturating_sub(slot.last_used_ms.load(Ordering::Relaxed))
+                        > MRM_STALE_AFTER_MS
+                }
             }
         };
         let outcome = if needs_refresh {
@@ -305,7 +306,8 @@ pub(crate) fn warm_connection(service: &Arc<super::Service>, account: &str) {
                 Ok(connection) => {
                     let mut guard = slot.connection.lock().await;
                     *guard = Some(connection);
-                    slot.last_used_ms.store(super::group_mrm::epoch_ms(), Ordering::Relaxed);
+                    slot.last_used_ms
+                        .store(super::group_mrm::epoch_ms(), Ordering::Relaxed);
                     drop(guard);
                     ensure_keepalive(&slot);
                     "ok"
@@ -975,7 +977,7 @@ async fn send_mrm(
                 slot.last_used_ms.store(epoch_ms(), Ordering::Relaxed);
                 ensure_keepalive(&slot);
                 return Ok(response);
-            },
+            }
             Err(RequestError::Other(MultiRecipientSendFailure::MismatchedDevices(list))) => {
                 return Err(MrmSendFailure::Mismatched(
                     list.into_iter().map(|mismatch| mismatch.account).collect(),
