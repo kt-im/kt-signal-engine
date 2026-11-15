@@ -11,6 +11,7 @@ use libsignal_protocol::{
 use rand::{rng, CryptoRng, Rng};
 use tracing::{debug, error, info, trace, warn};
 use tracing_futures::Instrument;
+use futures::StreamExt;
 use uuid::Uuid;
 use zkgroup::GROUP_IDENTIFIER_LEN;
 
@@ -65,6 +66,12 @@ pub struct SendMessageResponse {
 }
 
 pub type SendMessageResult = Result<SentMessage, MessageSenderError>;
+
+/// 群 fanout 的并发上限（KT fork，2026-11-15 perf 批）。
+///
+/// 官方 Signal-Desktop 对群成员用 Promise.all 且无显式上限；我们对单条 WS
+/// 连接保守取 4：足以把 N 次串行往返压成 1-2 次，又不至于把连接打满。
+const GROUP_FANOUT_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct SentMessage {
@@ -711,6 +718,58 @@ where
         results
     }
 
+    /// KT fork（2026-11-15 perf 批）：把 try_send_message 的【加密】段单独抽出。
+    ///
+    /// 加密需要 &mut self（会话/协议存储），调用方只能串行；但【投递】是纯
+    /// WS/HTTP，SignalWebSocket 可 Clone，因此群 fanout 可以「串行加密 -> 并发
+    /// 投递」，与官方 Signal-Desktop 的 Promise.all 对齐。
+    async fn prepare_push_messages(
+        &mut self,
+        recipient: ServiceId,
+        unidentified_access: Option<&UnidentifiedAccess>,
+        story: Option<&SenderCertificate>,
+        content_body: &ContentBody,
+        timestamp: u64,
+        include_pni_signature: bool,
+        online: bool,
+    ) -> Result<(OutgoingPushMessages, IdentityKey), MessageSenderError> {
+        use prost::Message;
+
+        let mut content = content_body.clone().into_proto();
+        if include_pni_signature {
+            content.pni_signature_message = Some(self.create_pni_signature()?);
+        }
+        let content_bytes = content.encode_to_vec();
+
+        let probe_is_typing = matches!(content_body, ContentBody::TypingMessage(_));
+
+        let Some(EncryptedMessages {
+            messages,
+            used_identity_key,
+        }) = self
+            .create_encrypted_messages(
+                &recipient,
+                story.or(unidentified_access.map(|access| &access.certificate)),
+                &content_bytes,
+                probe_is_typing,
+            )
+            .await?
+        else {
+            return Err(MessageSenderError::NoMessagesToSend);
+        };
+
+        Ok((
+            OutgoingPushMessages {
+                destination: recipient,
+                timestamp,
+                messages,
+                online,
+                urgent: false,
+            },
+            used_identity_key,
+        ))
+    }
+
     /// KT fork (deferred self sync): group counterpart of
     /// [`Self::send_message_split_sync`] — per-recipient results return
     /// without awaiting the group sync transcript; the prepared body (when
@@ -727,14 +786,103 @@ where
         online: bool,
     ) -> (Vec<SendMessageResult>, Option<ContentBody>) {
         let content_body: ContentBody = message.into();
-        let mut results = vec![];
+        let recipients = recipients.as_ref();
 
-        let mut needs_sync_in_results = false;
+        // KT fork（群 fanout 并发，2026-11-15 perf 批）：
+        // 上游是逐个收件人 await —— 群发延迟因此约为 N 乘单次往返（真机 1:1
+        // 609ms vs 群 1441-1719ms，差值正是这个串行循环）；官方 Signal-Desktop
+        // 用 Promise.all 并发。这里拆两步：
+        //   1) 加密（需 &mut store）仍串行，语义与上游一致；
+        //   2) 投递并发且保序（buffered 按输入顺序产出，results 与 recipients
+        //      一一对应，调用方不用感知并发）。
+        let mut prepared: Vec<Result<(OutgoingPushMessages, IdentityKey), MessageSenderError>> =
+            Vec::with_capacity(recipients.len());
+        for (recipient, unidentified_access, include_pni_signature) in recipients.iter() {
+            prepared.push(
+                self.prepare_push_messages(
+                    *recipient,
+                    unidentified_access.as_ref(),
+                    None,
+                    &content_body,
+                    timestamp,
+                    *include_pni_signature,
+                    online,
+                )
+                .await,
+            );
+        }
 
-        for (recipient, unidentified_access, include_pni_signature) in
-            recipients.as_ref()
-        {
-            let result = self
+        let identified_ws = self.identified_ws.clone();
+        let unidentified_ws = self.unidentified_ws.clone();
+        // 并发腿必须补齐上游的两个打点（WS_RTT / send_latency_probe），
+        // 否则群发会从观测里消失——P0 的前提正是可观测。
+        let local_aci = self.local_aci;
+        let probe_is_typing = matches!(content_body, ContentBody::TypingMessage(_));
+        let sends = prepared.into_iter().zip(recipients.iter()).map(
+            |(prepared_one, (recipient, unidentified_access, _))| {
+                let mut identified_ws = identified_ws.clone();
+                let mut unidentified_ws = unidentified_ws.clone();
+                let unidentified_access = unidentified_access.clone();
+                async move {
+                    let (messages, used_identity_key) = prepared_one?;
+                    let send_started = std::time::Instant::now();
+                    let submitted = if let Some(access) = &unidentified_access {
+                        unidentified_ws
+                            .send_messages_unidentified(messages, access)
+                            .await
+                    } else {
+                        identified_ws.send_messages(messages).await
+                    };
+                    crate::perf_hook::emit(
+                        crate::perf_hook::keys::WS_RTT,
+                        send_started.elapsed().as_micros() as u64,
+                    );
+                    let ws_probe_ms = send_started.elapsed().as_millis() as u64;
+                    let peer_label = if *recipient == local_aci { "self" } else { "direct" };
+                    if probe_is_typing {
+                        tracing::debug!(
+                            target: "send_latency_probe",
+                            stage = "engine.ws",
+                            dur_ms = ws_probe_ms,
+                            peer = peer_label,
+                            "send-latency-probe",
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "send_latency_probe",
+                            stage = "engine.ws",
+                            dur_ms = ws_probe_ms,
+                            peer = peer_label,
+                            "send-latency-probe",
+                        );
+                    }
+                    match submitted {
+                        Ok(SendMessageResponse { needs_sync }) => Ok(SentMessage {
+                            recipient: *recipient,
+                            used_identity_key,
+                            unidentified: unidentified_access.is_some(),
+                            needs_sync,
+                        }),
+                        Err(error) => Err(MessageSenderError::from(error)),
+                    }
+                }
+            },
+        );
+
+        let mut results: Vec<SendMessageResult> = futures::stream::iter(sends)
+            .buffered(GROUP_FANOUT_CONCURRENCY)
+            .collect()
+            .await;
+
+        // 并发腿只做一次投递，不复制上游的修复循环：失败的收件人交回
+        // try_send_message 串行重放，401 换道 / 设备修复 / proof / push
+        // challenge 全部沿用既有语义（失败即未送达，重放不会重复投递）。
+        for (index, result) in results.iter_mut().enumerate() {
+            if result.is_ok() {
+                continue;
+            }
+            let (recipient, unidentified_access, include_pni_signature) = &recipients[index];
+            *result = self
                 .try_send_message(
                     *recipient,
                     unidentified_access.as_ref(),
@@ -745,15 +893,13 @@ where
                     online,
                 )
                 .await;
+        }
 
-            match result {
-                Ok(SentMessage { needs_sync, .. }) if needs_sync => {
-                    needs_sync_in_results = true;
-                },
-                _ => (),
-            };
-
-            results.push(result);
+        let mut needs_sync_in_results = false;
+        for result in &results {
+            if let Ok(SentMessage { needs_sync: true, .. }) = result {
+                needs_sync_in_results = true;
+            }
         }
 
         // we only need to send a synchronization message once
