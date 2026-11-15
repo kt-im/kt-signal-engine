@@ -199,12 +199,6 @@ pub(crate) struct MrmSlot {
     keepalive: std::sync::atomic::AtomicBool,
 }
 
-/// 冷启动保温（2026-11-15 perf 批）：后台预热本账号的 MRM 连接。
-///
-/// 群发主路径是 MRM 单请求；槽里没有连接时发送要现场建连——真机实测冷发送
-/// 1.2–3.1s、热发送 0.28–0.36s（官方常驻 WS 无此惩罚）。群打字是发送前的必现
-/// 信号，用它把握手藏进用户打字的时间。失败静默：发送路径会照常重试建连。
-
 /// MRM 保活间隔：内核 WS 空闲上限 45s，取 30s（与官方 WS ping 同量级）。
 const MRM_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -280,6 +274,11 @@ pub(crate) fn maybe_warm(service: &Arc<super::Service>, account: &str) {
     warm_connection(service, account);
 }
 
+/// 冷启动保温（2026-11-15 perf 批）：后台预热本账号的 MRM 连接。
+///
+/// 群发主路径是 MRM 单请求；槽里没有连接时发送要现场建连——真机实测冷发送
+/// 1.2–3.1s、热发送 0.28–0.36s（官方常驻 WS 无此惩罚）。群打字是发送前的必现
+/// 信号，用它把握手藏进用户打字的时间。失败静默：发送路径会照常重试建连。
 pub(crate) fn warm_connection(service: &Arc<super::Service>, account: &str) {
     let Some(slot) = service.mrm_pool.slot_for(account) else {
         return;
