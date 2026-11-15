@@ -195,6 +195,8 @@ pub(crate) struct MrmSlot {
     last_used_ms: AtomicU64,
     /// 握手去重：一批 RPC 同时发现陈旧时只建一次连。
     warming: std::sync::atomic::AtomicBool,
+    /// 保活任务是否已起（每槽一个，起一次终身）。
+    keepalive: std::sync::atomic::AtomicBool,
 }
 
 /// 冷启动保温（2026-11-15 perf 批）：后台预热本账号的 MRM 连接。
@@ -202,6 +204,65 @@ pub(crate) struct MrmSlot {
 /// 群发主路径是 MRM 单请求；槽里没有连接时发送要现场建连——真机实测冷发送
 /// 1.2–3.1s、热发送 0.28–0.36s（官方常驻 WS 无此惩罚）。群打字是发送前的必现
 /// 信号，用它把握手藏进用户打字的时间。失败静默：发送路径会照常重试建连。
+
+/// MRM 保活间隔：内核 WS 空闲上限 45s，取 30s（与官方 WS ping 同量级）。
+const MRM_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 根因修复（2026-11-15）：MRM 连接没有事件循环驱动，空闲 45s 会被内核判死；
+/// 1:1 的 WS 靠接收循环发 31s ping 所以永不死。这里给 MRM 挂一个周期性的廉价
+/// 请求（GET /v1/accounts/whoami）当保活，使连接与 1:1 同构。
+///
+/// 失败即摘槽（下次发送自然重连）；try_lock 抢不到说明有发送在途，跳过本轮。
+fn ensure_keepalive(slot: &Arc<MrmSlot>) {
+    if slot.keepalive.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let slot = Arc::clone(slot);
+    tokio::task::spawn_local(async move {
+        loop {
+            tokio::time::sleep(MRM_KEEPALIVE_INTERVAL).await;
+            // 槽已被池淘汰（只剩本任务持有 Arc）→ 退出，别把连接和任务一起泄漏。
+            if Arc::strong_count(&slot) == 1 {
+                break;
+            }
+            let Ok(mut guard) = slot.connection.try_lock() else {
+                continue;
+            };
+            let Some(connection) = guard.as_ref() else {
+                continue;
+            };
+            let request = libsignal_net::chat::Request {
+                method: http::Method::GET,
+                path: "/v1/accounts/whoami".parse().expect("static path"),
+                headers: http::HeaderMap::new(),
+                body: None,
+            };
+            let sent_at = std::time::Instant::now();
+            let outcome = match connection
+                .send(request, std::time::Duration::from_secs(10))
+                .await
+            {
+                Ok(_) => {
+                    slot.last_used_ms
+                        .store(epoch_ms(), Ordering::Relaxed);
+                    "ok"
+                }
+                Err(_) => {
+                    *guard = None;
+                    "err"
+                }
+            };
+            tracing::warn!(
+                target: "send_latency_probe",
+                stage = "engine.mrm-keepalive",
+                outcome = outcome,
+                dur_ms = sent_at.elapsed().as_millis() as u64,
+                "send-latency-probe",
+            );
+        }
+    });
+}
+
 pub(crate) fn maybe_warm(service: &Arc<super::Service>, account: &str) {
     let Some(slot) = service.mrm_pool.slot_for(account) else {
         return;
@@ -246,6 +307,7 @@ pub(crate) fn warm_connection(service: &Arc<super::Service>, account: &str) {
                     *guard = Some(connection);
                     slot.last_used_ms.store(super::group_mrm::epoch_ms(), Ordering::Relaxed);
                     drop(guard);
+                    ensure_keepalive(&slot);
                     "ok"
                 }
                 Err(_) => "err",
@@ -316,6 +378,7 @@ impl MrmPool {
             connection: tokio::sync::Mutex::new(None),
             last_used_ms: AtomicU64::new(0),
             warming: std::sync::atomic::AtomicBool::new(false),
+            keepalive: std::sync::atomic::AtomicBool::new(false),
         });
         slots.insert(account.to_owned(), Arc::clone(&slot));
         Some(slot)
@@ -910,6 +973,7 @@ async fn send_mrm(
         match result {
             Ok(response) => {
                 slot.last_used_ms.store(epoch_ms(), Ordering::Relaxed);
+                ensure_keepalive(&slot);
                 return Ok(response);
             },
             Err(RequestError::Other(MultiRecipientSendFailure::MismatchedDevices(list))) => {
