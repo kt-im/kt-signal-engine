@@ -321,6 +321,11 @@ async fn dispatch(
     service: Arc<Service>,
 ) -> Value {
     let Request { id, method, params } = request;
+    // 发送前预热（perf，2026-11-15）：任何带 account 的 RPC 顺带检查一次 MRM 连接；
+    // 新鲜时零成本返回，陈旧（≥40s 未用）才后台建连。抓的是「用户有动作」这个信号。
+    if let Some(account) = params.get("account").and_then(Value::as_str) {
+        crate::service::group_mrm::maybe_warm(&service, account);
+    }
     // S2a 打点在 respond 单点包裹（本函数臂内多 `return`，不在此计时）。
     match method.as_str() {
         // startLink：旧端只读 deviceLinkUri（= 第 0 槽），linkAttemptId +
@@ -1523,6 +1528,8 @@ async fn dispatch(
             match (account, recipient, timestamps) {
                 (Some(account), Some(recipient), Some(Some(timestamps))) => {
                     state.lock().await.append_dispatch(method, params);
+                    // 打开会话 = 发送前信号：顺带预热 MRM 连接（覆盖「不打字直接发」）。
+                    crate::service::group_mrm::warm_connection(&service, account);
                     match service
                         .send_receipt(account, recipient, &timestamps, kind)
                         .await
