@@ -6814,6 +6814,8 @@ impl Service {
             // 面只在 real 生效）。
             return Ok(TypingGroupSendOutcome::Ok);
         }
+        // 群打字 = 发送前信号：后台预热 MRM 连接（冷发送 1.2–3.1s 的根因）。
+        group_mrm::warm_connection(self, account);
         let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
         let mut manager = lock_registered_for_send(&shared).await;
         let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
