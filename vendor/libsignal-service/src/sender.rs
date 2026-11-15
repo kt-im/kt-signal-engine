@@ -840,6 +840,19 @@ where
                 let unidentified_access = unidentified_access.clone();
                 async move {
                     let (messages, used_identity_key) = prepared_one?;
+                    // 冷/热探针：群投递所用连接实例 id。
+                    let socket_id = if unidentified_access.is_some() {
+                        unidentified_ws.socket_id()
+                    } else {
+                        identified_ws.socket_id()
+                    };
+                    tracing::warn!(
+                        target: "send_latency_probe",
+                        stage = "engine.wire-socket",
+                        peer = "group",
+                        socket_id = socket_id,
+                        "send-latency-probe",
+                    );
                     let send_started = std::time::Instant::now();
                     let submitted = if let Some(access) = &unidentified_access {
                         unidentified_ws
@@ -1090,6 +1103,21 @@ where
                 urgent,
             };
 
+            // 冷/热探针：记录本次投递所用的连接实例 id（新建连接会自增）。
+            {
+                let socket_id = if story.is_some() || unidentified_access.is_some() {
+                    self.unidentified_ws.socket_id()
+                } else {
+                    self.identified_ws.socket_id()
+                };
+                tracing::warn!(
+                    target: "send_latency_probe",
+                    stage = "engine.wire-socket",
+                    peer = "direct",
+                    socket_id = socket_id,
+                    "send-latency-probe",
+                );
+            }
             let send_started = std::time::Instant::now();
             let send = if let Some(_sender_certificate) = story {
                 tracing::debug!("sending via unidentified (story)");
