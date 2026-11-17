@@ -72,7 +72,7 @@ impl ProvisioningPipe {
         let mut stream = ws
             .take_request_stream()
             .expect("web socket request handler not in use");
-        while let Some((req, responder)) = stream.next().await {
+        while let Some((req, responder, _frame_stamp)) = stream.next().await {
             let env = self.process_request(req, responder).await.transpose();
             if let Some(env) = env {
                 sink.send(env).await?;

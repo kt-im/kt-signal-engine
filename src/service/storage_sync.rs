@@ -449,7 +449,7 @@ pub(crate) fn account_item_key_of(manifest: &ManifestRecord) -> Option<Vec<u8>> 
 /// 写面记录类别（manifest identifier type：Account=4、StickerPack=6、
 /// Contact=1、GroupV1=2、GroupV2=3、StoryDistributionList=5、CallLink=7、
 /// ChatFolder=8、NotificationProfile=9）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum StorageRecordKind {
     Account,
     StickerPack,
@@ -1191,8 +1191,9 @@ pub(crate) async fn read_blocked_conversations(
 
 /// 单条明文 StorageRecord → (aci 小写, whitelisted)：仅 Contact 类参与
 /// （标识口径复用 `contact_engine_id`；位 = 官方 storage proto
-/// ContactRecord.whitelisted，field 10）。
-fn contact_whitelist_of(plaintext: &[u8]) -> Option<(String, bool)> {
+/// ContactRecord.whitelisted，field 10）。pub(crate)：storage.write 写面
+/// 增量观测（已知位落地，免全量重拉）复用同一解码口径。
+pub(crate) fn contact_whitelist_of(plaintext: &[u8]) -> Option<(String, bool)> {
     let record = storage_proto::StorageRecord::decode(plaintext)
         .ok()?
         .record?;
@@ -1212,17 +1213,20 @@ fn contact_whitelist_of(plaintext: &[u8]) -> Option<(String, bool)> {
 /// 全量联系人 whitelist 位 map（aci 小写 → 位），直聊发送面 profileSharing
 /// 闸的输入：官方 sendNormalMessage 以会话 `profileSharing` 位闸本机
 /// profile_key 注入（sendNormalMessage.preload.ts:183-185）；本引擎无本地
-/// 会话库，位读 Storage Service contact 记录。任一环节失败（master key
-/// 缺失 / manifest 404 / 网络 / 解密）→ 空 map——fail-open = 照常注入
-/// （官方读本地库无失败面，偏差登记 compat §5；零 stderr——daemon 静默
-/// 纪律，compat §1）。
-pub(crate) async fn contact_whitelist_map(context: &StorageContext) -> HashMap<String, bool> {
-    let Ok(master_key) = context.store.fetch_master_key().await else {
-        return HashMap::new();
-    };
-    let Some(master_key) = master_key else {
-        return HashMap::new();
-    };
+/// 会话库，位读 Storage Service contact 记录。
+///
+/// 返回值两义（发送长尾修4：磁盘层要以「成功/失败」区分**真实空拒集**与
+/// **读失败**，否则拉取失败会被当空 map 落盘毒化冷启动）：
+/// - `Some(map)`：读面确实完成（含「零联系人」「manifest 404 = 账号从未有
+///   storage 状态」两个真实空面）；
+/// - `None`：任一环节失败（master key 缺失 / 打开 storage 失败 / 网络 /
+///   auth / 解密批读失败）——调用方按 fail-open 空 map 照常注入，且**不落
+///   盘**（官方读本地库无失败面，偏差登记 compat §5；零 stderr——daemon
+///   静默纪律，compat §1）。
+pub(crate) async fn contact_whitelist_map(
+    context: &StorageContext,
+) -> Option<HashMap<String, bool>> {
+    let master_key = context.store.fetch_master_key().await.ok()??;
     let storage_key = StorageServiceKey::from_master_key(&master_key);
     let Ok(storage) = open_storage_service(
         context.push.clone(),
@@ -1230,11 +1234,15 @@ pub(crate) async fn contact_whitelist_map(context: &StorageContext) -> HashMap<S
     )
     .await
     else {
-        return HashMap::new();
+        return None;
     };
     let manifest = match storage.manifest().await {
         Ok(manifest) => manifest,
-        Err(_) => return HashMap::new(),
+        // 从未有过 storage 状态 = 真实空面（与 read_blocked_ids 同口径）。
+        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
+            return Some(HashMap::new())
+        }
+        Err(_) => return None,
     };
     let keys: Vec<Vec<u8>> = manifest
         .identifiers
@@ -1248,7 +1256,8 @@ pub(crate) async fn contact_whitelist_map(context: &StorageContext) -> HashMap<S
         .map(|identifier| identifier.raw.clone())
         .collect();
     if keys.is_empty() {
-        return HashMap::new();
+        // 真实空面：账号有 manifest 但零联系人记录。
+        return Some(HashMap::new());
     }
     let record_ikm = if manifest.record_ikm.is_empty() {
         None
@@ -1256,10 +1265,10 @@ pub(crate) async fn contact_whitelist_map(context: &StorageContext) -> HashMap<S
         Some(manifest.record_ikm.as_slice())
     };
     let Ok(auth) = storage_auth(&context.push).await else {
-        return HashMap::new();
+        return None;
     };
     let Ok(items) = read_raw_items(&context.push, auth, keys).await else {
-        return HashMap::new();
+        return None;
     };
     let mut out = HashMap::new();
     for item in &items {
@@ -1269,7 +1278,7 @@ pub(crate) async fn contact_whitelist_map(context: &StorageContext) -> HashMap<S
             }
         }
     }
-    out
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------

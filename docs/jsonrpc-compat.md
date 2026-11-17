@@ -42,16 +42,41 @@ fixture 同款）：
   `kt-signal-engine: ERROR event=startup_failed code=SingleAccountRegistryViolation accounts=N limit=1 …`，
   滚动日志落 `engine.startup` 结构化 error（`stage`/`code`/`accounts`/`limit`）。
   未设置或非 `1` 保持既有行为（多账号兼容路径）。
+- `KT_SIGNAL_STORE_KEY`（M6 C 阶段，可选）：store 静态加密的 32B key，两种编码——
+  64 个十六进制字符（大小写均可）或该 32 字节的 base64（标准/url-safe、带不带 `=` 补位均可）。
+  形状非法 = fail-closed（`StoreKeyInvalid`，不建库）；缺席 = 明文兼容路径。key 不进日志/argv/指标。
+  语义与失败码见 `docs/plan/engine-store-encryption.md` §7「C 阶段」。
+- `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED`（M6 C-1，可选）：明文库的终态开关，**默认 off**
+  （= C 阶段原样：明文库照旧可服务——有 key 时按 legacy 打开并 warn 一次，不迁移、
+  不改一个字节）。取值表（三档，去空白、大小写不敏感）：`on`/`1`/`true`/`yes` → on；
+  `off`/`0`/`false`/`no`/空串/缺席 → off；**其它值 = off + 一条滚动日志 WARN**
+  （只进 `<data-dir>/logs/engine-stderr.log`，不进 stderr——stderr 的固定行只属于
+  下面的码面；认不出**不**回落到 on：默认 off 是硬约束，笔误不该把一批账号打成终态）。
+  on 时：明文头的库（**与有没有 key 无关**）→ 该账号接收管线停环，落
+  `code=StorePlaintextRequiresMigration retryable=false`，**不是进程退出**（引擎退出码
+  仍只有 0/1/2）；库不存在且**无 key** → `StoreKeyRequired`（没 key 建不出密文库，
+  也不许再造新的明文库）；库不存在且有 key 照常建密文库。开关是**逐进程**的，
+  开与不开是发布/运维决策（按批打开），语义见 `docs/plan/engine-store-encryption.md`
+  §7 C.12。
 - JVM 相关环境（`JAVA_OPTS`/`JAVA_HOME`）：引擎非 JVM，**必须忽略**，
   不得因此失败（connector 现行启动器会设置它们）。
-- stdio：stdin 逐行请求，stdout 逐行响应/通知，stderr 除两处启动期输出外
+- stdio：stdin 逐行请求，stdout 逐行响应/通知，stderr 除三处启动期/故障输出外
   保持安静：网络路径 INFO 行（`kt-signal-engine: INFO network path:
   <direct|explicit-env|std-env|system-http|system-socks> <地址或说明>`，恰
   一条）与 `KT_SIGNAL_SOCKS_PROXY` 非法时的错误行（exit 2 前打印）。connector
   watchdog 只把「websocketioexception 或 websocket+失败关键词」形状的行判为
   接收面死活信号，INFO 行刻意避开该形状；除此之外引擎不得再写 stderr
-  （S5 单账号护栏失败行是唯一例外，固定 `kt-signal-engine: ERROR
-  event=startup_failed code=…` 形状，仅在启动失败路径出现）。
+  （两条例外：S5 单账号护栏失败行固定 `kt-signal-engine: ERROR
+  event=startup_failed code=…`，仅在启动失败路径出现；M6 C 阶段的 store 打开
+  行固定 `kt-signal-engine: ERROR event=store_open_failed code=… retryable=…`，
+  code ∈ `StoreCipherUnavailable`/`StoreKeyInvalid`/`StoreKeyRequired`/
+  `StoreKeyRejected`/`StoreCorrupt`/`StorePlaintextRequiresMigration`（仅
+  `KT_SIGNAL_STORE_REQUIRE_ENCRYPTED=on` 且库头是明文时出现，见上面的开关条目）/
+  `StoreOpenFailed`，**每进程每码恰一条**；
+  `retryable=false` 的**六类**（缺能力 / 形状非法 / 缺 key / 错 key / 库损坏 /
+  开关 on 的明文库）不进退避重连，`StoreOpenFailed` 一类 `retryable=true`
+  保持既有重试语义；语义见
+  `docs/plan/engine-store-encryption.md` §7「C 阶段」）。
   日志纪律：不落消息正文/号码/URI/密钥（代理 host:port 属网络配置，允许）。
   **引擎自身滚动文件日志（2026-10-16 send 链可观测批，§5）**：引擎进程内
   tracing 事件（vendor 传输栈 warn/error + 引擎自有失败证据行）镜像写入
@@ -114,13 +139,19 @@ fixture 同款）：
   不退出。入站单帧上限 160 MiB（含换行；与 connector 帧预算及 100MB 附件
   的 base64 膨胀对齐，超帽帧吞到行尾后拒绝并落结构化 warn，见 §5 帧帽
   对齐批）。
+
+- 入站背压（2026-11-10，M4 稳定性批，§5）：stdin 读线程 → dispatch 环为
+  有界队列（64 帧）并叠 320MiB 在途字节预算；队列/预算满时阻塞读线程
+  （背压到 OS 管道与 connector 写端），不丢帧、不再无界堆帧。分派层同时
+  最多 8 个请求在飞，超限立即回 `-32000` 结构化 busy（形状见 §3/§5）。
 - 未知方法：`-32601`（上游真实行为；fixture 对未知方法回显 `{method}` 是
   夹具宽容，引擎不效仿，见 §5）。
 
 ## 3. 逐方法对齐表
 
 错误码约定：上游业务错误用 `-1`（message 原文）；JSON-RPC 协议错误用
-标准码（-32601/-32700/-32603）。`getUserStatus` 的账号解绑错误原文为
+标准码（-32601/-32700/-32603）；引擎级背压/超时用 server error 区
+`-32000`（2026-11-10 M4/M5 批，§5）。`getUserStatus` 的账号解绑错误原文为
 `-32603` + 「Failed to send message: Authorization failed!
 (AuthorizationFailedException)」（上游把 AuthorizationFailedException 包进
 UnexpectedErrorException 的形状，connector 1.21 靠它识别解绑）。2026-10-10
@@ -145,11 +176,35 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 零收件人——群成员过滤自身后为空，请求从未构造收件人面，确定未送达；
 `SendError::NoRecipients`，群发送系与群 typing 共用，§5 批块）。
 
+2026-11-10 起（M4/M5 稳定性批，§5，engine-compat）分派层再增两个**引擎级**
+错误面（适用于所有方法，code `-32000`——JSON-RPC 保留的 server error 区，
+不是上游业务 `-1`）：入站请求在飞数达到 8 时立即回
+「Engine busy: in-flight request limit reached. (EngineBusyException)」，
+`data = {reason:"ENGINE_BUSY", retryable:true, inFlightLimit:8}`（请求
+未执行，可安全重试）；请求超出预算未收敛时取消 dispatch future 并回
+「Request timed out and was cancelled by the engine.
+(EngineTimeoutException)」，`data = {reason:"REQUEST_TIMEOUT",
+retryable:false, timeoutMs}`（mutating 请求被取消时结局可能未知，引擎
+不宣称可重试；只读调用方可自行重试）。两臂 id 均按请求回显；预算为
+普通 60s、附件上行 120s、finishLink 360s（connector 5min 链接等待契约，
+详见 §5）。
+
+附件上行全局闸再增两个 `-32603` 锚词（2026-11-10，M5，§5）：
+`(AttachmentBusyException)`（2 个全局上行槽等待超时，上行未开始，确定
+未投递、可重试）与 `(AttachmentBudgetException)`（320MiB 全局解码字节
+预算不足，在 base64 decode 之前拒绝，decode/上行均未发生、不自动重试），
+message 均为「Failed to send message: …」同风格原文。闸覆盖 `send` 的
+`attachments`/`previewImage`/`sticker` 图、`sendStory` 正文附件与
+预览图、`sendContact` avatar 与贴纸图上行（32 条/100MB 单条帽不变）；
+profile/群头像走 cdn_upload 自有字节帽，不在本闸。
+
 | 方法 | params（关键字段） | result | 错误 | 对齐状态 |
 |---|---|---|---|---|
-| `version` | `{}`（零参数，params 忽略——wire 宽容，generateInviteLinkPassword 同口径；账号无关，未绑定账号照常应答） | `{name, version}`（双字符串键恒在：name = 引擎本名 `kt-signal-engine`、version = 引擎本仓版本——诚实自报不冒充上游名；libsignal 基线不在本面，`engine.protocolCapabilities.baseline` 所有，不自造字段） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-14 real（白名单补齐批，wire additive，engine-compat）**：上游 signal-cli JSON-RPC 元方法——connector `runtime.doctor`（§4.79）版本探针的引擎腿，doctor 以空参/只读车道/3s 诊断预算调用并把应答**原样透传**（verbatim，不 re-key 不归一，doctor-contract.md 钉定）；缺该方法的引擎被 doctor 按「上游错误类」降级（`present:false` + 固定理由文案「an engine that does not carry it surfaces the upstream class」冒上桌面——真机验收发现的根因面）；读面不落调度日志零 stderr；fake：同码路真实答 |
-| `startLink` | `{}` | `{deviceLinkUri}`（real：官方 `sgnl://linkdevice?uuid=…&pub_key=…` + **单个** `capabilities=nopni,nopni2,backup5` 参数，`qr_link_url` 收敛面） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩。**2026-10-15 real（转移弹窗修复批，engine-compat）**：capabilities 收敛为单参数并保证 `backup5` 在位——此前 `link_uri`（nopni,nopni2）+ `append_pair`（backup5）产出两个同名参数，Android 扫码侧 `Uri.getQueryParameter`（单数）只取第一个，`backup5` 被吞 → 手机判 VALID_WITHOUT_SYNC：链接成功但不弹「转移聊天记录」、不上传迁移档案 |
-| `finishLink` | `{deviceLinkUri, deviceName}` | `{number, aci?}`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批） | `-1` `Unknown device link uri.` | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩 |
+| `version` | `{}`（零参数，params 忽略——wire 宽容，generateInviteLinkPassword 同口径；账号无关，未绑定账号照常应答） | `{name, version, contractRevision}`（旧双键恒在：name = 引擎本名 `kt-signal-engine`、version = 引擎本仓版本——诚实自报不冒充上游名；libsignal 基线不在本面，`engine.protocolCapabilities.baseline` 所有，不自造字段。**2026-11-10 O1 握手引擎腿 additive【engine-compat】**：`contractRevision` = 引擎共享契约修订字符串，单源常量 `src/contract.rs::CONTRACT_REVISION`（当前 `1.285`），与 `engine.protocolCapabilities.contractRevision` 同值；connector `src/engine_contract.rs` O1 握手以闭区间 `1.200-1.285` 数字比较，本面是 capabilities 权威面的回退面） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-14 real（白名单补齐批，wire additive，engine-compat）**：上游 signal-cli JSON-RPC 元方法——connector `runtime.doctor`（§4.79）版本探针的引擎腿，doctor 以空参/只读车道/3s 诊断预算调用并把应答**原样透传**（verbatim，不 re-key 不归一，doctor-contract.md 钉定）；缺该方法的引擎被 doctor 按「上游错误类」降级（`present:false` + 固定理由文案「an engine that does not carry it surfaces the upstream class」冒上桌面——真机验收发现的根因面）；读面不落调度日志零 stderr；fake：同码路真实答。**2026-11-10 O1 握手引擎腿（wire additive【engine-compat】）**：新增 `contractRevision`（单源常量 1.285，与 `engine.protocolCapabilities` 同值），旧 `{name, version}` 双键零变化，见 §5 O1 块 |
+| `getSyncState` | `{account}`（未注册/已摘除账号 `-32603`；params 其余键忽略，读面惯例） | `{contacts, storage, profile, sinceMs}`（三半边相位词表封闭 `idle`/`inflight`/`done`/`failed`；`sinceMs` = 当前窗口开窗时刻 epoch ms——消费方的新鲜度锚，窗口开在调用方自己的 gate 之前即视为陈旧面） | 未注册/已摘除账号 `-32603`；其余无业务错误面（纯读，不触网） | **2026-11-12 real（阶段 1-1，SIGNAL-STAGE1-DESIGN §二 P-B-3，wire additive【engine-compat】，§5 块）**：收件箱 gate 的「拉」兜底查询——登录窗 sync 臂内部簿记的只读投影，零新状态机（无定时器/无重试/无决策）。数据源：注册表窗口簿（`add_account`/`remove_account`/启动装载）+ contacts 半边的 `post_registration_syncs_complete`（`contactSync.complete` 持久化位）+ storage 半边的 `engine.storagePull`（`trigger=login`，T-9b 结果事件两腿 join 面）与 `engine.initialSyncComplete.manifestOk`（登录拉被 30s 上限掐断时的兜底面）+ profile 半边的 `initialSyncComplete.profilesOk`。观测点唯一在 `service::outbound`（通知出口），只解析两个低频事件。相位语义：`inflight` = 窗口在飞且该半边未落定（窗口 TTL 120s 内）；`done`/`failed` = 观测到的首次落定面（迟到重复不改写）；`idle` = 无窗口或窗口已过 TTL 仍未落定（一次性窗已过，不发明 failed）；contacts 半边无 `failed` 面（三请求上行 best-effort，进程内无可观测失败事件，如实缺席）。**纯读幂等**：查询不建簿不改簿，重复调用逐字节一致（验收项）。fake：恒 `{idle,idle,idle}`（无真实同步臂，不伪装在飞） |
+| `startLink` | `{}` | `{deviceLinkUri, linkAttemptId, slots}`（`deviceLinkUri` = 第 0 槽，旧端逐字兼容；`linkAttemptId`（attempt 键）与 `slots: [{deviceLinkUri, slot}]`（live 槽表，slot 号 = 下标）是 2026-11-11 双槽轮换 additive 键。real：官方 `sgnl://linkdevice?uuid=…&pub_key=…` + **单个** `capabilities=nopni,nopni2,backup5` 参数，`qr_link_url` 收敛面） | — | **P1b real**：presage provisioning（设备名先占位，§5）；fake：夹具形状桩。**2026-10-15 real（转移弹窗修复批，engine-compat）**：capabilities 收敛为单参数并保证 `backup5` 在位——此前 `link_uri`（nopni,nopni2）+ `append_pair`（backup5）产出两个同名参数，Android 扫码侧 `Uri.getQueryParameter`（单数）只取第一个，`backup5` 被吞 → 手机判 VALID_WITHOUT_SYNC：链接成功但不弹「转移聊天记录」、不上传迁移档案；**2026-11-11 real（双槽 QR 轮换引擎腿，wire additive【engine-compat】，§5 块）**：新增 `linkAttemptId`/`slots` 两键，第 0 槽仍由顶层 `deviceLinkUri` 表达——没有 rotate 的调用方行为零变化（单槽语义原样），新 startLink 仍作废上一个 attempt（旧 attempt 的全部槽按未注册回收、在飞 finish 回 LINK_LOST） |
+| `rotateLink` | `{linkAttemptId}`（attempt 键，来自本 attempt 的 startLink 应答；缺席/非字符串 fail-closed 到同一码位） | `{deviceLinkUri, slot, slots}`（新槽 uri + 槽号 + 该 attempt 当前 live 槽全表；槽号 = live 槽表下标，收回后重排，调用方按 `slots` 全量重渲染） | `-1` `LINK_ATTEMPT_NOT_FOUND`（attempt 不存在/已被新 startLink 顶掉/已随提交收口）；其余折叠 `-32603` | **2026-11-11 real（双槽 QR 轮换引擎腿，wire additive【engine-compat】，§5 块）**：为同一 attempt 铸新 provisioning 会话（复用 startLink 的单槽铸造路径 `mint_link_slot`）；live 槽上限 2，第 3 个槽进 = 最旧槽退（abort 其 flow、按未注册回收、落 LINK_LOST 墓碑）；要退的槽上有在飞 finish 时不 abort（只置退休旗，收口延后到它归零）——轮换绝不丢掉用户正在确认的那次提交 |
+| `finishLink` | `{deviceLinkUri, deviceName}` | `{number, aci?}`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批） | `-1` `Unknown device link uri.`；`-1` `LINK_LOST`（B1/issue #951：URL 交付后 provisioning WS 关闭/超时/流结束 = 会话已死，确定性失败，不是 -32603） | **P1b real**：等手机确认（阻塞不饿死其他方法），设备名本地改写 + attributes 推送（ADR 0004）；fake：形状桩。**2026-11-11 real（B1 链接会话 lost 批，wire additive【engine-compat】，§5 块）**：link_flow 在 URL 交付后 provisioning 会话终局（WS 关闭/keepalive 超时/流结束）归类 LinkError::Lost，注册数据落库/重载失败仍 Internal；每个 link 用独立 `uri→PendingRecord{state,result,committed}`，finishLink 只等自己的记录，只有真正执行过 add_account 的记录才回 Ok，被新 start 顶掉的旧 finish 回 LINK_LOST/UnknownUri；新 start 以 supersede 代次复核后登记 pending，锁外 abort 旧 flow（JoinHandle + state 收口），旧未提交 store 回收 |
 | `listAccounts` | `{}` | `[{"number", "aci"?, "capabilities"?}]`（aci additive 2026-10-13，connector 契约 1.142 消费面，§5 批；capabilities additive 2026-10-20，回填能力门数据面，§5 块——`{attachmentBackfill: bool}` 单键对象，取不到时整键缺席）；无账号时空数组 | — | **P1b real**：state v2 注册表（号码→store 目录）；**2026-10-20 real/fake（回填能力门数据面批，wire additive，engine-compat，§5 块）**：条目 additive `capabilities` 键 = 本机 profile 的 `capabilities.attachmentBackfill`（官方 `isBackfillEnabled` 消费位，attachmentBackfill.preload.ts:57-72），有界缓存 + 整批 2s 预算，读面失败/超时/未注册 = 整键缺席（不投 false、不连坐列表）；fake 形状桩投引擎自声明位 |
 | `listContacts` | `{account}` | `[{number, name?, profile?: {givenName?, familyName?}, isHidden?, profileSharing?}]`（store 同步面；未注册账号 `-32603`） | 未注册账号 `-32603` | **P2 real**：presage contacts 投影；**2026-10-16 real（profile 名字刷新批，wire additive，engine-compat，§5 块）**：条目 additive `profile` 键——`{givenName, familyName}` 仅非空时出现（两件全空 = 整键不在；no-null 纪律，缺席与 null 折叠同一无键态），数据源 = profiles 表（`profiles.refreshContacts` 拉取落库面，键形状与 signal-cli 同形：givenName/familyName，connector supervisor 消费腿同形）；`name` 键语义不变（contacts 同步名，缺席键不在）。**2026-10-24 real（消息请求 B 批，wire additive，engine-compat，§5 块）**：条目 additive `isHidden` / `profileSharing`——官方 `isConversationAccepted` 的 `isInSystemContacts`（hidden 取反）与 `profileSharing` trusted-contact 因子；contacts 表同步行 `isHidden:false`、非通讯录 profile 行 `isHidden:true`；`profileSharing` 读 Storage Service 联系人 whitelist 位（发送链同一 map/缓存），记录缺席 = 键缺席（诚实未知），读面失败空 map = 全键缺席（fail-open）；connector `mrr_factors_stamp` 消费腿零改动 |
 | `profiles.refreshContacts` | `{account}`（字符串必需，缺席/非字符串 fail-closed `-32603`——phoneLookup 同款参数纪律；无逐联系人物品参数——本方法不接受目标清单，目标集恒由 store 推导，调用方无法借它探测任意 uuid 的 profile） | `{refreshed, failed, skipped}`（三计数恒在，u32 字面；只计数不含任何身份/号码/名字内容——引擎零联系人外传纪律同向）。refreshed = 本次实际发起 profile 拉取且成功；failed = 拉取失败**或**整批时限到期未尝试（含拉取成功但服务器侧名字材料仍空——计数语义是「刷新动作结局」而非「名字出现」）；skipped = 无需刷新（无 profile_key / 名字材料已在库 / contacts.name 非空） | 未注册账号 `-32603`；无账号库可达同折叠 | **2026-10-16 real（KT 扩展，profile 名字刷新批，wire additive，engine-compat，§5 块）**：登录绑定完成后的自动批（60s 一次性纪律同门，+10s 联系人沉降）与本显式方法共用同一刷新单点（`refresh_contact_profiles`）：目标集 = store contacts 中 profile_key 在库且名字材料为空者，presage `retrieve_profile_by_uuid` 同路径拉取（vendored registered.rs 同路：缓存查 → 服务器拉 → ProfileCipher 解密 → `save_profile` 落 **profiles 表**——落表查证结论：不是 contacts.name），并发 ≤3（独立 manager 各自持 websocket 槽）、单联系人失败不中断批次、整批时限 20s（到期未尝试计 failed）；presage 侧 profile 缓存（查到即回、无网络）使重复刷新零流量幂等；fake：`{refreshed:0, failed:0, skipped:0}`（形状桩，不落调度日志，读面纪律） |
@@ -245,7 +300,7 @@ prekey 拉取失败 `(PreKeyFetchException)`、会话建立失败
 | `backups.cloudStatus` | `{account}`（仅契约形状校验，不参与路由——进度面进程级单槽，同引擎至多一个 restore） | `{present: bool}`；present=true 时 `{present, phase, bytesRead(u64), bytesTotal?(u64), errorCode?}`——phase：`downloading`=在途（字节计数有效，total 缺席不给假 0）/`failed`=终态失败（`errorCode` 透出同码表，快照保留至下次 start 覆盖，不装死）；快照缺席（未开始/已成功收尾/引擎重启过）= `{present:false}`（成功终态不留痕清缺，产物走 NDJSON 消费链——transfer_archive「无论成败收尾清快照」同纪律；`history.importCancel` 取消同清，按会话归属账号判定） | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态，transfer.downloadStatus 同纪律） | **2026-10-08 real（KT 扩展，云备份 restore 批）**：只读轮询面（backup.exportStatus/transfer.downloadStatus 同语义，无推送事件轮询到终态）；快照进程内存不跨重启；只读不落调度日志零 stderr；**2026-10-14 起取消经 `history.importCancel`**（在途任务 abort + 半成品清理 + 快照/归属清缺，运行闸经 RunningGuard Drop 释放不泄漏） |
 | `backups.uploadToCloud` | `{account}` | `{"status": "started"}`（全链后台化：装配段=专用 OS 线程（§10.3 同款，工件→main 容器流式写→临时产物 `<account_dir>/cloud-upload-main-tmp`）→上行段=LocalSet watcher：凭据拉取（restore §1 链同源，404 引导自愈）→zkgroup 兑换呈现→生产 chat 未鉴权 gRPC `get_upload_form`（cdn===3 强制）→TUS create-with-upload 单发 POST（`Tus-Resumable: 1.0.0` + `Upload-Length` + `Upload-Metadata: filename <b64(form.key)>` + form headers，body=密文产物 128 KiB 块流式读盘，请求级超时 900 s）→`refresh_backup`；终态经 `backups.uploadStatus` 观测；upload 面=官方桌面 `Backups.upload` 同链，产物 remote 型与一期 local 容器逐字节同构，派生钥=`derive_keys`+remote 臂（Some(forward-secrecy token)→NEW_DST），契约钉定 cloud-backup-contract §6.1） | account 缺失/非字符串 `-32603`；结构化码八族均 `-1` + message 码位（`CloudUploadError::rpc_code` 单一映射源，带 detail 时附 `data.detail`；uploadStatus failed 相位同表两端不漂）：同步段 `BACKUP_AUTH_FAILED`（未注册/fake 账号、AEP/registration/身份密钥缺席或 zkgroup 兑换被拒，retryable=false）、`BACKUP_UPLOAD_ALREADY_RUNNING`（同引擎已有在途 upload 重入，**新码位，白名单登记归 connector 透传批**，retryable=false）、`BACKUP_ARTIFACT_MISSING`/`BACKUP_ARTIFACT_INVALID`（工件缺席/首行非法，非法当场删工件，retryable=false）；后台段失败经 uploadStatus failed 相位透出：`BACKUP_NOT_PROVISIONED`（引导自愈后仍无档，retryable=false）/`BACKUP_TRANSPORT_FAILED`（凭据/form gRPC/refresh_backup，retryable=true）/`BACKUP_UPLOAD_FAILED`（**新码位，白名单登记归 connector 透传批**：cdn≠3/非 2xx/超帽/上行读盘，retryable=true——上传 POST 已离站=unknown-outcome 窗口，重试=整链重来）/`BACKUP_IO_FAILED`（临时产物写面，retryable=false）（cloud-backup-contract §6.2） | **2026-10-08 real（KT 扩展，云备份 upload 批）**：官方 TUS 单发协议实锤（桌面 tusProtocol.node.ts create-with-upload：`POST {signedUploadLocation}` 2xx=完成，无断点续传——引擎同口径单发，失败=failed 终态不自动重试）；上传 POST 用 `HttpAuthOverride::Unidentified`（预签名 URL 不附账号 basic auth）；凭据/header 不落日志不落盘；临时产物任何终态必删（官方 finally unlink 同款），崩溃残留由下次上传覆盖写收敛；产物 1 GiB 帽 fail-closed（form 段 `UploadTooLarge` 同映射 `BACKUP_TRANSPORT_FAILED`，契约 §6.1 裁定）；media 档出范围（messages 档密文归档；mediaRootBackupKey 每次随机 32B，契约差异登记同 §10.5）；运行闸进程级单槽 CAS；send lane mutating；fake 账号无 store 同未注册答 `BACKUP_AUTH_FAILED`；不落调度日志零 stderr |
 | `backups.uploadStatus` | `{account}`（仅契约形状校验，不参与路由——进度面进程级单槽，同引擎至多一个 upload） | `{present: bool}`；present=true 时 `{present, phase, bytesRead(u64), bytesTotal?(u64), errorCode?}`——phase：`exporting`=装配段在途（无字节计数语义，bytesRead=0）/`uploading`=上行段（块计数有效，total=产物字节不给假 0）/`failed`=终态失败（`errorCode` 透出同码表，快照保留至下次 start 覆盖，不装死）；快照缺席（未开始/已成功收尾/引擎重启过）= `{present:false}`（成功终态不留痕清缺——restore cloudStatus 同纪律） | 无（参数缺失/未注册/fake 账号同样答 `{present:false}`：快照面是进程内观测，不泄露注册状态，cloudStatus 同纪律） | **2026-10-08 real（KT 扩展，云备份 upload 批）**：只读轮询面（cloudStatus/transfer.downloadStatus 同语义）；快照进程内存不跨重启；只读不落调度日志零 stderr |
-| `engine.protocolCapabilities` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{deviceCapabilities: {storage, transfer, attachmentBackfill, spqr, profiles_v2, usernameChangeSyncMessage, versionedExpirationTimer, optionalPhoneNumber}, deviceCapabilitiesUpload: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}, linkCapabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage}, baseline: {presageRev, libsignalVersion, libsignalCommit}}`（能力位 JSON 形状 = vendor serde 属性输出：camelCase、`profiles_v2` 按上游字面保持 snake——线上声明即此拼写；位值 = 引擎实际向服务器声明的协议能力，真相源与防漂移闸见 §5 引擎自证面块；`deviceCapabilitiesUpload` = D5 设备面注册位（官方 CapabilitiesUploadType 四键）；baseline = 编译期钉定的依赖锚，运行时不查网络） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-10 real（KT 扩展，引擎自证面批）**：引擎以 linked device 身份的声明如实自报——账号属性面 DeviceCapabilities（presage 主注册链同值的钉定镜像）+ 链接面 LinkCapabilities（link_device 取 `LinkCapabilities::default()` 三位，运行时 live 复用 vendor 构造器）；spqr 恒 true（vendor 链已声明，上游 2026-03 强制过滤批量注销不达标客户端的核对面）；不落调度日志零 stderr。**2026-10-11 D5 additive**：deviceCapabilities 补 `versionedExpirationTimer`/`optionalPhoneNumber` 两位（server 真相 DeviceCapability.java 全集对齐，均 false），新增 `deviceCapabilitiesUpload` 面（engine.deviceCapabilities 的 PUT body 同形） |
+| `engine.protocolCapabilities` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{contractRevision, deviceCapabilities: {storage, transfer, attachmentBackfill, spqr, profiles_v2, usernameChangeSyncMessage, versionedExpirationTimer, optionalPhoneNumber}, deviceCapabilitiesUpload: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}, linkCapabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage}, baseline: {presageRev, libsignalVersion, libsignalCommit}}`（能力位 JSON 形状 = vendor serde 属性输出：camelCase、`profiles_v2` 按上游字面保持 snake——线上声明即此拼写；位值 = 引擎实际向服务器声明的协议能力，真相源与防漂移闸见 §5 引擎自证面块；`deviceCapabilitiesUpload` = D5 设备面注册位（官方 CapabilitiesUploadType 四键）；baseline = 编译期钉定的依赖锚，运行时不查网络；`contractRevision` = 共享契约修订（2026-11-10 O1 握手引擎腿 additive【engine-compat】，单源常量 `src/contract.rs::CONTRACT_REVISION`，当前 `1.285`，connector O1 支持区间 1.200-1.285，见 §5 O1 块） | 无（只读常量应答，无业务错误面；fake/real 同码路真实答） | **2026-10-10 real（KT 扩展，引擎自证面批）**：引擎以 linked device 身份的声明如实自报——账号属性面 DeviceCapabilities（presage 主注册链同值的钉定镜像）+ 链接面 LinkCapabilities（link_device 取 `LinkCapabilities::default()` 三位，运行时 live 复用 vendor 构造器）；spqr 恒 true（vendor 链已声明，上游 2026-03 强制过滤批量注销不达标客户端的核对面）；不落调度日志零 stderr。**2026-10-11 D5 additive**：deviceCapabilities 补 `versionedExpirationTimer`/`optionalPhoneNumber` 两位（server 真相 DeviceCapability.java 全集对齐，均 false），新增 `deviceCapabilitiesUpload` 面（engine.deviceCapabilities 的 PUT body 同形）。**2026-11-10 O1 握手引擎腿 additive【engine-compat】**：新增 `contractRevision`（与 version 面同值，单源常量 1.285），connector O1 握手以本面为权威面判 `match`/`legacy`/`mismatch` |
 | `engine.deviceCapabilities` | `{account}` | `{account, registered: true, capabilities: {attachmentBackfill, spqr, usernameChangeSyncMessage, optionalPhoneNumber}}`（capabilities = PUT /v1/devices/capabilities 的 body 同形回读，位值 = 钉定镜像，见 §5 D5 块） | 未知/未注册账号 `-32603`（open_registered 未命中折叠，不泄露注册态）；服务器 401 解绑 `-32603` + getUserStatus 解绑原文同款；其余服务器失败 `-32603` 折叠（位值声明幂等，重试安全） | **2026-10-11 real（KT 扩展，D5 设备面注册批）**：官方 registerCapabilities 同端点手动触发 + 上传面回读（宿主可查询）；fake 恒已注册（getUserStatus 同款）；接收管线建流另有自动注册（同一位值常量，每管线运行成功一次即止）；触网不落调度日志零 stderr |
 | `engine.perfMetrics` | `{}`（参数忽略，账号无关——无 `account`，未绑定账号照常应答） | `{uptimeMs, timings, counters, unknownKeyDropped, accounts, outbound}`（timings 条目 `{count, totalUs, maxUs, lastUs}` 微秒制、键序 BTreeMap 确定性；词表封闭见 §5 S2a 块——未命中的计时/计数键不出现，诚实缺席不发明 0；稳定性批 2026-10-20 additive：`accounts` = 逐账号 `{inflight, receive{count,totalUs,maxUs,lastUs,p50Us,p95Us}, receiveLag{...Ms}, streamConnected, streamRecoverable, streamUnbound, crashes}`，`outbound` = `{globalDepth, globalCapacity, accounts{account: 在途帧数}}`，见 §5 稳定性批块） | 无（只读快照应答，无业务错误面；fake/real 同码路真实答——指标是进程真相，不分模式） | **2026-10-12 real（KT 扩展，S2a 性能基线打点层，【engine-compat】，§5 S2a 块）**：进程内有界指标注册表的只读投影（只测不改立项纪律，`kt-desktop-wt-signal/docs/plan/signal-runtime-followup-projects.md` §附四②）；快照进程内存不跨重启；词表外键计 `unknownKeyDropped` 丢弃（有界面）；消费面 = connector 白名单透传（**connector 切片遗留**）+ S2b 直连实测 harness；不落调度日志零 stderr。**2026-10-20 稳定性批（A1，wire additive【engine-compat】）**：追加 `accounts`/`outbound` 两键（审计 §9.13.2 A1：mailbox 深度/在飞/p50·p95/接收延迟/重连次数）；基础四键形状与词表零变化，见 §5 稳定性批块 |
 | `deleteForMeConversation` | `{account, kind("contact"\|"group"), conversationId, localOnly?, mostRecentMessages?, mostRecentNonExpiringMessages?}`（会话级「为我删除」上行，官方 deleteConversation 发送面同位。kind：contact = service-id 串（ACI/PNI）\|E164（`+` + 1..15 位数字）双形态——官方 getConversationIdentifier aci/e164 优先序；group = 32B 标准 base64 群 master key（decode_group_id 闸，listGroups id 同源）；legacyGroup 不在词表——官方非 GV2 群 throw（syncIdentifiers.preload.ts:148-150）同拒。localOnly 缺省/null = false：全量清空臂，`mostRecentMessages` 必填非空数组、条目 ≤5（官方 slice(0,5) 上限镜像，超出 fail-closed 不静默截断破坏性意图），`mostRecentNonExpiringMessages` 可选 ≤5（官方 areAnyDisappearing 伴随面）；true = 仅本地臂，mostRecent* 必须缺席（官方 local-only else 分支无消息位）。条目 `{author, timestamp}`：author = service-id 串\|E164 直通（官方 toAddressableMessage 形态，引擎不做号码↔service id 二次变换——作者身份须与手机端消息行逐字匹配），timestamp 非零整数） | `{status: "sent"}`（群族成功答同纪律） | 参数缺失/形状错（account 缺席、kind 词表外、conversationId 形状错——contact 非 service-id·非 E164、group 非 base64·≠32B、localOnly 非布尔、全量清空臂 mostRecentMessages 缺席·空批·非数组·超 5、nonExpiring 超 5、仅本地臂 mostRecent* 在场、条目 author 缺失·不可解析、timestamp 缺失·0·负数·非整数）`-32603`；未注册账号 `-32603`；发送链错误面 = send 系同款（解绑 `-32603` + getUserStatus 解绑原文、限流/人机验证/服务端不可用同 send_error_of 分类） | **2026-10-11 real（KT 扩展，P15c 项3，官方对齐 conversations.preload.ts:5640-5663 + SendMessage.preload.ts:1840 getDeleteForMeSyncMessage，engine-compat，§5 P15c 块）**：会话级「为我删除」上行两变体——全量清空臂 = SyncMessage.deleteForMe.conversationDeletes[0]{conversation, isFullDelete: true, mostRecentMessages, mostRecentNonExpiringMessages?}（delete-conversation 语义：手机端按 mostRecent 定位并全量清空 + 服务器删除）、仅本地臂 = localOnlyConversationDeletes[0]{conversation}（delete-local-conversation：其他设备仅清本地行）；会话标识三形态 binary-first（threadServiceIdBinary 现行面/threadE164/threadGroupId = master key bytes，官方 toConversationIdentifier isProtoBinaryEncodingEnabled 同位）；padded sync message；desktop 上行接线归后续批；fake：两臂成功 `{status: "sent"}` 形状桩，参数闸同口径（契约测试钉定），落调度日志 |
@@ -5089,6 +5144,12 @@ round-trip 保真单测早已钉定，仅缺写面接线）。
     `send_group_mrm` / `send_group_failover` / `send_group_repair_round`
     （409/410 修复轮）、`prekey_quick_check_time_trigger` /
     `prekey_quick_check_volume_trigger`、`stream_outcome_*` 四出口。
+  - 计数（2026-11-10 Duplicate 恢复臂观测 additive）：`duplicate_replay_*`
+    四键——`spawn_failed`（replay 任务无法 spawn）、`panic`（任务 panic）、
+    `aborted`（任务被取消）三键 = 投影状态未知，ack 扣留；`unavailable`
+    （thread_messages 行缺失/重建失败，含 dedupe key miss；2026-11-10
+    phase2 起 kt_outbox 已 DROP，这里是唯一恢复源）= 无可投影，按「无可投影
+    = 已投影」flush 后照常 ack（止血 b，避免服务器重投风暴），只留计数/日志。
 - **纪律对位**：零 stderr（compat §1 watchdog 判死活）；测量点全走单一
   咽喉（Service::flush_barrier / lock_registered_for_send /
   dispatch_group / failover / project_content 薄壳），调用序/返回值/控制流
@@ -5441,7 +5502,8 @@ connector 原样冒上桌面。本批闭合引擎供给腿（connector/桌面零
   - 应答消费 = **原样透传**：doctor 把 result 装进 `EngineMethodFace.face`
     逐字上桌面（不 re-key、不归一、不重推导）；doctor-contract.md 对该
     face 的机器判据只有「是 JSON 对象」，字段级形状以上游 signal-cli
-    `version` 应答为准 = `{name, version}` 双字符串键。
+    `version` 应答为准 = `{name, version}` 双字符串键（2026-11-10 O1
+    握手引擎腿批 additive `contractRevision`，旧双键不变）。
   - 错误语义 = 错误类降级：timeout/not-running/exited/backpressure 答
     「stopped answering mid-probe」，其余错误（含本批修的 `-32601`）答上游
     错误类固定理由——present:false + reason，诊断整体不失败。
@@ -5449,7 +5511,8 @@ connector 原样冒上桌面。本批闭合引擎供给腿（connector/桌面零
   generateInviteLinkPassword 同口径；账号无关，未绑定账号照常应答；
   fake/real 同码路真实答——常量面无模式分叉，calls.endorsementsPublicKey
   同款）；读面不落调度日志零 stderr（engine.protocolCapabilities 同纪律）。
-  应答 `{name: "kt-signal-engine", version: CARGO_PKG_VERSION}`——身份诚实
+  应答 `{name: "kt-signal-engine", version: CARGO_PKG_VERSION, contractRevision}`
+  （末键 2026-11-10 O1 批 additive，单源常量）——身份诚实
   自报引擎本名与本仓版本，不冒充上游名（doctor 原样呈现，冒名将制造
   「signal-cli 0.1.0」式误读，自证面「如实自报」同纪律）；libsignal 基线
   **不在本面**（`engine.protocolCapabilities.baseline` 的
@@ -6285,7 +6348,8 @@ wire 面：`syncMessage.keys` 增 `accountEntropyPoolPresent` 布尔一位
    时序不改判定面；偏差登记面（compat §5 fail-open）不变。
 3. **探针词表 additive（perf 词表，零 wire）**：`engine.deliver-self-async`
    （后台转录腿时长，outcome=ok|err）；暗区三段子探针
-   `engine.whitelist`（cache=hit|miss 固定词）/ `engine.upload-pre` /
+   `engine.whitelist`（cache=hit|persisted|miss；persisted 为修4 磁盘层
+   扩词）/ `engine.upload-pre` /
    `engine.sticker-pre`（no-op 段同样落行，钉死排除法；原
    `engine.upload` 条件行更名 `engine.upload-pre` 且恒落）。
    `engine.deliver` 保持总观（现 = 主投递腿时长，不含后台转录腿）。
@@ -6311,11 +6375,85 @@ send_warmup 启动预热批之后，同一 `spawn_local` 任务、60s 一次性�
   fake 模式早退（与 send_warmup 批同姿态）。
 - **验证面**：新增探针行 `engine.whitelist-warmup`（send-latency-probe
   词表 additive，warn 级）：`dur_ms`（预热全程）、`account`（前 8 字符
-  前缀）、`cache = hit|filled|err` 固定词。复现验证口径：预热行
-  cache=filled 之后，同窗首条真实 send 的 `engine.whitelist` 段应为
-  cache=hit 且 dur_ms≈0；cache=err 则下条 send 照旧 cache=miss（诚实）。
+  前缀）、`cache = hit|filled|err` 固定词（修4 扩 busy = 同账号刷新在途）。
+  复现验证口径：预热行 cache=filled 之后，同窗首条真实 send 的
+  `engine.whitelist` 段应为 cache=hit 且 dur_ms≈0；cache=err 则下条 send
+  照旧 cache=miss（诚实）。
 
 wire 面：零变化（方法/应答/错误面全部不动；探针行为纯日志）。
+
+### profileSharing 闸读面磁盘层（2026-11-10，发送长尾修4：冷启动/过期不再同步拉 Storage Service，零 wire 变化【engine-compat】）
+
+**现场（修3 遗留面）**：TTL 600s 的进程缓存只解「TTL 内重复发送」；进程
+冷启动（watchdog 重启、池槽迁移）或 TTL 过期后的**首条** send 仍付 ~1.8s
+Storage Service 全量拉取（`engine.whitelist` cache=miss）。修3 预热在 sync
+臂沉降带（≥10s 后）才回填，进程刚起、连接器立刻发消息时仍踩冷缓存。
+
+**修法（读面三级 + 账号目录磁盘快照）**：
+
+1. **进程内存**（TTL = `WHITELIST_CACHE_TTL` 600s，修1 语义不变）；
+2. **账号 store 目录磁盘 map**：`accounts/lk-<hex>/profile-sharing-whitelist.json`
+   （`service::whitelist_store`），形状
+   `{version: 1, accountHash, updatedAtMs, denied: [aci…]}`：
+   - `accountHash` = 账号不可逆短哈希（`probe_account8` 同源，**不落号码
+     明文**）；哈希不符（目录换用/复制）→ 当无 map，绝不复用他人快照；
+   - `denied` = **只落显式 `whitelisted == false` 的 ACI**（拒集）。位 true
+     与缺记录在闸判定 `include_profile_key_for` 上同义（fail-open 注入），
+     落全集等于把联系人台账写进引擎（AGENTS.md 边界），落拒集信息量等价、
+     暴露面最小；读回 map 只含 false 条目，判定式零变化；
+   - `updatedAtMs` = 最近一次成功全量读的墙钟毫秒；`0` = 写面陈旧标记
+     （语义 = 「map 已知但陈旧」而**不是**「无 map」）；
+   - **未来时间戳边界（修5，2026-11-10）**：`updatedAtMs` 比现刻晚出
+     `MAX_FUTURE_SKEW_MS`（300s）以上 = 陈旧。未来时刻只可能来自系统时钟
+     回拨、手工改表或旧机快照复制，认可它等于让一份陈旧拒集**无限续命**
+     （`now - updatedAt` 恒为负 → 永远「新鲜」）。偏差窗内的未来时刻
+     （毫秒~分钟级抖动）仍按新鲜处理，免得为跨主机小漂移白拉一次网络；
+   - 版本不符 / 坏 JSON / 字段缺失 → 当无 map；写面固定「同目录临时文件 +
+     rename」原子替换；**拉取失败不写不删**（旧 map 原样）。
+3. **bootstrap 同步全量读**：**仅**「该账号从未有任何持久化 map」才发生
+   （首装 / 账号目录被清），成功后立即落盘，此后不再阻塞发送。
+
+**读面调度（发送路径零阻塞）**：
+
+| 场景 | 行为 | `engine.whitelist` cache= |
+|---|---|---|
+| 内存命中且不需刷新 | 零网络零磁盘 | `hit` |
+| 内存 miss + 磁盘 map 新鲜（≤600s） | 磁盘应答，零网络 | `persisted` |
+| 内存 miss + 磁盘 map 陈旧（>600s / 标记 0） | 磁盘应答 + 排后台刷新（单飞） | `persisted` |
+| 内存 miss + 磁盘 map 时刻在未来越界（>now+300s，时钟回拨/异常） | 磁盘应答 + 排后台刷新（单飞），**绝不当新鲜** | `persisted` |
+| 内存 miss + 磁盘 map 时刻在未来偏差窗内（≤now+300s，抖动） | 磁盘应答，按新鲜缓存满窗 | `persisted` |
+| 无任何持久化 map | bootstrap 同步拉一次 + 落盘 | `miss` |
+| 账号启动装载（接收管线起点） | 磁盘 → 内存，纯本地读 | — |
+
+- **加载点**：账号接收管线起点（`seed_profile_sharing_whitelist`）；重连不
+  覆盖已热条目；内存 deadline 与磁盘剩余新鲜寿命对齐（不让内存续命把陈旧
+  快照拖过新鲜窗）。
+- **写回点**：bootstrap 成功 / 后台刷新成功 / 预热成功，三者同
+  `whitelist_store::persist_fetch` 单点；`storage.write` Contact 臂**增量**
+  落盘（明文里就带位，免重拉——无持久化 map 时不落半份拒集：半份快照会
+  抑制后续 bootstrap，让未知拒条目静默丢失）。
+- **失效点**：`setConversationBlocked` / `setConversationState` / 入站 merge
+  Contact 观测 → 内存失效 + 磁盘打陈旧标记，下一次发送命中磁盘后**后台**
+  重拉；**绝不回落同步拉取**。
+- **失败姿态**：后台刷新/预热失败保留旧 map（内存与磁盘都不动），零
+  stderr，只打点；同账号刷新在途时发送路径不排第二份网络请求（单飞）。
+- **delete_account**：账号目录整体删除，磁盘 map 随目录消失，内存条目同时
+  摘除。
+
+**验证（单测钉定）**：冷启动有持久化 map 时读面零 Storage 拉取（fetch 计数
+0）；过期只排后台刷新（inline 0 次）；无 map 时 bootstrap 恰一次且落盘后
+「重启」零拉取；拉取失败不落盘、不覆盖旧 map；拒集读回后闸判定逐条同义
+（显式 false 不注入、缺记录注入）；**未来时间戳**（`now+300s+1`、`now+24h`、
+`u64::MAX` 邻域）判陈旧且只排后台刷新、旧 map 照常应答，偏差窗闭边界
+（`now+300s`）仍新鲜——启动装载面同一判据（种子条目 `refresh_due`，零
+inline 拉取）。
+
+**新探针**：`engine.whitelist-refresh`（send-latency-probe 词表 additive，
+warn 级）：`dur_ms` / `account`（前 8 hex）/ `outcome = ok|err`；
+`engine.whitelist-warmup` 的 `cache` 词表扩为 `hit|filled|busy|err`
+（busy = 同账号刷新在途，未重复轰网络）。
+
+wire 面：零变化（方法/应答/错误面全部不动；新文件只落在引擎 --data-dir 内）。
 
 ### 接收风暴死循环批（2026-10-17，DuplicatedMessage 分类 + 有界重试真界，零 wire 变化【engine-compat】）
 
@@ -6774,6 +6912,159 @@ connector 消费面（异仓）、leg 3/3 = 本批消息级发送面。此前引
   `delete_for_me_messages_faces_and_param_fail_closed` 覆盖 fake 成功、
   256 帽边界、逐参数拒、real 未注册折叠与调度日志。
 
+### 分派背压 + 请求超时 + 附件上行全局闸批（2026-11-10，M4/M5 稳定性修复，wire additive 错误面【engine-compat】）
+
+背景：stdin 读线程 → dispatch 环此前是无界 channel，每帧直接 spawn、无在飞
+上限；dispatch 没有超时，长尾/挂死请求会永久占资源；附件上行没有进程级
+并发/内存闸，多个大附件请求叠加可把引擎 RSS 推到 GiB 级。本批只加背压/
+预算/超时与错误面，不改任何成功路径的 wire 形状。
+
+**M4 入站背压与在飞上限**
+
+- **有界队列**：stdin 读线程 → dispatch 环容量 64 帧
+  （`INBOUND_QUEUE_CAPACITY`）；读线程 `blocking_send`，队列满时背压到
+  OS 管道/connector 写端，不丢帧、不再无界堆帧。
+- **队列字节预算**：320MiB（`INBOUND_PENDING_BYTES_BUDGET` =
+  2×160MiB 满帧），预算满只阻塞读线程；帧计数与字节双界共同约束峰值内存。
+- **在飞上限**：同时最多 8 个 Request 在 dispatch
+  （`INFLIGHT_REQUEST_LIMIT`）；超限帧不执行，立即结构化回错（id 回显）：
+
+```json
+{"jsonrpc":"2.0","id":42,"error":{"code":-32000,
+ "message":"Engine busy: in-flight request limit reached. (EngineBusyException)",
+ "data":{"reason":"ENGINE_BUSY","retryable":true,"inFlightLimit":8}}}
+```
+
+  请求从未执行 = 可安全重试；不排队、不静默丢。坏行/超帧是廉价解析错误
+  面，不占在飞许可、不受 busy 拒绝。
+
+**M5 请求超时与取消**
+
+- dispatch 统一 `tokio::time::timeout`；超时 drop（取消）dispatch future
+  后回错（id 回显）：
+
+```json
+{"jsonrpc":"2.0","id":43,"error":{"code":-32000,
+ "message":"Request timed out and was cancelled by the engine. (EngineTimeoutException)",
+ "data":{"reason":"REQUEST_TIMEOUT","retryable":false,"timeoutMs":60000}}}
+```
+
+  `retryable:false` 是诚实口径：mutating 请求（send 系）被取消时可能已
+  写出，结局未知；只读调用方可自行重试。超时只取消 dispatch future，进程
+  与接收管线继续。
+- **预算分类**：普通 60s；附件上行面 120s（`send` 带
+  `attachments`/`previewImage`/`sticker`、`sendStory` 媒体/预览图、
+  `sendContact` avatar、`setProfile`/`createGroup`/`updateGroup`/
+  `migrateGroup` avatar）；`finishLink` 360s。
+- **finishLink 偏差说明**：等待手机确认是协议内长任务，connector
+  `LINK_FINISH_TIMEOUT` = 5 min（kt-signal-connector src/supervisor.rs:77）；
+  引擎若用 60s 会先砍掉仍在等确认的链接会话，connector 重试会变成第二次
+  设备授权。360s 只作最后兜底，正常情况下 connector 的 5min 取消先到。
+- `[KT 适配]`：分派层 busy/timeout 无上游 signal-cli 对应面，是引擎本地
+  资源保护错误面；不改变任何方法成功应答或业务错误分类。
+
+**附件上行全局闸**
+
+- **并发槽 2**（`MAX_CONCURRENT_UPLOADS=2`，2–4 区间下限）；槽等待有界
+  10s，等不到回 `-32603` + `Failed to send message: Attachment upload
+  slot busy. (AttachmentBusyException)`（`SendError::AttachmentBusy`）。
+  上行尚未开始，确定未投递，`is_definite_failure=true`，同调用内快速
+  重试 1 次。
+- **全局解码字节预算 320MiB**（`GLOBAL_BYTE_BUDGET`）。二段式解析：先
+  `parse_attachment_meta` 只做形状/定位（不 decode），按整批 payload
+  长度（解码字节上界）原子预留预算，再 decode/上传；不足立即回
+  `-32603` + `Failed to send message: Attachment byte budget exhausted.
+  (AttachmentBudgetException)`（`SendError::AttachmentBudgetExceeded`），
+  decode 与 CDN 上行均未发生；不自动重试。
+- **租约 Drop 释放**：正常返回、上传失败、dispatch 超时取消三条路径都释放
+  预算与槽位。
+- **既有帽保留**：单附件 100MB / 单请求 32 条帽不变；单条帽在 decode 前用
+  解码下界判定（100MB 附件的 base64 payload 约 133MB，不能用 payload 长度
+  直接比 100MB），decode 后仍有精确字节复核。
+- **接入面**：`send`（直聊/群）的 attachments/previewImage/sticker 图、
+  `sendStory` 正文附件/预览图、`sendContact` avatar、贴纸图上行。
+  profile/群头像走 cdn_upload（自有字节帽），不在本闸。
+- `[KT 适配]`：无上游对应面；presage `upload_attachments` 原语零改动。
+
+**帧帽评估（160MiB vs 16MiB 参考值）**
+
+- `MAX_LINE_BYTES` 维持 160MiB：100MB 附件的 base64 单帧约 133MiB，
+  下调到 16MiB 会切断 >12MiB 附件发送；本批不上调帧帽（不放大），内存
+  峰值改由队列字节预算 + 解码字节预算约束。
+- connector implementation-plan §4.12 仍记录 16MiB 参考值与
+  `DEFAULT_MAX_CONNECTOR_FRAME_BYTES`，现行 connector `lib.rs` 已是
+  160MiB；当前 kt-desktop 源码未找到该常量（只有 AI assistant SSE 的
+  16MiB，语义无关）。若某个桌面版本仍按 16MiB 限 host socket，需要
+  connector/desktop 单独对齐，不在本批范围。
+
+**错误锚词与 connector 分类**
+
+- 新增四锚词：`(EngineBusyException)`、`(EngineTimeoutException)`、
+  `(AttachmentBusyException)`、`(AttachmentBudgetException)`。引擎侧
+  message 逐字钉定，connector 分类器认领属 connector 侧批次；未认领前
+  这四臂落 connector 的泛化 upstream/engine 错误分类，语义退化但不静默。
+- busy/timeout 的 `data.reason`（`ENGINE_BUSY` / `REQUEST_TIMEOUT`）
+  是 additive 结构化提示，connector 可只按 code+message 识别。
+
+**测试与门禁**
+
+- 单测：队列满背压不丢帧、队列字节预算等待、在飞上限 busy、超时预算
+  分类、超时取消（Drop 探针）、正常路径不变、附件闸并发/字节预算/
+  32 条/100MB decode 前上界。
+- 契约：fake 模式不触网关，成功路径 90 例零变化。
+- **门禁（2026-11-10 终审口径）**：fmt/clippy/test 全绿。`cargo test` 必须
+  `--test-threads=1` 串行——测试并行时多用例共享 SQLite store 与进程级
+  全局态，偶发全局锁死锁（挂死整个 job）；串行是门禁本体，不是性能选项。
+  CI 同时保留 `RUST_MIN_STACK=8388608`（给仍留在门禁内的深栈用例留余量），
+  但它**不兜底**已知栈溢出用例：默认 2 MiB 测试线程栈下
+  `service::tests::receive_loop_retries_unavailable_manager_until_shutdown`
+  **单跑即 SIGABRT（栈溢出，与并行无关）**，该用例已标
+  `#[ignore = "known stack overflow; tracked"]` 出常规门禁。
+  复现/回归口径（单跑，不进门禁）：
+  `RUST_MIN_STACK=8388608 cargo test --bin kt-signal-engine service::tests::receive_loop_retries_unavailable_manager_until_shutdown -- --exact --ignored`
+  （8 MiB 栈通过；去掉 `RUST_MIN_STACK` 即复现溢出）。根因修复后移除
+  `#[ignore]` 并复核串行门禁仍绿。
+
+**文件**：`src/main.rs`（队列/预算/信号量/超时包裹）、
+`src/methods.rs`（Prepared/预算/busy·timeout 面）、
+`src/service/attachment_gate.rs`（新）、`src/service/mod.rs`（二段式
+解析与接入）、`src/service/stories.rs`。
+
+### 引擎契约修订自证批（O1 握手引擎腿，2026-11-10，wire additive【engine-compat】）
+
+背景：connector O1 握手（`kt-signal-connector/src/engine_contract.rs`）在引擎
+落地后先探 `version` 与 `engine.protocolCapabilities`，以引擎自报的契约修订
+判定 `match`/`legacy`/`mismatch`。引擎此前两面都不带修订，握手只能恒判
+`legacy` 降级——连接器与引擎两份二进制的契约版本从未在运行时对过账。本批
+补齐引擎腿，纯 additive：不改任何既有键，不新增方法，不触网。
+
+- **单源常量**：`src/contract.rs::CONTRACT_REVISION = "1.285"` 是唯一事实
+  源，`version` 与 `engine.protocolCapabilities` 两个应答体都从这里取，不在
+  payload 里各写字面量。契约修订不是 `CARGO_PKG_VERSION`——包版本随构建
+  漂移，契约修订只在 wire 契约变化时推进。
+- **两面同值**：`version` 应答新增 `contractRevision`（旧 `{name, version}`
+  双键原样保留）；`engine.protocolCapabilities` 应答新增同值
+  `contractRevision`（旧四键 `deviceCapabilities`/`deviceCapabilitiesUpload`/
+  `linkCapabilities`/`baseline` 原样保留）。connector 以 capabilities 面为
+  权威、version 面为回退面，两面同值即稳定判 `match`。
+- **区间对齐**：connector 侧
+  `ENGINE_CONTRACT_MIN_REVISION = "1.200"` /
+  `ENGINE_CONTRACT_MAX_REVISION = "1.285"` 闭区间数字比较；release service
+  的 `engineContractRevision` 声明把引擎侧钉成 `min == max == 1.285`。推进
+  契约修订必须同时改 `CONTRACT_REVISION`、connector 区间上界与该声明。
+- **降级安全**：不带 `contractRevision` 的旧引擎仍被 connector 判 `legacy`
+  （服务不杀），本批只让新引擎进入 `match`；旧字段零变化保证旧 connector/
+  doctor 原样透传面不受影响。
+- **测试**：单测钉常量形状/值/connector 区间（`src/contract.rs`）、version
+  payload 形状与旧键不回归（`src/methods.rs`）、自证面 payload 形状与旧四键
+  不回归（`src/service/capabilities.rs`）；契约测试 real/fake 双模式钉
+  `version` 与 `engine.protocolCapabilities` 的 `contractRevision`，并跨面
+  断言两面同值、旧字段在场（`tests/contract.rs`）。
+- **文件**：`src/contract.rs`（新，单源常量）、`src/main.rs`（模块注册）、
+  `src/methods.rs`（version 面）、`src/service/capabilities.rs`（自证面）、
+  `tests/contract.rs`（real/fake 契约面）。
+
+
 ## 6. fake 服务模式（仅测试）
 
 `KT_ENGINE_FAKE_SERVICE=1` 显式开启（生产缺省永远走 real）：P1a 形状桩
@@ -6883,6 +7174,143 @@ announcements/terminated、收件人解析、profileSharing 白名单）仅 real
   串行与 tmp 无残留、分位/环形缓冲/在飞守卫；契约测试钉定
   `engine.perfMetrics` 六键形状（基础四键 + additive 两键）。
 
+### 双槽 QR 轮换引擎腿批（2026-11-11，startLink/rotateLink 双槽，wire additive【engine-compat】）
+
+**背景**：单槽 QR 的扫码窗口只覆盖「手机扫到 → 确认」一次；连接器/桌面要在
+不打断用户确认的前提下轮换二维码，需要引擎侧承认「一次链接尝试（attempt）里
+可以有多个 provisioning 槽」。本批在引擎侧落地 attempt/槽模型，对旧端零破坏。
+
+**wire 面（additive）**
+
+- `startLink`：旧键 `deviceLinkUri` 保持 = 第 0 槽；新增 `linkAttemptId`
+  （attempt 键，rotateLink 的入参）与 `slots: [{deviceLinkUri, slot}]`
+  （该 attempt 的 live 槽表，slot 号 = 表下标）。没有 rotate 时 `slots` 恒为
+  单槽 —— 旧调用方读 `deviceLinkUri` 的行为逐字不变。
+- `rotateLink {linkAttemptId}` → `{deviceLinkUri, slot, slots}`：为同一
+  attempt 铸新 provisioning 会话；同一 attempt 最多 2 个 live 槽，超出时收回
+  最旧槽。attempt 不存在（已被新 `startLink` 顶掉 / 已随提交收口 / 参数缺失）
+  → `-1` + `LINK_ATTEMPT_NOT_FOUND`（确定性契约错误，不是 `-32603`）。
+- `finishLink` 仍按 `deviceLinkUri`：接受该 attempt 内任一 live 槽的 uri，
+  提交只发生一次（attempt 级提交门单飞），成功后收回其余槽；已提交 attempt 的
+  任一槽重复 finish 幂等回同一账号。
+
+**实现要点（engine 侧）**
+
+- `Inner` 增 `attempts: HashMap<attemptId, LinkAttempt{slots: Vec<uri>, committed}>`；
+  `links: uri → PendingRecord` 保留（每槽一条独立记录）。
+- 单槽铸造抽成 `Service::mint_link_slot`（开 store → spawn flow → 30s URL
+  有界等待），`startLink` 与 `rotateLink` 共用；登记（写 `links` 与槽表归属）
+  由调用方在 `inner` 锁内完成，过期铸造走 `MintedLinkSlot::discard` 当场收口。
+- attempt 级提交位被全部槽的 `PendingRecord::committed` 共享（同一把锁）：
+  跨槽提交单飞；兄弟槽完成链接后，等在本槽结果上的在飞 finish 读提交位拿回同一
+  账号，不丢成 LINK_LOST。
+- 退休（rotate 淘汰 / 提交后收回其余槽）`Service::retire_slot`：`inflight_finishes > 0`
+  时只置退休旗，物理收口（abort flow + 未注册 store 回收）由最后一个 finish 在
+  `FinishGuard` 里落地；无在飞 finish 则当场收口并落 LINK_LOST 墓碑（旧码后续
+  finish 稳定回 LINK_LOST）。
+- `startLink` 仍作废上一个 attempt：清 `attempts` + 取走全部 `links`，旧 flow
+  abort、在飞 finish 确定性回 LINK_LOST（B1 语义不变）。
+- 槽表不变量（审计必须项）：`attempt.slots` **恒等于 live 槽表**。任何让
+  uri 离开 `links` 的出口（finish 的 LINK_LOST 收口、提交后的兄弟槽收口）都
+  同步 `retain_live_attempt_slots`，`rotateLink` 在 push 新槽前再按 `links`
+  存在性修剪一次（双保险）；淘汰循环跳过已死目标、继续找真正最旧的活槽。应答
+  `slots` 只含 live 槽、`slot` 号 = 表下标（死槽不占位）。
+- 文件面：`accounts/lk-*` 每槽一个目录；退休未提交 = 埋掉（同 B1 的
+  `remove_link_store` 纪律，先 take 句柄再删目录）。
+
+**门禁**
+
+- 单测（`src/service/mod.rs`）：rotate 后两个槽都能 finish、第 3 次 rotate 淘汰
+  最旧且旧码 finish 回 LINK_LOST、两个槽并发 finish 只提交一次、rotate 不打断
+  在飞 finish、attempt 不存在错误码；槽表不变量三条——第 0 槽 LINK_LOST 后
+  rotate 应答不含死槽、残留死槽不抢淘汰名额（活槽不被误退休）、死槽不占 slot
+  下标。**跨槽幂等（提交第 1 槽后另一码 replay 回同一账号、只建 1 个账号）在
+  真面单测断言**（attempt 级提交位只在真面存在）。
+- 契约测试（`tests/contract.rs` fake 面）：只覆盖 wire 形状——`startLink` 三键
+  形状 + `rotateLink` 槽表 + 提交 rotate 出来的**第 1 槽** + `LINK_ATTEMPT_NOT_FOUND`
+  码位。fake 面 `finishLink` 首提交即清空 `fake_link`（无 store、无 attempt 级
+  提交位），**表达不了跨槽幂等**，因此不用 `accounts.len()==1` 自证单飞。
+- `cargo fmt` / `cargo clippy --all-targets -- -D warnings` / 全量单测与契约测试全绿。
+
+## 调度日志按账号分文件与脱敏（多账号 M5，2026-11-12）
+
+- 路径：`<data_dir>/engine-send-log/<accountTag>.jsonl`；`accountTag` =
+  `sha256(salt || lower(accountId))` 前 16 hex，`salt` 为同目录 `.salt`
+  （首建 32 随机字节，0600；安装级），**文件名不含号码/账号明文**；大小写归一，
+  `ABC`/`abc` 在 APFS/NTFS 上落到同一个文件。
+- 脱敏：正文类键（message/text/caption/quoteText/question/options/previewTitle/
+  previewDescription）只留 `{length, sha256Prefix, redacted}`；收件人类键只留
+  `count`；群名/联系人姓名/邀请链接/邀请密码/举报 token/sticker 图片一律摘要化；
+  任意 E.164 形状串一律 `{redacted:"phone"}`；超过 1 MiB 的媒体 data URI
+  只留字节数，`sticker.image` 一律摘要。保留 `method`、`ts` 与结构键。
+- 上限与轮转：每账号活动日志上限 5 MiB，超限轮转一次为 `.jsonl.1`
+  （只保留最近一段），不无限增长。
+- 生命周期：先 drain 再删日志；被参数校验拒绝的请求不写日志（不在删除后重建文件）。
+- 旧全局 `engine-send-log.jsonl` 一次性处理：先把旧文件原子改名为 `.migrated`
+  （保证幂等，崩溃残留不重放、不重复追加），再按 `params.account` 归属追加到
+  分文件；不可归属的行丢弃并 warn。
+- 权限：Unix 下文件 0600、目录 0700（每次写入校正；盐文件 0600）。
+
+## 阶段 1-1：`getSyncState` 登录窗同步投影（2026-11-12，wire additive【engine-compat】）
+
+**动机**（`SIGNAL-STAGE1-DESIGN.md` §二 P-B-3「gate 改拉」）：桌面收件箱 gate 目前
+只靠事件路径（`engine.storagePull` / `engine.initialSyncComplete`）。四跳管道任何一处
+丢帧，gate 就只能等 2min 半边超时。本方法把「sync 臂已经跟踪的三件套状态」变成
+**可拉取、幂等、账号域**的只读查询：gate 每 5s 拉一次（上限 24 次 = 120s），看到某半边
+`done` 即 poll-settled 放行；事件路径不变，仍是快路径。
+
+**wire 形状**（method `getSyncState`，params `{account}`）：
+
+```jsonc
+{ "contacts": "idle|inflight|done|failed",
+  "storage":  "idle|inflight|done|failed",
+  "profile":  "idle|inflight|done|failed",
+  "sinceMs":  1760000000000 }
+```
+
+- 四键恒在（no-null：相位词恒是四词之一，`sinceMs` 恒是整数）。
+- `sinceMs` = 当前窗口的开窗时刻（epoch ms）——消费方的新鲜度锚：窗口开在调用方
+  自己的 gate/激活之前 = 上一次链接/启动留下的旧面，应按陈旧处理而不是当作落定。
+- 未登记/已摘除账号 `-32603`（读面惯例折叠）。其余无业务错误面：查询不触网、
+  不落调度日志、零 stderr。
+
+**数据源（零新状态机：只观测引擎已经在跟踪的簿记）**：
+
+| 半边 | 权威簿记 | 观测/落定面 |
+|---|---|---|
+| 窗口起算 | 注册表（`EngineState`） | `add_account` = 新链路/同号重链开窗；`remove_account` = 窗口作废；启动装载时 `post_registration_syncs_complete == false` 的账号 = 首流窗口（收流臂 `initial_sync_due(None)` 同门，一定会安排这一窗）；已完成的账号启动不再跑本窗，如实 `idle` |
+| contacts | `post_registration_syncs_complete`（`contactSync` `complete` 到达时收流臂落盘） | state 层落盘钩子 `note_contacts_complete`（首次落定优先）。没有 `failed` 面：三请求上行 best-effort（失败只 warn、下次链路重补），进程内无可观测失败事件 |
+| storage | `engine.storagePull`（`trigger=login`，T-9b 结果事件的两腿 join 布尔）+ `engine.initialSyncComplete.manifestOk` | 通知出口观测；`initialSyncComplete` 的 `manifestOk` 兜底「登录拉被 30s 上限掐断、没有 storagePull 事件」的窗口 |
+| profile | `engine.initialSyncComplete.profilesOk`（首轮 profile 刷新腿 join 结论） | 通知出口观测 |
+
+**观测点唯一**：`service::outbound::OutboundHub::notify`（全部通知的唯一出口）。
+只解析 `engine.storagePull` 与 `engine.initialSyncComplete` 两个低频事件；逐消息的
+`receive` 通知只比一次方法名，不做深解析。观测在入队背压之前落簿——出口慢不会让
+状态滞后。
+
+**相位语义**：
+
+- `inflight`：窗口在飞且该半边尚未落定（窗口 TTL 120s 内：登录拉 30s 上限 + profile
+  10s 沉降之后仍无落定的半边不再报在飞）；
+- `done` / `failed`：观测到的**首次**落定面（迟到的相反结论不改写，重复事件幂等）；
+- `idle`：没有窗口，或窗口已过 TTL 仍未落定（一次性窗已过，不再假装在飞——不发明
+  `failed`；消费方自己的半边超时兜底）。
+
+**幂等**：`getSyncState` 是纯读——不建簿、不改簿、不触发拉取，重复调用逐字节一致。
+这是 P-B-3 轮询兜底的硬前提（轮询本身不得改变任何状态）。
+
+**fake 面**：`KT_ENGINE_FAKE_SERVICE=1` 没有真实同步臂，三半边恒 `idle`（`sinceMs` =
+进程启动时刻），不伪装在飞。
+
+**测试**：`src/sync_state.rs` 单测钉定——形状与幂等（同刻重复调用逐字节一致）、
+首发落定优先、非 `login` 触发不落 storage 半边、TTL 后 `inflight`→`idle`、已完成
+注册读 `idle`+`contacts=done`、坏形状观测忽略；connector 侧
+`accounts.getSyncState` 形状闸与 fake-engine 臂见 connector
+`docs/implementation-plan.md` §4.281。
+
+**门禁**：`cargo fmt` / `cargo clippy --all-targets -- -D warnings` / `cargo test` /
+release build；connector 侧 `cargo fmt` / `cargo clippy --all-targets -- -D warnings` /
+`cargo test`（含 `tests/sync_state.rs` 与 `tests/schema_consistency.rs`）。
 ### 消息请求 trusted-contact 因子导出批（2026-10-24，wire additive【engine-compat】）
 
 官方锚（Signal-Desktop AGPL 只读零抄码）：`isConversationAccepted.preload.ts:21-82`

@@ -53,6 +53,9 @@ pub struct OutgoingPushMessages {
     pub timestamp: u64,
     pub messages: Vec<OutgoingPushMessage>,
     pub online: bool,
+    /// Ask the server to wake the destination with a push notification.
+    /// Signal-Desktop sets this for the contact-sync request.
+    pub urgent: bool,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -100,6 +103,61 @@ pub struct MessageSender<S> {
     aci_identity: IdentityKeyPair,
     pni_identity: Option<IdentityKeyPair>,
     device_id: DeviceId,
+}
+
+impl<S> MessageSender<S>
+where
+    S: ProtocolStore + SenderKeyStore + SessionStoreExt + Sync + Clone,
+{
+    /// KT fork（BUG-16 proof 批，2026-11-13）：push 挑战求解对——
+    /// GET /v1/challenge/{aci}/{token} → challenge 串（零人工）→
+    /// PUT /v1/challenge（type="push"）回答。失败原样上抛（不吞）。
+    async fn solve_push_challenge(
+        service: &PushService,
+        aci: &str,
+        token: &str,
+    ) -> Result<(), ServiceError> {
+        #[derive(serde::Deserialize)]
+        struct ChallengeBody {
+            #[serde(default)]
+            challenge: String,
+        }
+        #[derive(serde::Serialize)]
+        struct PushAnswer<'a> {
+            #[serde(rename = "type")]
+            challenge_type: &'a str,
+            token: &'a str,
+            challenge: &'a str,
+        }
+        let challenge: ChallengeBody = service
+            .request(
+                reqwest::Method::GET,
+                crate::configuration::Endpoint::service(format!("/v1/challenge/{aci}/{token}")),
+                HttpAuthOverride::NoOverride,
+            )?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?
+            .json()
+            .await?;
+        service
+            .request(
+                reqwest::Method::PUT,
+                crate::configuration::Endpoint::service("/v1/challenge"),
+                HttpAuthOverride::NoOverride,
+            )?
+            .json(&PushAnswer {
+                challenge_type: "push",
+                token,
+                challenge: &challenge.challenge,
+            })
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?;
+        Ok(())
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -241,25 +299,29 @@ where
         // if it fails or stalls (= we should at least split the API calls so clients can decide what to do)
         let attachment_upload_form = self
             .service
-            .get_attachment_v4_upload_attributes()
+            .get_attachment_v4_upload_attributes(contents.len() as u64)
             .instrument(tracing::trace_span!("requesting upload attributes"))
             .await?;
 
-        let resumable_upload_url = self
-            .service
-            .get_attachment_resumable_upload_url(&attachment_upload_form)
-            .await?;
-
-        let attachment_digest = self
-            .service
-            .upload_attachment_v4(
-                attachment_upload_form.cdn,
-                &resumable_upload_url,
-                contents.len() as u64,
-                attachment_upload_form.headers,
-                &mut std::io::Cursor::new(&contents),
-            )
-            .await?;
+        let attachment_digest = if attachment_upload_form.cdn == 3 {
+            self.service
+                .upload_attachment_v4_direct(&attachment_upload_form, contents.clone())
+                .await?
+        } else {
+            let resumable_upload_url = self
+                .service
+                .get_attachment_resumable_upload_url(&attachment_upload_form)
+                .await?;
+            self.service
+                .upload_attachment_v4(
+                    attachment_upload_form.cdn,
+                    &resumable_upload_url,
+                    contents.len() as u64,
+                    attachment_upload_form.headers,
+                    &mut std::io::Cursor::new(&contents),
+                )
+                .await?
+        };
 
         Ok(AttachmentPointer {
             content_type: Some(spec.content_type),
@@ -586,6 +648,7 @@ where
                 timestamp,
                 messages,
                 online: false,
+                urgent: false,
             })
             .await?;
 
@@ -785,6 +848,29 @@ where
     async fn try_send_message(
         &mut self,
         recipient: ServiceId,
+        unidentified_access: Option<&UnidentifiedAccess>,
+        story: Option<&SenderCertificate>,
+        content_body: &ContentBody,
+        timestamp: u64,
+        include_pni_signature: bool,
+        online: bool,
+    ) -> SendMessageResult {
+        self.try_send_message_with_urgency(
+            recipient,
+            unidentified_access,
+            story,
+            content_body,
+            timestamp,
+            include_pni_signature,
+            online,
+            false,
+        )
+        .await
+    }
+
+    async fn try_send_message_with_urgency(
+        &mut self,
+        recipient: ServiceId,
         mut unidentified_access: Option<&UnidentifiedAccess>,
         // KT fork (stories): story 发送模式。Some = sealed sender 加密用该
         // sender certificate（不派生 UAK 头）、经 `?story=true` 传输面分发；
@@ -795,6 +881,7 @@ where
         timestamp: u64,
         include_pni_signature: bool,
         online: bool,
+        urgent: bool,
     ) -> SendMessageResult {
         trace!("trying to send a message");
 
@@ -814,6 +901,9 @@ where
         let probe_is_typing =
             matches!(content_body, ContentBody::TypingMessage(_));
 
+        // KT fork（BUG-16 proof 批，2026-11-13）：push 挑战只自动求解一次
+        //（官方客户端同款上限——求解后的重发走既有 4 轮循环的下一轮）。
+        let mut push_challenge_solved = false;
         for _ in 0..4u8 {
             let Some(EncryptedMessages {
                 messages,
@@ -838,6 +928,7 @@ where
                 timestamp,
                 messages,
                 online,
+                urgent,
             };
 
             let send_started = std::time::Instant::now();
@@ -964,7 +1055,35 @@ where
                     }
                 },
                 Err(ServiceError::ProofRequiredError(ref p)) => {
-                    tracing::debug!("{:?}", p);
+                    // KT fork（BUG-16 proof 批，2026-11-13）：push 挑战
+                    // 全自动求解（GET /v1/challenge/{aci}/{token} → PUT
+                    // /v1/challenge type=push）后重试一轮；recaptcha 族
+                    // 需人工，原样上抛（engine/UX 批的确定性面）。单次
+                    // 上限（push_challenge_solved），求解失败不吞原错误。
+                    let wants_push = p
+                        .options
+                        .iter()
+                        .any(|option| option == "push" || option == "pushChallenge");
+                    if wants_push && !push_challenge_solved {
+                        push_challenge_solved = true;
+                        let aci = self.local_aci.service_id_string();
+                        match Self::solve_push_challenge(&self.service, &aci, &p.token).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    token = %p.token,
+                                    "push challenge auto-solved; retrying the send"
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    token = %p.token,
+                                    ?error,
+                                    "push challenge auto-solve failed; surfacing ProofRequired"
+                                );
+                            }
+                        }
+                    }
                     return Err(MessageSenderError::ProofRequired {
                         token: p.token.clone(),
                         options: p.options.clone(),
@@ -1089,7 +1208,7 @@ where
             debug!(
                 "sending multi-device sync message with content {content:?}"
             );
-            self.try_send_message(
+            self.try_send_message_with_urgency(
                 self.local_aci.into(),
                 None,
                 None,
@@ -1097,6 +1216,7 @@ where
                 timestamp,
                 false,
                 false,
+                true,
             )
             .await?;
         }

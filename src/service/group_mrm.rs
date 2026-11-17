@@ -190,6 +190,177 @@ pub(crate) const MRM_CONNECTION_LIMIT: usize = 2;
 pub(crate) struct MrmSlot {
     generation: u64,
     connection: tokio::sync::Mutex<Option<ChatConnection>>,
+    /// 最近一次成功发送/建连的时刻（epoch ms）。> MRM_STALE_AFTER_MS 即视为可能已被
+    /// 对端掐断（内核 WS_MAX_IDLE_INTERVAL=45s），暖任务才会换新连接。
+    last_used_ms: AtomicU64,
+    /// 最近一次**用户动作**（群 RPC / 发送成功）的时刻；保活自己刷新不算。
+    /// 保活只在「近期有活动」时运行，避免 24/7 固定节拍变成可识别指纹。
+    last_activity_ms: AtomicU64,
+    /// 握手去重：一批 RPC 同时发现陈旧时只建一次连。
+    warming: std::sync::atomic::AtomicBool,
+    /// 保活任务是否已起（每槽一个，起一次终身）。
+    keepalive: std::sync::atomic::AtomicBool,
+}
+
+/// MRM 保活基础间隔：内核 WS 空闲上限 45s，取 38s（留余量，也省 25% 流量）。
+const MRM_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(38);
+
+/// 抖动上限：38s + 0..3s 随机，避免「固定 30.0s 节拍」这种机器人特征。
+const MRM_KEEPALIVE_JITTER_MS: u64 = 3_000;
+
+/// 活动窗口：只有最近 10 分钟内有过用户动作才保活；用户睡了就让连接自然断，
+/// 下次打开会话由 maybe_warm 重建（预热路径本来就在）。
+const MRM_ACTIVITY_WINDOW_MS: u64 = 10 * 60 * 1_000;
+
+/// 根因修复（2026-11-15）：MRM 连接没有事件循环驱动，空闲 45s 会被内核判死；
+/// 1:1 的 WS 靠接收循环发 31s ping 所以永不死。这里给 MRM 挂一个周期性的廉价
+/// 请求（GET /v1/accounts/whoami）当保活，使连接与 1:1 同构。
+///
+/// 失败即摘槽（下次发送自然重连）；try_lock 抢不到说明有发送在途，跳过本轮。
+fn ensure_keepalive(slot: &Arc<MrmSlot>) {
+    if slot.keepalive.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let slot = Arc::clone(slot);
+    tokio::task::spawn_local(async move {
+        loop {
+            let jitter =
+                std::time::Duration::from_millis(rand::random::<u64>() % MRM_KEEPALIVE_JITTER_MS);
+            tokio::time::sleep(MRM_KEEPALIVE_INTERVAL + jitter).await;
+            // 槽已被池淘汰（只剩本任务持有 Arc）→ 退出，别把连接和任务一起泄漏。
+            if Arc::strong_count(&slot) == 1 {
+                slot.keepalive.store(false, Ordering::Release);
+                break;
+            }
+            // 活动门控：用户长时间没动作就让连接自然死（下次会话打开会重建），
+            // 把 24/7 节拍收窄成「使用时段」节拍。
+            let idle_ms = epoch_ms().saturating_sub(slot.last_activity_ms.load(Ordering::Relaxed));
+            if idle_ms > MRM_ACTIVITY_WINDOW_MS {
+                if let Ok(mut guard) = slot.connection.try_lock() {
+                    *guard = None;
+                }
+                slot.keepalive.store(false, Ordering::Release);
+                break;
+            }
+            let Ok(mut guard) = slot.connection.try_lock() else {
+                continue;
+            };
+            let Some(connection) = guard.as_ref() else {
+                continue;
+            };
+            let request = libsignal_net::chat::Request {
+                method: http::Method::GET,
+                path: "/v1/accounts/whoami".parse().expect("static path"),
+                headers: http::HeaderMap::new(),
+                body: None,
+            };
+            let sent_at = std::time::Instant::now();
+            let outcome = match connection
+                .send(request, std::time::Duration::from_secs(10))
+                .await
+            {
+                Ok(_) => {
+                    slot.last_used_ms.store(epoch_ms(), Ordering::Relaxed);
+                    "ok"
+                }
+                Err(_) => {
+                    *guard = None;
+                    "err"
+                }
+            };
+            tracing::warn!(
+                target: "send_latency_probe",
+                stage = "engine.mrm-keepalive",
+                outcome = outcome,
+                dur_ms = sent_at.elapsed().as_millis() as u64,
+                "send-latency-probe",
+            );
+        }
+    });
+}
+
+pub(crate) fn maybe_warm(service: &Arc<super::Service>, account: &str) {
+    let Some(slot) = service.mrm_pool.slot_for(account) else {
+        return;
+    };
+    // 用户动作：刷新活动时间，保活据此决定是否继续。
+    slot.last_activity_ms.store(epoch_ms(), Ordering::Relaxed);
+    let fresh =
+        epoch_ms().saturating_sub(slot.last_used_ms.load(Ordering::Relaxed)) <= MRM_STALE_AFTER_MS;
+    if fresh
+        && slot
+            .connection
+            .try_lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    {
+        return;
+    }
+    warm_connection(service, account);
+}
+
+/// 冷启动保温（2026-11-15 perf 批）：后台预热本账号的 MRM 连接。
+///
+/// 群发主路径是 MRM 单请求；槽里没有连接时发送要现场建连——真机实测冷发送
+/// 1.2–3.1s、热发送 0.28–0.36s（官方常驻 WS 无此惩罚）。群打字是发送前的必现
+/// 信号，用它把握手藏进用户打字的时间。失败静默：发送路径会照常重试建连。
+pub(crate) fn warm_connection(service: &Arc<super::Service>, account: &str) {
+    let Some(slot) = service.mrm_pool.slot_for(account) else {
+        return;
+    };
+    if slot.warming.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tokio::task::spawn_local(async move {
+        let started = std::time::Instant::now();
+        let now = super::group_mrm::epoch_ms();
+        // 短锁判断：连接在、且最近用过（未超陈旧阈值）才算热。
+        let needs_refresh = {
+            let guard = slot.connection.lock().await;
+            match guard.as_ref() {
+                None => true,
+                Some(_) => {
+                    now.saturating_sub(slot.last_used_ms.load(Ordering::Relaxed))
+                        > MRM_STALE_AFTER_MS
+                }
+            }
+        };
+        let outcome = if needs_refresh {
+            match super::cloud_backup::connect_production_chat().await {
+                Ok(connection) => {
+                    let mut guard = slot.connection.lock().await;
+                    *guard = Some(connection);
+                    slot.last_used_ms
+                        .store(super::group_mrm::epoch_ms(), Ordering::Relaxed);
+                    drop(guard);
+                    ensure_keepalive(&slot);
+                    "ok"
+                }
+                Err(_) => "err",
+            }
+        } else {
+            "hit"
+        };
+        slot.warming.store(false, Ordering::Release);
+        tracing::warn!(
+            target: "send_latency_probe",
+            stage = "engine.mrm-warm",
+            outcome = outcome,
+            dur_ms = started.elapsed().as_millis() as u64,
+            "send-latency-probe",
+        );
+    });
+}
+
+/// 连接陈旧阈值：内核 WS 空闲上限 45s，取 40s 留余量。
+const MRM_STALE_AFTER_MS: u64 = 40_000;
+
+/// epoch 毫秒（单调性够用：只做差值比较）。
+pub(crate) fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// MRM 连接池：账号 → 槽；最多 [`MRM_CONNECTION_LIMIT`] 个活槽。
@@ -231,6 +402,10 @@ impl MrmPool {
         let slot = Arc::new(MrmSlot {
             generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
             connection: tokio::sync::Mutex::new(None),
+            last_used_ms: AtomicU64::new(0),
+            last_activity_ms: AtomicU64::new(0),
+            warming: std::sync::atomic::AtomicBool::new(false),
+            keepalive: std::sync::atomic::AtomicBool::new(false),
         });
         slots.insert(account.to_owned(), Arc::clone(&slot));
         Some(slot)
@@ -823,7 +998,12 @@ async fn send_mrm(
             )
             .await;
         match result {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                slot.last_used_ms.store(epoch_ms(), Ordering::Relaxed);
+                slot.last_activity_ms.store(epoch_ms(), Ordering::Relaxed);
+                ensure_keepalive(&slot);
+                return Ok(response);
+            }
             Err(RequestError::Other(MultiRecipientSendFailure::MismatchedDevices(list))) => {
                 return Err(MrmSendFailure::Mismatched(
                     list.into_iter().map(|mismatch| mismatch.account).collect(),

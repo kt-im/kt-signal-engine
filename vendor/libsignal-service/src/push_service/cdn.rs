@@ -10,6 +10,7 @@ use reqwest::{
     Method, StatusCode,
 };
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use tracing::{debug, trace};
 use url::Url;
 
@@ -138,10 +139,11 @@ impl PushService {
 
     pub(crate) async fn get_attachment_v4_upload_attributes(
         &mut self,
+        upload_length: u64,
     ) -> Result<AttachmentUploadForm, ServiceError> {
         self.request(
             Method::GET,
-            Endpoint::service("/v4/attachments/form/upload"),
+            Endpoint::service(format!("/v4/attachments/form/upload?uploadLength={upload_length}")),
             HttpAuthOverride::NoOverride,
         )?
         .send()
@@ -300,6 +302,37 @@ impl PushService {
         Ok(ResumeInfo {
             content_range: None,
             content_start: upload_offset,
+        })
+    }
+
+    /// Official tus create-with-upload: POST the encrypted body together with
+    /// Upload-Length. The upload form must be requested with uploadLength too,
+    /// otherwise Signal signs a location with uploadLength=0 and CDN rejects it.
+    #[tracing::instrument(skip(self, contents))]
+    pub(crate) async fn upload_attachment_v4_direct(
+        &mut self,
+        form: &AttachmentUploadForm,
+        contents: Vec<u8>,
+    ) -> Result<AttachmentDigest, ServiceError> {
+        let length = contents.len() as u64;
+        let mut request = self.request(
+            Method::POST,
+            Endpoint::Absolute(form.signed_upload_location.clone()),
+            HttpAuthOverride::Unidentified,
+        )?;
+        for (key, value) in &form.headers {
+            request = request.header(key, value);
+        }
+        request = request
+            .header("Tus-Resumable", "1.0.0")
+            .header("Upload-Length", length)
+            .header(CONTENT_TYPE, "application/offset+octet-stream");
+        let digest = Sha256::digest(&contents).to_vec();
+        request.body(contents).send().await?.error_for_status()?;
+        Ok(AttachmentDigest {
+            digest,
+            incremental_digest: None,
+            incremental_mac_chunk_size: 0,
         })
     }
 

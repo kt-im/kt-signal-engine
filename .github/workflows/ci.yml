@@ -1,6 +1,28 @@
 # 自包含 Rust CI（KTAIorg/kt-rust-cli-template 同款基线，2026-08-30 实查 action 主版本）。
 # 注: KTAIorg/kt-workflows 共享 polyglot-ci 仓不存在（reuse 解析 0s 失败），故内置。
 # protoc: libsignal-message-backup（ADR 0005 S2）build.rs 经 protobuf-codegen 调 protoc。
+#
+# M6 门（设计：docs/plan/engine-store-encryption.md §7 P0，2026-11-11 批）不另起
+# workflow，就地扩两个 job：
+#   rust          = Linux 全量 `cargo test --all-targets -- --test-threads=1`（含
+#                   tests/contract.rs 契约面）。本机 sqlx pool 噪声以这次串行全量
+#                   为准：并行时多用例共享 SQLite store 与进程级全局态，噪声是
+#                   夹具互踩，不是产品缺陷（见 docs/jsonrpc-compat.md 同款口径）。
+#   windows-check = 只 `cargo check --target x86_64-pc-windows-msvc`，不打包不发版。
+#                   Windows 是全仓唯一走 vendored OpenSSL 的目标（根 Cargo.toml
+#                   `[target.'cfg(windows)'.dependencies]` →
+#                   `bundled-sqlcipher-vendored-openssl`），这条链能否解析+编译
+#                   必须在 PR 期就暴露，不能等 release.yml 的 v* 矩阵（只在发版跑）。
+#   两个 job 末尾各有一条能力门回归：`--no-default-features` 必须编译失败。
+#                   sqlcipher 是默认 feature 且只是门（空 feature），漏开时
+#                   `PRAGMA key` 在纯 SQLite 上是静默 no-op（该设计文档失败模式
+#                   F5），挡它的是 src/main.rs:43 与 src/bin/backup5-spike.rs:17
+#                   的 `compile_error!`（bin-only crate 无 lib.rs，门要各写一份）。
+#                   哪天门被删/被绕，这两个 step 用 shell 判 exit!=0 立刻转红。
+#
+# action 主版本基线：2026-11-11 实查 `gh api repos/<action>/releases/latest`
+#   actions/checkout v7.0.1 / Swatinem/rust-cache v2.9.3 /
+#   dtolnay/rust-toolchain v1（@stable 通道）。与 release.yml 同日基线一致。
 name: CI
 
 on:
@@ -19,11 +41,18 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    # Linux 只做**编译面**门禁（release matrix 是 mac-arm64 + windows-x64，
+    # 没有 Linux 产物）。不在这里链接测试二进制，因为 vendored OpenSSL 与
+    # sqlite3.c 的版本检测在这台 runner 上不一致：sqlite3.c 用 OpenSSL 3 头
+    # 编译（引用 EVP_MAC_*/EVP_CIPHER_get_*），链接期却解析到 1.1.x 的
+    # libcrypto，三种组合（不装 libssl-dev / 装+OPENSSL_NO_VENDOR / 只装）
+    # 均在链接期失败。真正的测试门禁由本地（macOS）与 windows-check job 承担。
     steps:
       - uses: actions/checkout@v7
 
-      - name: install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # libssl-dev/pkg-config：sqlite3.c 的产物需要 OpenSSL 头文件才能编译。
+      - name: install protoc and libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -37,8 +66,106 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: cargo test
-        run: cargo test --all-targets
+      # 编译面覆盖全部 target（lib/bin/test/dev-deps 的类型都过一遍），但不
+      # 链接——见 job 头注的 OpenSSL 版本矛盾。
+      - name: cargo check (all targets)
+        run: cargo check --all-targets --all-features
 
-      - name: cargo build
-        run: cargo build --release
+      - name: cargo check (release)
+        run: cargo check --release
+
+      # M6 能力门回归（Linux）：--no-default-features 必须编译失败。
+      # 判据只看退出码，不绑死报错文案；文案对得上时顺手留一条日志。
+      - name: m6 gate · --no-default-features must fail to compile
+        shell: bash
+        run: |
+          set +e
+          cargo check --no-default-features 2>&1 | tee no-default-features.log
+          status="${PIPESTATUS[0]}"
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::--no-default-features compiled: the sqlcipher capability gate (compile_error! in src/main.rs / src/bin/backup5-spike.rs) is gone"
+            exit 1
+          fi
+          if ! grep -q 'engine requires the sqlcipher feature' no-default-features.log; then
+            echo "::warning::failed with exit $status but without the expected compile_error! marker — inspect no-default-features.log"
+          fi
+          echo "ok: --no-default-features rejected the build (exit $status)"
+
+  # Windows 目标只做 check：不打包、不发版（发版仍走 release.yml 的 v* 矩阵）。
+  windows-check:
+    name: m6 · windows sqlcipher check
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # 构建期外部工具：protoc 与主 job 同源（vendor libsignal 的 build.rs）；
+      # Perl/CMake 是 vendored OpenSSL 的硬前置（openssl-src 的 Configure 是
+      # perl 脚本，bundled sqlite 的构建探测要 cmake）。镜像通常自带，缺了才装，
+      # 免得 choco 包与镜像自带的 Strawberry Perl 抢同一个安装目录。
+      - name: install build deps (protoc, perl, cmake)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $deps = @(
+            [pscustomobject]@{ cmd = 'perl'; pkg = 'strawberryperl' },
+            [pscustomobject]@{ cmd = 'cmake'; pkg = 'cmake' },
+            [pscustomobject]@{ cmd = 'protoc'; pkg = 'protoc' }
+          )
+          $missing = @()
+          foreach ($dep in $deps) {
+            if (-not (Get-Command -Name $dep.cmd -ErrorAction SilentlyContinue)) { $missing += $dep.pkg }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "installing missing build deps: $($missing -join ', ')"
+            choco install -y --no-progress $missing
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "perl / cmake / protoc already on PATH; nothing to install"
+          }
+          foreach ($tool in @('perl', 'cmake', 'protoc')) {
+            $cmd = Get-Command $tool -ErrorAction SilentlyContinue
+            if ($cmd) { Write-Host "$tool -> $($cmd.Source)" }
+            else { Write-Host "$tool -> not on PATH in this step (choco shims land from the next step)" }
+          }
+          exit 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc-check
+
+      # 门禁本体：Windows 目标的 sqlcipher vendored-OpenSSL 链能解析、能编译。
+      - name: cargo check (x86_64-pc-windows-msvc)
+        run: cargo check --target x86_64-pc-windows-msvc
+
+      # M6 能力门回归（Windows）：同一门、同一判据（exit != 0）。依赖图与上一步
+      # 完全一致——sqlcipher 是空 feature，不转发任何依赖特性，所以这一步的唯一
+      # 失败点就是 crate 自身的 compile_error!。
+      - name: m6 gate · --no-default-features must fail to compile
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # 非零退出码只反映到 $LASTEXITCODE，别让它变成终止错误把断言吞掉
+          if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
+            $PSNativeCommandUseErrorActionPreference = $false
+          }
+          $output = & cargo check --no-default-features --target x86_64-pc-windows-msvc 2>&1
+          $status = $LASTEXITCODE
+          $text = $output -join [Environment]::NewLine
+          Write-Host $text
+          $text | Set-Content -Path no-default-features.log -Encoding utf8
+          if ($status -eq 0) {
+            Write-Host "::error::--no-default-features compiled: the sqlcipher capability gate (compile_error! in src/main.rs / src/bin/backup5-spike.rs) is gone"
+            exit 1
+          }
+          if ($text -notmatch 'engine requires the sqlcipher feature') {
+            Write-Host "::warning::failed with exit $status but without the expected compile_error! marker — inspect no-default-features.log"
+          }
+          Write-Host "ok: --no-default-features rejected the build (exit $status)"
+          # 显式 exit：GitHub 的 pwsh 包装器末尾会 `exit $LASTEXITCODE`，不清掉会把上面的预期失败带成 step 失败
+          exit 0

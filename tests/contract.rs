@@ -122,6 +122,86 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// M5：调度日志按账号分文件（`engine-send-log/<accountId>.jsonl`）。测试
+/// 大多只关心「这个 data-dir 落了什么」，这里按文件名字典序拼接全部账号
+/// 日志（目录不存在 = 空串）。
+fn dispatch_log_text(dir: &Path) -> String {
+    let log_dir = dir.join("engine-send-log");
+    let mut paths: Vec<PathBuf> = match std::fs::read_dir(&log_dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect(),
+        Err(_) => return String::new(),
+    };
+    paths.sort();
+    let mut out = String::new();
+    for path in paths {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            out.push_str(&text);
+        }
+    }
+    out
+}
+
+fn dispatch_log_exists(dir: &Path) -> bool {
+    !dispatch_log_text(dir).is_empty()
+}
+
+/// M5：读取安装级盐（32B）。
+fn dispatch_salt(dir: &Path) -> [u8; 32] {
+    std::fs::read(dir.join("engine-send-log").join(".salt"))
+        .expect("dispatch log salt")
+        .as_slice()
+        .try_into()
+        .expect("32B salt")
+}
+
+/// M5：accountTag = sha256(salt || lower(accountId)) 前 16 hex。
+fn dispatch_account_tag(salt: &[u8; 32], account: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(account.to_ascii_lowercase().as_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::new();
+    for byte in digest.iter() {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded.truncate(16);
+    encoded
+}
+
+/// M5：加盐文本摘要前缀（正文/账号键的 sha256Prefix）。
+fn dispatch_salted_prefix(salt: &[u8; 32], value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::new();
+    for byte in digest.iter() {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded.truncate(12);
+    encoded
+}
+
+fn assert_hashed_dispatch_name(name: &str) {
+    let stem = name.strip_suffix(".jsonl").expect("jsonl name");
+    assert_eq!(stem.len(), 16, "accountTag 16 hex: {name}");
+    assert!(
+        stem.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "accountTag 小写 hex: {name}"
+    );
+}
+
 fn engine_command(data_dir: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-engine"));
     command.arg("--data-dir").arg(data_dir).args([
@@ -269,6 +349,50 @@ fn missing_registry_with_store_fails_startup_and_preserves_dirs() {
     assert!(
         log.contains("RegistryMissingWithStores"),
         "fail-closed 日志: {log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M6 C 阶段（评审第 3 条）：固定 stderr 码面 **每进程每码恰一条**——
+/// 起真进程（`KT_SIGNAL_STORE_KEY` 形状非法 → 启动期即落 `StoreKeyInvalid`），
+/// stdin 立即 EOF 收口后读全量 stderr：
+///
+/// - 该行逐字形状 + 恰出现一次（对照单测里只能断言「闸幂等」的那条）；
+/// - 除它之外没有别的 `event=store_open_failed`；
+/// - fail-closed：磁盘上不落 `store.db`（连 accounts/ 都不建）。
+#[test]
+fn store_open_failed_line_is_emitted_once_per_process() {
+    let dir = temp_dir("store-open-line-contract");
+    let output = Command::new(env!("CARGO_BIN_EXE_kt-signal-engine"))
+        .arg("--data-dir")
+        .arg(&dir)
+        .arg("jsonRpc")
+        .stdin(Stdio::null()) // 立即 EOF：进程干净退出
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env("KT_SIGNAL_STORE_KEY", "not-a-key")
+        .output()
+        .expect("engine spawns and exits");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("event=store_open_failed"))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "kt-signal-engine: ERROR event=store_open_failed code=StoreKeyInvalid retryable=false"
+        ],
+        "每进程每码恰一条固定行；实际 stderr:\n{stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdin EOF 是干净退出：{stderr}"
+    );
+    assert!(
+        !dir.join("accounts").exists(),
+        "形状非法的 key 一个账号目录都不该建"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -421,6 +545,86 @@ fn start_and_finish_link_lifecycle() {
     );
 }
 
+/// 双槽 QR 轮换（engine 侧 additive 契约，2026-11-11 批）：startLink 除旧
+/// deviceLinkUri（= 第 0 槽）外新增 linkAttemptId + slots；rotateLink 铸新槽
+/// 并回该 attempt 的 live 槽全表；提交 **rotate 出来的第 1 槽**（用户真正会扫
+/// 的那张码）成功后 attempt 收口 → rotateLink / 缺参都答 -1
+/// LINK_ATTEMPT_NOT_FOUND。
+///
+/// 假面边界（审计必须项 2，显式声明）：KT_ENGINE_FAKE_SERVICE 的 finishLink
+/// 首提交即清空 fake_link（无 store、无 attempt 级提交位），**表达不了跨槽
+/// 幂等**——另一码 replay 在假面会答 -1 UNKNOWN_LINK_URI，那不是真面行为。
+/// 所以本用例只覆盖 wire 形状（三个键、槽表、错误码），"只提交一次 + 另一码
+/// 幂等回同一账号"的证明搬到了真面单测
+/// service::tests::rotate_link_mints_second_slot_and_either_slot_can_finish
+/// （那里真跑 attempt 级提交位）。这里也不用 accounts.len()==1 自证：假面每
+/// 次成功提交必然只建一个账号，长度断言证明不了单飞。
+#[test]
+fn rotate_link_rotation_lifecycle() {
+    let dir = temp_dir("link-rotate");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    let started = engine.request("startLink", json!({}));
+    let slot0 = started["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("deviceLinkUri string")
+        .to_owned();
+    let attempt_id = started["result"]["linkAttemptId"]
+        .as_str()
+        .expect("linkAttemptId string")
+        .to_owned();
+    assert!(!attempt_id.is_empty(), "linkAttemptId must be non-empty");
+    assert_eq!(
+        started["result"]["slots"],
+        json!([{ "deviceLinkUri": slot0.clone(), "slot": 0 }]),
+        "没有 rotate 时只有一个槽（旧行为不变）"
+    );
+
+    let rotated = engine.request("rotateLink", json!({ "linkAttemptId": attempt_id.clone() }));
+    let slot1 = rotated["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("rotated uri string")
+        .to_owned();
+    assert_ne!(slot0, slot1, "rotate 必须铸新槽");
+    assert_eq!(rotated["result"]["slot"], json!(1));
+    assert_eq!(
+        rotated["result"]["slots"],
+        json!([
+            { "deviceLinkUri": slot0.clone(), "slot": 0 },
+            { "deviceLinkUri": slot1.clone(), "slot": 1 },
+        ])
+    );
+
+    // 真的 finish 轮换出来的第 1 槽（不是第 0 槽）：用户扫的就是最新那张码。
+    let finished = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": slot1, "deviceName": "KT" }),
+    );
+    let number = finished["result"]["number"]
+        .as_str()
+        .expect("number string")
+        .to_owned();
+    assert_e164_number(&number);
+    // 号码必须真的落进账号表（按号码核，而不是拿长度自证单飞）。
+    let accounts = engine.request("listAccounts", json!({}))["result"]
+        .as_array()
+        .expect("accounts array")
+        .clone();
+    assert!(
+        accounts.iter().any(|row| row["number"] == json!(number)),
+        "提交后的号码必须在 listAccounts 里: {accounts:?}"
+    );
+    // 跨槽幂等（另一码 replay 同账号）在假面表达不了（见上方边界说明）；
+    // 真面断言在服务单测 rotate_link_mints_second_slot_and_either_slot_can_finish。
+
+    // attempt 已收口：轮换不再接受（确定性错误码，不是 -32603）。
+    let (code, message) = engine.error_of("rotateLink", json!({ "linkAttemptId": attempt_id }));
+    assert_eq!((code, message.as_str()), (-1, "LINK_ATTEMPT_NOT_FOUND"));
+    // 参数缺失同样 fail-closed 到同一码位。
+    let (code, message) = engine.error_of("rotateLink", json!({}));
+    assert_eq!((code, message.as_str()), (-1, "LINK_ATTEMPT_NOT_FOUND"));
+}
+
 /// listAccounts 回填能力门数据面（2026-10-20 批，wire additive
 /// `capabilities` 键，compat §3 行 + §5 块）：fake 形状桩逐账号投
 /// `{attachmentBackfill: true}`——官方 `isBackfillEnabled` 对
@@ -467,6 +671,53 @@ fn list_accounts_fake_capabilities_shape() {
         accounts[0].get("aci").is_none(),
         "fake listAccounts 无 aci 键（既有语义不回归）"
     );
+}
+
+/// receive.confirm / receive.replay 兼容面（phase2）：kt_outbox 已 DROP，
+/// 两个方法保留一版回滚窗口。confirm = 幂等 no-op（已知账号 true / 未知
+/// false / key 形状不参与判定）；replay = 仍按 dedupe key 解析 sender+ts 查
+/// thread_messages（无行 → -32603）。wire 形状不变。
+#[test]
+fn receive_compat_surface_stays_a_noop() {
+    let dir = temp_dir("receive-compat");
+    // v2 注册表：一条带 store 目录的账号（fake 管线不启动，只测方法面）。
+    let account = "+15550000001";
+    let state = json!({
+        "version": 2,
+        "accounts": [{ "number": account, "dir": "accounts/known" }],
+    });
+    std::fs::write(
+        dir.join("engine-state.json"),
+        serde_json::to_vec(&state).expect("state json"),
+    )
+    .expect("engine-state.json");
+    std::fs::create_dir_all(dir.join("accounts/known")).expect("account dir");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    let key = "dup:11111111-2222-4333-8444-555555555555:1700000000000";
+
+    // 已知账号：幂等 true（kt_outbox 已 DROP，没有行也需要 confirm 收口）；
+    // 未知账号：如实 false。
+    for _ in 0..2 {
+        let confirmed = engine.request(
+            "receive.confirm",
+            json!({ "account": account, "dedupeKey": key }),
+        );
+        assert_eq!(confirmed["result"], json!(true));
+    }
+    let unknown = engine.request(
+        "receive.confirm",
+        json!({ "account": "+15559990000", "dedupeKey": key }),
+    );
+    assert_eq!(unknown["result"], json!(false));
+
+    // 参数面照旧 fail-closed（-32603）。
+    let (code, _) = engine.error_of("receive.confirm", json!({ "account": account }));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of(
+        "receive.replay",
+        json!({ "account": account, "dedupeKey": key }),
+    );
+    assert_eq!(code, -32603, "无 store 行 → replay 折叠内部错误");
 }
 
 #[test]
@@ -596,17 +847,12 @@ fn calls_relays_fake_empty_state_and_no_dispatch_log() {
     assert!(result.get("lastError").is_none(), "空态成功无 lastError 键");
 
     // 读面不落调度日志（engine.deviceCapabilities 触网读面同纪律）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let has_entry = std::fs::read_to_string(&log_path)
-        .ok()
-        .map(|log| {
-            log.lines().any(|line| {
-                serde_json::from_str::<Value>(line)
-                    .map(|entry| entry["method"] == "calls.relays")
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
+    let log = dispatch_log_text(&dir);
+    let has_entry = log.lines().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .map(|entry| entry["method"] == "calls.relays")
+            .unwrap_or(false)
+    });
     assert!(!has_entry, "calls.relays 读面不落调度日志");
 }
 
@@ -1010,6 +1256,69 @@ fn devices_fake_shapes_and_param_fail_closed() {
         json!({ "account": "+15550001111", "deviceId": 2 }),
     );
     assert_eq!(code, -32603, "unknown account folds to internal error");
+}
+
+/// getSyncState 契约面（阶段 1-1，SIGNAL-STAGE1-DESIGN §二 P-B-3）：fake
+/// 模式无真实同步臂，三半边恒 idle + sinceMs 整数；查询纯读幂等（重复调用
+/// 逐字节一致）；未登记账号/缺参/坏参折 -32603；删号后窗口簿随注册表消失。
+#[test]
+fn sync_state_fake_shape_and_idempotency() {
+    let dir = temp_dir("sync-state-fake");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+
+    // 未登记账号 / 缺 account / 非字符串 account：读面惯例折叠 -32603
+    // （不建簿、不发明窗口）。
+    let (code, _) = engine.error_of("getSyncState", json!({ "account": "+15550009999" }));
+    assert_eq!(code, -32603, "unknown account folds to internal error");
+    let (code, _) = engine.error_of("getSyncState", json!({}));
+    assert_eq!(code, -32603);
+    let (code, _) = engine.error_of("getSyncState", json!({ "account": 7 }));
+    assert_eq!(code, -32603);
+
+    // fake 链接一个账号 → 注册表写入、窗口簿随之开窗；fake 面没有真实
+    // 同步臂，三半边如实 idle（不伪装在飞）。
+    let started = engine.request("startLink", json!({}));
+    let uri = started["result"]["deviceLinkUri"]
+        .as_str()
+        .expect("deviceLinkUri string")
+        .to_owned();
+    let finished = engine.request(
+        "finishLink",
+        json!({ "deviceLinkUri": uri, "deviceName": "KT" }),
+    );
+    let number = finished["result"]["number"]
+        .as_str()
+        .expect("number string")
+        .to_owned();
+    let account = number.clone();
+
+    let first = engine.request("getSyncState", json!({ "account": account }))["result"].clone();
+    assert_eq!(
+        first,
+        json!({
+            "contacts": "idle",
+            "storage": "idle",
+            "profile": "idle",
+            "sinceMs": first["sinceMs"],
+        }),
+        "fake 面恒 idle，四键恒在（{first}）"
+    );
+    assert!(
+        first["sinceMs"].as_u64().is_some(),
+        "sinceMs 必须是整数：{first}"
+    );
+
+    // 幂等：重复调用逐字节一致（纯读，不建簿不改簿）。
+    let second = engine.request("getSyncState", json!({ "account": account }))["result"].clone();
+    assert_eq!(first, second, "getSyncState is a pure snapshot");
+
+    // 删号后窗口簿随注册表一起消失：不再可查（-32603）。
+    assert_eq!(
+        engine.request("deleteLocalAccountData", json!({ "account": number }))["result"],
+        json!({})
+    );
+    let (code, _) = engine.error_of("getSyncState", json!({ "account": account }));
+    assert_eq!(code, -32603, "the window book leaves with the registry row");
 }
 
 /// 贴纸包安装状态同步（P5 扩面，Storage Service 真相源）：fake 模式空列表
@@ -1445,10 +1754,10 @@ fn create_group_fake_shape_param_fail_closed_and_log_redaction() {
         );
     }
 
-    // 调度日志：title/members 键逐字保留（协议上行面纪律），avatar 键
-    // 形状摘要化（data URI 载荷零字节落盘）；被拒调用同样落日志。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：title/群名摘要化（长度 + 加盐哈希），members 号码脱敏
+    // （结构保留），avatar 键形状摘要化（data URI 载荷零字节落盘）；被拒
+    // 调用不落日志（append 在参数校验之后）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -1456,10 +1765,14 @@ fn create_group_fake_shape_param_fail_closed_and_log_redaction() {
         .collect();
     assert_eq!(
         entries.len(),
-        14,
-        "成功两条 + 失败一条 + 拒绝十一条均落日志"
+        3,
+        "成功两条 + 头像上行失败一条落日志；拒绝十一条不落日志"
     );
-    assert_eq!(entries[0]["params"]["title"], json!("作战室"));
+    assert_eq!(entries[0]["params"]["title"]["redacted"], json!("text"));
+    assert_eq!(
+        entries[0]["params"]["title"]["length"],
+        json!("作战室".chars().count())
+    );
     assert!(
         entries[0]["params"]["members"].is_null(),
         "members 缺省原样保留"
@@ -1573,10 +1886,10 @@ fn migrate_group_fake_shapes_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：groupId/members/title 键逐字保留（协议上行面纪律），
-    // avatar 键形状摘要化（data URI 载荷零字节落盘）；被拒调用同样落日志。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：groupId 保留（群 key 是结构键）、title 摘要化、members
+    // 号码脱敏（结构保留），avatar 键形状摘要化（data URI 载荷零字节落盘）；
+    // 被拒调用不落日志（append 在参数校验之后）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -1584,14 +1897,23 @@ fn migrate_group_fake_shapes_and_param_fail_closed() {
         .collect();
     assert_eq!(
         entries.len(),
-        18,
-        "成功两条 + 失败一条 + 拒绝十五条均落日志"
+        3,
+        "成功两条 + 头像上行失败一条落日志；拒绝十五条不落日志"
     );
     assert_eq!(entries[0]["params"]["groupId"], json!(legacy_id));
-    assert_eq!(entries[0]["params"]["members"], members);
+    assert_eq!(
+        entries[0]["params"]["members"],
+        json!([{ "redacted": "phone" }]),
+        "members 号码抹除（UUID 结构保留）"
+    );
     assert!(
         entries[0]["params"]["title"].is_null(),
         "title 缺省原样保留"
+    );
+    assert_eq!(
+        entries[1]["params"]["title"]["redacted"],
+        json!("text"),
+        "migrateGroup title 摘要化"
     );
     let redacted = &entries[2]["params"]["avatar"];
     assert!(
@@ -1665,8 +1987,7 @@ fn terminate_group_fake_shape_and_param_fail_closed() {
     assert_eq!((code, message.as_str()), (-32603, "Internal error"));
 
     // 调度日志：groupId 逐字保留（协议上行面纪律）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -1676,7 +1997,7 @@ fn terminate_group_fake_shape_and_param_fail_closed() {
         .find(|entry| entry["method"] == "terminateGroup")
         .expect("terminateGroup logged");
     assert_eq!(entry["params"]["groupId"], json!(group_id));
-    assert_eq!(entry["params"]["account"], json!("+15550000000"));
+    assert_eq!(entry["params"]["account"]["redacted"], json!("account"));
 }
 
 /// 群消失计时器（updateGroup {expiration}，KT 扩展方法）：fake 模式成功
@@ -1728,10 +2049,9 @@ fn update_group_expiration_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：groupId 逐字保留（协议上行面纪律；被拒的调用同样落日志
-    // ——记录的是派发，mutating 面同款——成功两条 + 拒绝十条 = 12 行）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：groupId 逐字保留（协议上行面纪律）；被拒调用不落日志
+    //（append 在参数校验之后）——成功两条 = 2 行。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -1740,10 +2060,13 @@ fn update_group_expiration_fake_shape_and_param_fail_closed() {
         .iter()
         .filter(|entry| entry["method"] == "updateGroup")
         .collect();
-    assert_eq!(set_entries.len(), 12, "成功两条 + 拒绝十条均落日志");
+    assert_eq!(set_entries.len(), 2, "成功两条落日志；拒绝十条不落日志");
     assert_eq!(set_entries[0]["params"]["groupId"], json!(group_id));
     assert_eq!(set_entries[0]["params"]["expiration"], json!(86_400));
-    assert_eq!(set_entries[0]["params"]["account"], json!("+15550000000"));
+    assert_eq!(
+        set_entries[0]["params"]["account"]["redacted"],
+        json!("account")
+    );
     assert_eq!(set_entries[1]["params"]["groupId"], json!(group_id));
     assert_eq!(set_entries[1]["params"]["expiration"], json!(0));
 
@@ -1813,9 +2136,9 @@ fn update_group_announcements_only_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：成功三条 + 拒绝四条 = 7 行，announcementsOnly 键逐字保留。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：成功三条 = 3 行（拒绝四条不落日志），announcementsOnly
+    // 键逐字保留。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -1824,7 +2147,7 @@ fn update_group_announcements_only_fake_shape_and_param_fail_closed() {
         .iter()
         .filter(|entry| entry["method"] == "updateGroup")
         .collect();
-    assert_eq!(set_entries.len(), 7, "成功三条 + 拒绝四条均落日志");
+    assert_eq!(set_entries.len(), 3, "成功三条落日志；拒绝四条不落日志");
     assert_eq!(set_entries[0]["params"]["announcementsOnly"], json!(true));
     assert_eq!(set_entries[1]["params"]["announcementsOnly"], json!(false));
     assert_eq!(set_entries[2]["params"]["announcementsOnly"], json!(true));
@@ -1934,16 +2257,19 @@ fn update_group_avatar_fake_arms_param_fail_closed_and_log_redaction() {
     }
 
     // 调度日志：avatar data URI 键形状摘要化（零 data URI/base64 字节落盘），
-    // groupId/expiration 键照旧逐字保留；成功臂 + 失败臂 + 拒绝臂均落日志
-    //（mutating 面同款：成功 2 + 失败 2 + 拒绝 9 = 13 行 updateGroup 条目）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // groupId/expiration 键照旧逐字保留；成功臂 + 服务层失败臂落日志，
+    // 参数拒绝臂不落（成功 2 + 失败 2 = 4 行 updateGroup 条目）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
         .filter(|entry| entry["method"] == "updateGroup")
         .collect();
-    assert_eq!(entries.len(), 13, "成功两条 + 失败两条 + 拒绝九条均落日志");
+    assert_eq!(
+        entries.len(),
+        4,
+        "成功两条 + 失败两条落日志；拒绝九条不落日志"
+    );
     assert!(
         !log.contains("data:image") && !log.contains("iVBO"),
         "avatar data URI/base64 payload leaked into dispatch log"
@@ -2017,16 +2343,20 @@ fn update_group_title_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：title 键明文逐字保留（成功 2 + 拒绝 6 = 8 行均落日志）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：title 键摘要化（长度 + 加盐哈希）；成功 2 行，拒绝 6 条
+    // 不落日志。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
         .filter(|entry| entry["method"] == "updateGroup")
         .collect();
-    assert_eq!(entries.len(), 8, "成功两条 + 拒绝六条均落日志");
-    assert_eq!(entries[0]["params"]["title"], json!("新群名"));
+    assert_eq!(entries.len(), 2, "成功两条落日志；拒绝六条不落日志");
+    assert_eq!(entries[0]["params"]["title"]["redacted"], json!("text"));
+    assert_eq!(
+        entries[0]["params"]["title"]["length"],
+        json!("新群名".chars().count())
+    );
     assert_eq!(entries[0]["params"]["groupId"], json!(group_id));
 
     // real 模式未注册账号 + title 在场：storage 上下文打不开折叠 -32603。
@@ -2093,20 +2423,19 @@ fn update_group_add_members_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：addMembers 键照旧逐字保留（成功 2 + 拒绝 5 = 7 行均落日志）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：addMembers 结构保留、号码脱敏（成功 2 行；拒绝 5 条不落）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
         .filter(|entry| entry["method"] == "updateGroup")
         .collect();
-    assert_eq!(entries.len(), 7, "成功两条 + 拒绝五条均落日志");
+    assert_eq!(entries.len(), 2, "成功两条落日志；拒绝五条不落日志");
     assert_eq!(
         entries[0]["params"]["addMembers"],
-        json!(["+15550000001", "11111111-2222-4333-8444-555555555555"])
+        json!([{ "redacted": "phone" }, "11111111-2222-4333-8444-555555555555"])
     );
-    assert_eq!(entries[1]["params"]["title"], json!("扩员"));
+    assert_eq!(entries[1]["params"]["title"]["redacted"], json!("text"));
 
     // real 模式未注册账号 + addMembers 在场：storage 上下文打不开折叠
     // -32603。
@@ -2164,18 +2493,17 @@ fn update_group_remove_members_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：removeMembers 键照旧逐字保留（成功 1 + 拒绝 5 = 6 行）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：removeMembers 结构保留、号码脱敏（成功 1 行；拒绝 5 条不落）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
         .filter(|entry| entry["method"] == "updateGroup")
         .collect();
-    assert_eq!(entries.len(), 6, "成功一条 + 拒绝五条均落日志");
+    assert_eq!(entries.len(), 1, "成功一条落日志；拒绝五条不落日志");
     assert_eq!(
         entries[0]["params"]["removeMembers"],
-        json!(["+15550000001"])
+        json!([{ "redacted": "phone" }])
     );
 
     // real 模式未注册账号 + removeMembers 在场：storage 上下文打不开折叠
@@ -2269,22 +2597,22 @@ fn update_group_group_link_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：两键照旧逐字保留（成功 3 + 拒绝 10 = 13 行均落日志）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：access 键保留、inviteLinkPassword 摘要化（成功 3 行；
+    // 拒绝 10 条不落日志）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
         .filter(|entry| entry["method"] == "updateGroup")
         .collect();
-    assert_eq!(entries.len(), 13, "成功三条 + 拒绝十条均落日志");
+    assert_eq!(entries.len(), 3, "成功三条落日志；拒绝十条不落日志");
     assert_eq!(
         entries[0]["params"]["addFromInviteLinkAccess"],
         json!("ANY")
     );
     assert_eq!(
-        entries[1]["params"]["inviteLinkPassword"],
-        json!(password_b64)
+        entries[1]["params"]["inviteLinkPassword"]["redacted"],
+        json!("text")
     );
 
     // real 模式未注册账号 + 链接两面在场：storage 上下文打不开折叠 -32603。
@@ -2334,15 +2662,14 @@ fn leave_group_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：groupId 逐字保留（成功 1 + 拒绝 4 = 5 行）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：groupId 逐字保留（成功 1 行；拒绝 4 条不落日志）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
         .filter(|entry| entry["method"] == "leaveGroup")
         .collect();
-    assert_eq!(entries.len(), 5, "成功一条 + 拒绝四条均落日志");
+    assert_eq!(entries.len(), 1, "成功一条落日志；拒绝四条不落日志");
     assert_eq!(entries[0]["params"]["groupId"], json!(group_id));
 
     // real 模式未注册账号：storage 上下文打不开折叠 -32603（terminateGroup
@@ -2402,8 +2729,7 @@ fn preview_group_via_link_fake_error_face_and_param_fail_closed() {
     }
 
     // 读面不落调度日志（材料面纪律，与 generateInviteLinkPassword 同位）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = dispatch_log_text(&dir);
     assert!(
         !log.lines().any(|line| line.contains("previewGroupViaLink")),
         "preview 读面零调度日志"
@@ -2422,8 +2748,8 @@ fn preview_group_via_link_fake_error_face_and_param_fail_closed() {
 /// joinGroupViaLink（经链接入群写面，P13/任务3，官方 joinGroupV2ViaLink
 /// 行为对齐）：fake 形状桩 `{status:"joined"}`（direct 臂形状——fake 无
 /// join info 读面不裁定审批臂，§5 登记偏差）；写面落调度日志（mutating
-/// 面纪律，inviteLink 键照旧逐字保留）；参数面 fail-closed（-32603 同
-/// preview 闸）；real 模式未注册账号折叠 -32603。
+/// 面纪律，inviteLink 键摘要化）；参数面 fail-closed（-32603 同 preview
+/// 闸）；real 模式未注册账号折叠 -32603。
 #[test]
 fn join_group_via_link_fake_shape_and_param_fail_closed() {
     let dir = temp_dir("join-group-via-link");
@@ -2454,16 +2780,18 @@ fn join_group_via_link_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：写面落日志，inviteLink 键逐字保留（成功 1 + 拒绝 4 = 5 行）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：写面落日志、inviteLink 摘要化（成功 1 行；拒绝 4 条不落）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
         .filter(|entry| entry["method"] == "joinGroupViaLink")
         .collect();
-    assert_eq!(entries.len(), 5, "成功一条 + 拒绝四条均落日志");
-    assert_eq!(entries[0]["params"]["inviteLink"], json!(link));
+    assert_eq!(entries.len(), 1, "成功一条落日志；拒绝四条不落日志");
+    assert_eq!(
+        entries[0]["params"]["inviteLink"]["redacted"],
+        json!("text")
+    );
 
     // real 模式未注册账号：storage 上下文打不开折叠 -32603。
     let real_dir = temp_dir("join-group-via-link-real");
@@ -2477,7 +2805,7 @@ fn join_group_via_link_fake_shape_and_param_fail_closed() {
 
 /// cancelJoinRequest（撤回入群申请，P13/任务4，官方桌面 cancelJoinRequest
 /// 行为对齐）：fake 形状桩 `{status:"cancelled"}`（leaveGroup 同纪律）；
-/// 写面落调度日志（inviteLink 键逐字保留）；参数面 fail-closed（-32603：
+/// 写面落调度日志（inviteLink 键摘要化）；参数面 fail-closed（-32603：
 /// 缺 account/缺 inviteLink/坏形状——parseInviteLink 同闸收口）；real 模
 /// 式未注册账号折叠 -32603。
 #[test]
@@ -2510,16 +2838,18 @@ fn cancel_join_request_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：写面落日志（成功 1 + 拒绝 4 = 5 行），inviteLink 键逐字。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：写面落日志（成功 1 行；拒绝 4 条不落），inviteLink 摘要化。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
         .filter(|entry| entry["method"] == "cancelJoinRequest")
         .collect();
-    assert_eq!(entries.len(), 5, "成功一条 + 拒绝四条均落日志");
-    assert_eq!(entries[0]["params"]["inviteLink"], json!(link));
+    assert_eq!(entries.len(), 1, "成功一条落日志；拒绝四条不落日志");
+    assert_eq!(
+        entries[0]["params"]["inviteLink"]["redacted"],
+        json!("text")
+    );
 
     // real 模式未注册账号：storage 上下文打不开折叠 -32603。
     let real_dir = temp_dir("cancel-join-request-real");
@@ -2584,18 +2914,17 @@ fn approve_join_request_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：写面落日志（成功 2 + 拒绝 7 = 9 行），recipient 键逐字。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：写面落日志（成功 2 行；拒绝 7 条不落），recipient 只留计数。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("log line JSON"))
         .filter(|entry| entry["method"] == "approveJoinRequest")
         .collect();
-    assert_eq!(entries.len(), 9, "成功两条 + 拒绝七条均落日志");
+    assert_eq!(entries.len(), 2, "成功两条落日志；拒绝七条不落日志");
     assert_eq!(
         entries[0]["params"]["recipient"],
-        json!("44444444-5555-4666-9777-888888888888")
+        json!({ "redacted": "recipient", "count": 1 })
     );
 
     // real 模式未注册账号：storage 上下文打不开折叠 -32603。
@@ -2716,9 +3045,8 @@ fn invite_link_materials_pure_faces_and_param_fail_closed() {
     }
 
     // 材料面非协议上行：零调度日志行。
-    let log_path = dir.join("engine-send-log.jsonl");
     assert!(
-        !log_path.exists(),
+        !dispatch_log_exists(&dir),
         "invite link materials are not protocol uplink: no dispatch log"
     );
 
@@ -2861,9 +3189,8 @@ fn call_link_materials_fake_shape_and_param_fail_closed() {
 
     // 材料供给面非协议上行：不落调度日志（五个方法全部调用后日志文件仍
     // 不存在）。
-    let log_path = dir.join("engine-send-log.jsonl");
     assert!(
-        !log_path.exists(),
+        !dispatch_log_exists(&dir),
         "calls.* 材料面不落调度日志（compat §5 call-link 块纪律）"
     );
 }
@@ -2989,8 +3316,7 @@ fn incident_sized_attachment_send_survives_and_answers() {
 
     // 调度日志只留摘要：5.9MB data URI 不落盘（帧帽对齐后大媒体首次可达
     // dispatch，落库边界与 updateGroup avatar 摘要同款）。
-    let log =
-        std::fs::read_to_string(dir.join("engine-send-log.jsonl")).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     assert!(
         !log.contains("data:video/mp4"),
         "attachment payload leaked into the dispatch log"
@@ -3400,10 +3726,9 @@ fn send_story_fake_shape_and_param_fail_closed() {
     );
     assert_eq!(code, -32603, "空批 + group null 归缺席 = 现状整拒");
 
-    // 调度日志纪律：成功与被拒调用都落日志（send 系同款，updateGroup
-    // 同构断言）；params 形状供 connector 侧依赖断言。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志纪律：仅成功派发落日志（append 在参数校验之后）；params
+    // 形状供 connector 侧依赖断言。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -3414,20 +3739,28 @@ fn send_story_fake_shape_and_param_fail_closed() {
         .collect();
     assert_eq!(
         story_entries.len(),
-        51,
-        "成功六条 + 拒绝三十八条均落日志（append_dispatch 在参数闸之前；媒体 \
-         story 批新增成功两条/拒绝八条；群 story 批新增成功四条/拒绝三条）"
+        10,
+        "仅成功派发落日志（十次成功调用）；参数拒绝不落日志（媒体 \
+         story 与群 story 面的成功条目都计入）"
     );
     assert_eq!(
         story_entries[0]["params"]["recipients"],
-        json!(["+15555550101", "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"])
+        json!({ "redacted": "recipients", "count": 2 })
     );
     assert_eq!(
         story_entries[0]["params"]["previewUrl"],
         json!("https://example.com/a"),
         "previewUrl/previewTitle 原样进日志（connector 侧依赖断言）"
     );
-    assert_eq!(story_entries[0]["params"]["previewTitle"], json!("Example"));
+    assert_eq!(
+        story_entries[0]["params"]["previewTitle"]["redacted"],
+        json!("text"),
+        "previewTitle 摘要化"
+    );
+    assert_eq!(
+        story_entries[0]["params"]["previewTitle"]["length"],
+        json!("Example".chars().count())
+    );
     assert_eq!(
         story_entries[1]["params"]["distributionListId"],
         json!(null),
@@ -3570,10 +3903,9 @@ fn send_story_caption_fake_shape_and_param_fail_closed() {
         assert_eq!(code, -32603);
     }
 
-    // 调度日志纪律：成功与被拒调用都落日志（send 系同款）；caption 原样
-    // 进 params（connector 侧依赖断言）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志纪律：仅成功派发落日志（append 在参数校验之后）；caption
+    // 摘要化进 params（connector 侧依赖断言）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -3581,14 +3913,15 @@ fn send_story_caption_fake_shape_and_param_fail_closed() {
         .collect();
     assert_eq!(
         entries.len(),
-        12,
-        "成功六条 + 拒绝六条均落日志（append_dispatch 在参数闸之前）"
+        6,
+        "仅成功派发落日志（六次成功调用）；参数拒绝的六条不落日志"
     );
     assert_eq!(
-        entries[0]["params"]["caption"],
-        json!("story caption"),
-        "caption 原样进日志"
+        entries[0]["params"]["caption"]["redacted"],
+        json!("text"),
+        "caption 只留摘要"
     );
+    assert_eq!(entries[0]["params"]["caption"]["length"], json!(13));
 
     // real 模式未注册账号：折叠 -32603 不触网（send 系同折叠）。
     let real_dir = temp_dir("send-story-caption-real");
@@ -3835,10 +4168,9 @@ fn send_story_reaction_fake_shape_and_param_fail_closed() {
     );
     assert_eq!(with_remove.get("result"), Some(&json!({})));
 
-    // 调度日志纪律：成功与被拒调用都落日志（append_dispatch 在参数闸之前）；
-    // params 原样供 connector 侧依赖断言。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志纪律：仅成功派发落日志（append 在参数校验之后）；params
+    // 摘要化供 connector 侧依赖断言。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -3847,10 +4179,14 @@ fn send_story_reaction_fake_shape_and_param_fail_closed() {
         .iter()
         .filter(|entry| entry["method"] == "sendStoryReaction")
         .collect();
-    assert_eq!(reaction_entries.len(), 13, "成功两条 + 拒绝十一条均落日志");
+    assert_eq!(
+        reaction_entries.len(),
+        2,
+        "成功两条落日志；拒绝十一条不落日志"
+    );
     assert_eq!(
         reaction_entries[0]["params"]["storyAuthor"],
-        json!("+15555550101")
+        json!({ "redacted": "recipient", "count": 1 })
     );
     assert_eq!(
         reaction_entries[0]["params"]["storyTimestamp"],
@@ -3948,10 +4284,9 @@ fn send_story_reaction_group_fake_shape_and_param_fail_closed() {
         assert_eq!(code, -32603);
     }
 
-    // 调度日志纪律：群腿/缺席腿/被拒调用均落日志（append_dispatch 在参数
-    // 闸之前）；params 原样供 connector 侧依赖断言。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志纪律：群腿/缺席腿的成功派发落日志（append 在参数校验之后）；
+    // params 摘要化供 connector 侧依赖断言。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -3962,8 +4297,8 @@ fn send_story_reaction_group_fake_shape_and_param_fail_closed() {
         .collect();
     assert_eq!(
         reaction_entries.len(),
-        5,
-        "群腿一条 + 缺席两条 + 群闸拒两条均落日志"
+        3,
+        "群腿一条 + 缺席两条成功派发落日志；群闸拒绝两条不落日志"
     );
     let group_string_entries: Vec<&Value> = reaction_entries
         .iter()
@@ -3972,8 +4307,8 @@ fn send_story_reaction_group_fake_shape_and_param_fail_closed() {
         .collect();
     assert_eq!(
         group_string_entries.len(),
-        2,
-        "群腿一条 + 空串闸拒一条（字符串形 groupId；非串 42 形态另落但非字符串）"
+        1,
+        "仅群腿成功条目（空串参数闸拒绝不落日志）"
     );
     assert_eq!(
         group_string_entries[0]["params"]["groupId"],
@@ -3983,7 +4318,10 @@ fn send_story_reaction_group_fake_shape_and_param_fail_closed() {
         .iter()
         .find(|entry| entry["params"].get("groupId") == Some(&Value::Null))
         .expect("null 归缺席调用亦原样落日志");
-    assert_eq!(null_entry["params"]["storyAuthor"], json!("+15555550101"));
+    assert_eq!(
+        null_entry["params"]["storyAuthor"],
+        json!({ "redacted": "recipient", "count": 1 })
+    );
 
     // real 模式未注册账号（群腿在场）：折叠 -32603 不触网（send 系同折叠）。
     let real_dir = temp_dir("send-story-reaction-group-real");
@@ -4128,9 +4466,8 @@ fn delete_story_for_everyone_fake_shape_and_param_fail_closed() {
         assert_eq!(code, -32603);
     }
 
-    // 调度日志纪律：成功与被拒调用都落日志（append_dispatch 在参数闸之前）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志纪律：仅成功派发落日志（append 在参数校验之后）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -4139,10 +4476,14 @@ fn delete_story_for_everyone_fake_shape_and_param_fail_closed() {
         .iter()
         .filter(|entry| entry["method"] == "deleteStoryForEveryone")
         .collect();
-    assert_eq!(delete_entries.len(), 20, "成功两条 + 拒绝十八条均落日志");
+    assert_eq!(
+        delete_entries.len(),
+        2,
+        "成功两条落日志；拒绝十八条不落日志"
+    );
     assert_eq!(
         delete_entries[0]["params"]["recipients"],
-        json!(["+15555550101", "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"])
+        json!({ "redacted": "recipients", "count": 2 })
     );
     assert_eq!(
         delete_entries[1]["params"]["recipients"],
@@ -4278,8 +4619,7 @@ fn mutating_methods_log_dispatch_and_reply() {
     assert_eq!(half_quote["error"]["code"], -32603);
 
     // 调度日志：逐行 {method, params}，参数形状供 connector 侧依赖断言。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -4299,15 +4639,13 @@ fn mutating_methods_log_dispatch_and_reply() {
             "sendReadReceipt",
             "sendViewedReceipt",
             "sendDeliveryReceipt",
-            "send",
-            "send",
             "send"
         ]
     );
     assert_eq!(
         entries[0]["params"]["recipient"],
-        json!(["+15555550101"]),
-        "send carries recipient array"
+        json!({ "redacted": "recipients", "count": 1 }),
+        "send carries recipient count"
     );
     assert_eq!(
         entries[1]["params"]["stop"],
@@ -4316,14 +4654,14 @@ fn mutating_methods_log_dispatch_and_reply() {
     );
     assert_eq!(
         entries[4]["params"]["recipient"],
-        json!("+15555550101"),
-        "updateContact carries single-string recipient"
+        json!({ "redacted": "recipient", "count": 1 }),
+        "updateContact carries single-string recipient (count only)"
     );
     // 回执面：单作者 recipient（官方按作者分组直发）+ 时间戳数组原样透传。
     assert_eq!(
         entries[5]["params"]["recipient"],
-        json!("+15555550101"),
-        "receipt carries single-author recipient"
+        json!({ "redacted": "recipient", "count": 1 }),
+        "receipt carries single-author recipient (count only)"
     );
     assert_eq!(
         entries[5]["params"]["timestamps"],
@@ -4332,25 +4670,34 @@ fn mutating_methods_log_dispatch_and_reply() {
     );
     assert_eq!(entries[6]["params"]["timestamps"], json!([44]));
     assert_eq!(entries[7]["params"]["timestamps"], json!([45]));
-    // send 扩面键在调度日志逐字保留（半参失败那次也落日志，记录的是派发）。
+    // send 扩面结构键在调度日志保留（正文/号码脱敏；半参失败那次也落日志）。
     assert_eq!(entries[8]["params"]["quoteTimestamp"], json!(42));
-    assert_eq!(entries[8]["params"]["quoteAuthor"], json!("+15555550101"));
+    assert_eq!(
+        entries[8]["params"]["quoteAuthor"],
+        json!({ "redacted": "recipient", "count": 1 })
+    );
     assert_eq!(
         entries[8]["params"]["previewUrl"],
         json!("https://example.com")
     );
     assert_eq!(
         entries[8]["params"]["mentions"],
-        json!([{ "number": "+15555550101", "start": 0, "length": 2 }])
+        json!([{ "number": { "redacted": "recipient", "count": 1 }, "start": 0, "length": 2 }])
     );
-    // 坏附件那次（entries[9]）：非字符串条目被拒但派发记录原样保留。
-    assert_eq!(entries[9]["params"]["attachments"], json!([42]));
-    // 半参引用（entries[10]）：quoteTimestamp 无 quoteAuthor，记录的是派发。
-    assert_eq!(entries[10]["params"]["quoteTimestamp"], json!(42));
-    assert!(entries[10]
-        .get("params")
-        .and_then(|p| p.get("quoteAuthor"))
-        .is_none());
+    // 坏附件/半参引用两次参数拒绝不落日志（append 在参数校验之后）。
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["params"]["attachments"] == json!([42])),
+        "被拒的坏附件 send 不落日志"
+    );
+    assert!(
+        !entries.iter().any(|entry| {
+            entry["params"].get("quoteTimestamp").is_some()
+                && entry["params"].get("quoteAuthor").is_none()
+        }),
+        "被拒的半参引用 send 不落日志"
+    );
     // 附件：data URI 数组逐字进调度日志（connector 上游唯一形状）。
     assert_eq!(
         entries[8]["params"]["attachments"],
@@ -4420,7 +4767,7 @@ fn mutating_methods_log_dispatch_and_reply() {
     );
     assert_eq!(sticker_missing["error"]["code"], -32603);
 
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -4431,14 +4778,13 @@ fn mutating_methods_log_dispatch_and_reply() {
         json!("0123456789abcdef")
     );
     assert_eq!(last["params"]["sticker"]["stickerId"], json!(7));
-    // 带 message 的贴纸拒绝也落日志（记录的是派发）。
-    let rejected = entries
-        .iter()
-        .rev()
-        .find(|entry| entry["params"].get("message").is_some())
-        .expect("rejected sticker send logged");
-    assert_eq!(rejected["params"]["message"], json!("nope"));
-    assert!(rejected["params"]["sticker"].is_object());
+    // 带 message 的贴纸参数拒绝不落日志（append 在参数校验之后）。
+    assert!(
+        !entries.iter().any(|entry| {
+            entry["params"].get("message").is_some() && entry["params"].get("sticker").is_some()
+        }),
+        "被拒的 sticker+text send 不落日志"
+    );
     // 贴纸+quote 共存：调度日志两者齐备（keys 与文本分支同名直投）。
     let with_quote = entries
         .iter()
@@ -4449,7 +4795,10 @@ fn mutating_methods_log_dispatch_and_reply() {
         })
         .expect("sticker+quote send logged");
     assert_eq!(with_quote["params"]["quoteTimestamp"], json!(50));
-    assert_eq!(with_quote["params"]["quoteAuthor"], json!("+15555550101"));
+    assert_eq!(
+        with_quote["params"]["quoteAuthor"],
+        json!({ "redacted": "recipient", "count": 1 })
+    );
     assert_eq!(
         with_quote["params"]["sticker"]["packId"],
         json!("0123456789abcdef")
@@ -4549,8 +4898,7 @@ fn view_once_send_param_faces_and_send_view_once_open_contract() {
     }
 
     // 调度日志：viewOnce 键逐字保留；sendViewOnceOpen 带完整三元组。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -4573,7 +4921,10 @@ fn view_once_send_param_faces_and_send_view_once_open_contract() {
         .expect("sendViewOnceOpen logged");
     assert_eq!(open_entry["params"]["senderAci"], json!(sender_aci));
     assert_eq!(open_entry["params"]["timestamp"], json!(42));
-    assert_eq!(open_entry["params"]["account"], json!(number));
+    assert_eq!(
+        open_entry["params"]["account"]["redacted"],
+        json!("account")
+    );
 }
 
 /// markRead/markViewed（P14 组 6，官方 syncReadMessages/syncView 同构）：
@@ -4632,8 +4983,7 @@ fn mark_read_mark_viewed_sync_contract() {
     }
 
     // 调度日志：reads/viewed 键逐字保留。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -4644,7 +4994,7 @@ fn mark_read_mark_viewed_sync_contract() {
         .expect("markRead logged");
     assert_eq!(
         read_entry["params"]["reads"][0]["sender"],
-        json!(sender_aci)
+        json!({ "redacted": "recipient", "count": 1 })
     );
     assert_eq!(read_entry["params"]["reads"][0]["timestamp"], json!(42));
     let viewed_entry = entries
@@ -4653,7 +5003,7 @@ fn mark_read_mark_viewed_sync_contract() {
         .expect("markViewed logged");
     assert_eq!(
         viewed_entry["params"]["viewed"][1]["sender"],
-        json!("PNI:00000000-0000-0000-0000-000000000001")
+        json!({ "redacted": "recipient", "count": 1 })
     );
     assert_eq!(viewed_entry["params"]["viewed"][1]["timestamp"], json!(44));
 }
@@ -4757,10 +5107,9 @@ fn send_text_style_param_faces_and_dispatch_log() {
     assert!(plain["result"]["timestamp"].is_u64());
 
     // 调度日志：textStyle 数组逐字保留（IPC 形状锚——connector upstream
-    // params 的 `textStyle` 键原样进引擎、原样落日志）；非法 send 的派发
-    // 也落日志（记录的是派发，sticker 先例同款）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // params 的 textStyle 键原样进引擎、原样落日志）；参数拒绝的 send 不
+    // 落日志（append 在参数校验之后）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -4782,17 +5131,13 @@ fn send_text_style_param_faces_and_dispatch_log() {
         ]),
         "textStyle array verbatim"
     );
-    let rejected = entries
-        .iter()
-        .find(|entry| {
+    assert!(
+        !entries.iter().any(|entry| {
             entry["params"]
                 .get("textStyle")
                 .is_some_and(|t| t.as_array().is_some_and(|a| a.len() == 65))
-        })
-        .expect("rejected over-cap send logged");
-    assert_eq!(
-        rejected["params"]["textStyle"].as_array().unwrap().len(),
-        65
+        }),
+        "参数拒绝的超帽 send 不落日志"
     );
 }
 
@@ -4873,8 +5218,7 @@ fn call_message_fake_shape_and_param_fail_closed() {
 
     // 调度日志：data/urgency/destinationDeviceId/group 逐字保留（协议上行
     // 面纪律）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -4884,8 +5228,11 @@ fn call_message_fake_shape_and_param_fail_closed() {
         .find(|entry| entry["method"] == "sendCallMessage")
         .expect("sendCallMessage logged");
     assert_eq!(entry["params"]["data"], json!(data));
-    assert_eq!(entry["params"]["recipient"], json!("+15555550101"));
-    assert_eq!(entry["params"]["account"], json!(number));
+    assert_eq!(
+        entry["params"]["recipient"],
+        json!({ "redacted": "recipient", "count": 1 })
+    );
+    assert_eq!(entry["params"]["account"]["redacted"], json!("account"));
     let explicit = entries
         .iter()
         .find(|entry| {
@@ -4990,8 +5337,7 @@ fn call_event_fake_shape_and_param_fail_closed() {
 
     // 调度日志：type/direction/event/conversationId/callId 逐字保留（协议
     // 上行面纪律）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -5005,7 +5351,7 @@ fn call_event_fake_shape_and_param_fail_closed() {
     assert_eq!(entry["params"]["event"], json!("accepted"));
     assert_eq!(entry["params"]["callId"], json!("9007199254740993"));
     assert_eq!(entry["params"]["timestamp"], json!(1700000000000u64));
-    assert_eq!(entry["params"]["account"], json!(number));
+    assert_eq!(entry["params"]["account"]["redacted"], json!("account"));
 }
 
 /// 名片发送臂（sendContact，窗D B11）：fake 形状成功 {"timestamp":u64}（直
@@ -5108,9 +5454,8 @@ fn send_contact_fake_shapes_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：contact 逐字保留（协议上行面纪律），群腿无 recipient 键。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：contact 结构保留、号码脱敏（协议上行面纪律），群腿无 recipient 键。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -5119,11 +5464,14 @@ fn send_contact_fake_shapes_and_param_fail_closed() {
         .iter()
         .find(|entry| entry["method"] == "sendContact" && entry["params"].get("groupId").is_none())
         .expect("direct sendContact logged");
-    assert_eq!(entry["params"]["recipient"], json!("+15555550101"));
-    assert_eq!(entry["params"]["account"], json!(number));
     assert_eq!(
-        entry["params"]["contact"]["number"][0]["value"],
-        json!("+15550001111")
+        entry["params"]["recipient"],
+        json!({ "redacted": "recipient", "count": 1 })
+    );
+    assert_eq!(entry["params"]["account"]["redacted"], json!("account"));
+    assert_eq!(
+        entry["params"]["contact"]["number"],
+        json!({ "redacted": "recipients", "count": 1 })
     );
     // avatar 载荷摘要化（调度零头像字节纪律），摘要保留量级——定位带
     // avatar 的全卡片直聊记录断言。
@@ -5211,9 +5559,8 @@ fn set_expiration_timer_fake_shape_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：account/recipient/expirationInSeconds 逐字保留。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：account 哈希、recipient 计数、expirationInSeconds 保留。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -5222,8 +5569,11 @@ fn set_expiration_timer_fake_shape_and_param_fail_closed() {
         .iter()
         .find(|entry| entry["method"] == "setExpirationTimer")
         .expect("setExpirationTimer logged");
-    assert_eq!(entry["params"]["account"], json!(number));
-    assert_eq!(entry["params"]["recipient"], json!("+15555550101"));
+    assert_eq!(entry["params"]["account"]["redacted"], json!("account"));
+    assert_eq!(
+        entry["params"]["recipient"],
+        json!({ "redacted": "recipient", "count": 1 })
+    );
     assert_eq!(entry["params"]["expirationInSeconds"], json!(86_400));
 }
 
@@ -5438,9 +5788,8 @@ fn set_profile_fake_shapes_and_param_fail_closed() {
     }
 
     // fake 纪律：不落调度日志；头像 data URI（含 base64 载荷）零字节进日志。
-    let log_path = dir.join("engine-send-log.jsonl");
     assert!(
-        !log_path.exists(),
+        !dispatch_log_exists(&dir),
         "setProfile must not write dispatch log entries"
     );
 }
@@ -5900,9 +6249,8 @@ fn storage_write_fake_shapes_and_param_fail_closed() {
     }
 
     // fake 纪律：mutating 写面不落调度日志。
-    let log_path = dir.join("engine-send-log.jsonl");
     assert!(
-        !log_path.exists(),
+        !dispatch_log_exists(&dir),
         "storage.write must not write dispatch log entries"
     );
 
@@ -6010,9 +6358,8 @@ fn send_message_request_response_faces_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：type/腿参数逐字保留（协议上行面纪律，send 系同款）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：type/腿结构保留、recipient 计数（协议上行面纪律，send 系同款）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -6025,7 +6372,10 @@ fn send_message_request_response_faces_and_param_fail_closed() {
         })
         .expect("direct-leg MRR logged");
     assert_eq!(direct["params"]["type"], json!("accept"));
-    assert_eq!(direct["params"]["recipient"], json!("+15555550101"));
+    assert_eq!(
+        direct["params"]["recipient"],
+        json!({ "redacted": "recipient", "count": 1 })
+    );
     let group = entries
         .iter()
         .find(|entry| {
@@ -6167,10 +6517,9 @@ fn request_attachment_backfill_faces_and_param_fail_closed() {
         );
     }
 
-    // 调度日志：author/sentTimestamp/腿参数逐字保留（协议上行面纪律，send
+    // 调度日志：author 计数、sentTimestamp/腿参数保留（协议上行面纪律，send
     // 系同款）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -6182,7 +6531,10 @@ fn request_attachment_backfill_faces_and_param_fail_closed() {
                 && entry["params"].get("recipient").is_some()
         })
         .expect("direct-leg backfill logged");
-    assert_eq!(direct["params"]["author"], json!("+15555550101"));
+    assert_eq!(
+        direct["params"]["author"],
+        json!({ "redacted": "recipient", "count": 1 })
+    );
     assert_eq!(
         direct["params"]["sentTimestamp"],
         json!(1_700_000_000_000u64)
@@ -6329,9 +6681,8 @@ fn lookup_outgoing_dispatch_faces_and_param_fail_closed() {
 
     // 读面纪律：零调度日志（version/listGroups 同款——查证零协议上行，
     // 日志若在即纪律破窗）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    if log_path.exists() {
-        let log = std::fs::read_to_string(&log_path).expect("dispatch log readable");
+    let log = dispatch_log_text(&dir);
+    if !log.is_empty() {
         assert!(
             !log.contains("lookupOutgoingDispatch"),
             "read face must not land in the dispatch log"
@@ -6992,11 +7343,15 @@ fn engine_protocol_capabilities_self_report_shape() {
             obj.keys().collect::<Vec<_>>().as_slice(),
             [
                 "baseline",
+                "contractRevision",
                 "deviceCapabilities",
                 "deviceCapabilitiesUpload",
                 "linkCapabilities"
             ]
         );
+        // O1 握手引擎腿（2026-11-10，wire additive）：契约修订在自证面
+        // 原样自报，值 = 单源常量（connector 支持区间 1.200-1.285）。
+        assert_eq!(obj["contractRevision"], json!("1.285"));
 
         let device = obj["deviceCapabilities"]
             .as_object()
@@ -7078,7 +7433,7 @@ fn engine_protocol_capabilities_self_report_shape() {
     assert_shape(&real_engine.request("engine.protocolCapabilities", json!({}))["result"]);
     drop(real_engine);
     assert!(
-        !real_dir.join("engine-send-log.jsonl").exists(),
+        !dispatch_log_exists(&real_dir),
         "read-only face must not write the dispatch log"
     );
 
@@ -7103,9 +7458,11 @@ fn engine_protocol_capabilities_self_report_shape() {
 fn version_self_report_shape() {
     let assert_shape = |result: &Value| {
         let obj = result.as_object().expect("result object");
+        // 旧双键 {name, version} 不回归；O1 握手引擎腿（2026-11-10，
+        // wire additive）新增 contractRevision，值 = 单源常量。
         assert_eq!(
             obj.keys().collect::<Vec<_>>().as_slice(),
-            ["name", "version"]
+            ["contractRevision", "name", "version"]
         );
         assert_eq!(obj["name"], json!("kt-signal-engine"));
         let version = obj["version"].as_str().expect("version string");
@@ -7114,6 +7471,7 @@ fn version_self_report_shape() {
             version.chars().next().is_some_and(|c| c.is_ascii_digit()),
             "version is semver-ish (digit-leading)"
         );
+        assert_eq!(obj["contractRevision"], json!("1.285"));
     };
 
     // real 模式 + 全新数据目录：doctor 探针同形空参应答；零参数方法多余
@@ -7124,7 +7482,7 @@ fn version_self_report_shape() {
     assert_shape(&real_engine.request("version", json!({ "extra": 1 }))["result"]);
     drop(real_engine);
     assert!(
-        !real_dir.join("engine-send-log.jsonl").exists(),
+        !dispatch_log_exists(&real_dir),
         "read-only face must not write the dispatch log"
     );
 
@@ -7132,6 +7490,35 @@ fn version_self_report_shape() {
     let fake_dir = temp_dir("version-fake");
     let mut fake_engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
     assert_shape(&fake_engine.request("version", json!({}))["result"]);
+}
+
+/// O1 握手引擎腿（connector `src/engine_contract.rs`，共享契约 1.285）：
+/// 两个自证面必须自报同一个 `contractRevision`（单源常量派生），且旧字段
+/// 零回归——connector 以 capabilities 面为权威、version 面为回退，两面同值
+/// 才能稳定判 `match`；任一缺失/分叉会退化成 `legacy` 或失配。
+#[test]
+fn self_report_faces_share_one_contract_revision() {
+    let fake_dir = temp_dir("contract-revision-fake");
+    let mut engine = Engine::spawn_with_env(&fake_dir, FAKE_SERVICE);
+    let version = engine.request("version", json!({}))["result"].clone();
+    let capabilities = engine.request("engine.protocolCapabilities", json!({}))["result"].clone();
+    assert_eq!(version["contractRevision"], json!("1.285"));
+    assert_eq!(
+        capabilities["contractRevision"], version["contractRevision"],
+        "两面契约修订必须同值（单源常量）"
+    );
+    // 旧字段不回归：version 双键、自证面四键照常在手。
+    for key in ["name", "version"] {
+        assert!(!version[key].is_null(), "version.{key} 不回归");
+    }
+    for key in [
+        "baseline",
+        "deviceCapabilities",
+        "deviceCapabilitiesUpload",
+        "linkCapabilities",
+    ] {
+        assert!(capabilities.get(key).is_some(), "capabilities.{key} 不回归");
+    }
 }
 
 /// engine.perfMetrics（S2a 性能基线打点层 + A1 per-account 观测，KT 扩展
@@ -7193,7 +7580,7 @@ fn engine_perf_metrics_snapshot_shape() {
     );
     drop(engine);
     assert!(
-        !real_dir.join("engine-send-log.jsonl").exists(),
+        !dispatch_log_exists(&real_dir),
         "read-only face must not write the dispatch log"
     );
 
@@ -7233,7 +7620,7 @@ fn engine_device_capabilities_register_and_report() {
     assert_eq!(capabilities["optionalPhoneNumber"], json!(false));
     drop(fake_engine);
     assert!(
-        !fake_dir.join("engine-send-log.jsonl").exists(),
+        !dispatch_log_exists(&fake_dir),
         "capability registration must not write the dispatch log"
     );
 
@@ -7309,8 +7696,7 @@ fn edit_message_param_faces_and_dispatch_log() {
     }
 
     // 调度日志：合法派发逐键保留（含非法派发，send 系纪律同款）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -7318,12 +7704,15 @@ fn edit_message_param_faces_and_dispatch_log() {
     let entry = entries
         .iter()
         .find(|entry| {
-            entry["method"] == "editMessage" && entry["params"]["message"] == json!("edited body")
+            entry["method"] == "editMessage" && entry["params"]["targetTimestamp"] == json!(42)
         })
         .expect("editMessage logged");
     assert_eq!(entry["params"]["targetTimestamp"], json!(42));
-    assert_eq!(entry["params"]["recipient"], json!(["+15555550101"]));
-    assert_eq!(entry["params"]["account"], json!(number));
+    assert_eq!(
+        entry["params"]["recipient"],
+        json!({ "redacted": "recipients", "count": 1 })
+    );
+    assert_eq!(entry["params"]["account"]["redacted"], json!("account"));
 }
 
 /// sendGroupCallUpdate 契约面（同批，官方群通话开始/结束信令面）：fake 成功
@@ -7370,8 +7759,7 @@ fn send_group_call_update_param_faces_and_dispatch_log() {
     }
 
     // 调度日志：eraId 逐键保留。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -7381,7 +7769,7 @@ fn send_group_call_update_param_faces_and_dispatch_log() {
         .find(|entry| entry["method"] == "sendGroupCallUpdate")
         .expect("sendGroupCallUpdate logged");
     assert_eq!(entry["params"]["eraId"], json!("era-1"));
-    assert_eq!(entry["params"]["account"], json!(number));
+    assert_eq!(entry["params"]["account"]["redacted"], json!("account"));
 }
 
 /// Polls 发送三臂契约面（窗D A7，官方 poll 发送面对位）：fake 成功 `{}` +
@@ -7509,8 +7897,7 @@ fn poll_send_param_faces_and_dispatch_log() {
     }
 
     // 调度日志：三臂逐键保留（send 系纪律）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -7519,8 +7906,15 @@ fn poll_send_param_faces_and_dispatch_log() {
         .iter()
         .find(|entry| entry["method"] == "sendPollCreate")
         .expect("sendPollCreate logged");
-    assert_eq!(create["params"]["question"], json!("Lunch?"));
-    assert_eq!(create["params"]["options"], json!(["Ramen", "Salad"]));
+    assert_eq!(create["params"]["question"]["redacted"], json!("text"));
+    assert_eq!(create["params"]["question"]["length"], json!(6));
+    let options = create["params"]["options"]
+        .as_array()
+        .expect("options array");
+    assert_eq!(options.len(), 2, "options 只留长度摘要");
+    assert!(options
+        .iter()
+        .all(|option| option["redacted"] == json!("text") && option["length"] == json!(5)));
     let vote = entries
         .iter()
         .find(|entry| entry["method"] == "sendPollVote" && entry["params"]["voteCount"] == json!(3))
@@ -7528,7 +7922,7 @@ fn poll_send_param_faces_and_dispatch_log() {
     assert_eq!(vote["params"]["optionIndexes"], json!([]));
     assert_eq!(
         vote["params"]["targetAuthor"],
-        json!("11111111-2222-4333-8444-555555555555")
+        json!({ "redacted": "recipient", "count": 1 })
     );
     let terminate = entries
         .iter()
@@ -7625,9 +8019,8 @@ fn send_quote_type_and_body_ranges_param_faces_and_dispatch_log() {
         );
     }
 
-    // 调度日志：quoteType/quoteBodyRanges 数组逐字保留（IPC 形状锚）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    // 调度日志：quoteType/quoteBodyRanges 结构保留、mention 号码脱敏（IPC 形状锚）。
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -7639,10 +8032,10 @@ fn send_quote_type_and_body_ranges_param_faces_and_dispatch_log() {
     assert_eq!(
         entry["params"]["quoteBodyRanges"],
         json!([
-            { "number": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae", "start": 0, "length": 3 },
+            { "number": { "redacted": "recipient", "count": 1 }, "start": 0, "length": 3 },
             { "style": "BOLD", "start": 4, "length": 2 }
         ]),
-        "quoteBodyRanges array verbatim"
+        "quoteBodyRanges 结构保留、mention 号码脱敏"
     );
 }
 
@@ -7772,8 +8165,7 @@ fn delete_for_me_conversation_faces_and_param_fail_closed() {
     }
 
     // 调度日志：协议上行面逐字保留（send 系同纪律）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -7908,8 +8300,7 @@ fn delete_for_me_messages_faces_and_param_fail_closed() {
     }
 
     // 调度日志：协议上行面逐字保留（send 系同纪律；无消息正文）。
-    let log_path = dir.join("engine-send-log.jsonl");
-    let log = std::fs::read_to_string(&log_path).expect("dispatch log exists");
+    let log = dispatch_log_text(&dir);
     let entries: Vec<Value> = log
         .lines()
         .map(|line| serde_json::from_str(line).expect("log line JSON"))
@@ -7981,7 +8372,7 @@ fn history_import_cancel_idempotent_and_absent_shape() {
     );
     drop(fake_engine);
     assert!(
-        !fake_dir.join("engine-send-log.jsonl").exists(),
+        !dispatch_log_exists(&fake_dir),
         "取消/进度观测面不落调度日志"
     );
 
@@ -7998,5 +8389,227 @@ fn history_import_cancel_idempotent_and_absent_shape() {
             json!({ "account": "+15550001111" })
         )["result"],
         json!({ "present": false })
+    );
+}
+
+/// M5 多账号日志端到端：旧全局文件迁移幂等、文件名加盐哈希（无号码明文、
+/// 大小写归一）、账号隔离、脱敏、删号清日志且被拒请求不再重建。
+#[test]
+fn dispatch_log_per_account_migration_and_delete_cleanup() {
+    let dir = temp_dir("dispatch-m5");
+    let legacy_entry = json!({
+        "method": "send",
+        "params": {
+            "account": "+15550000000",
+            "message": "legacy secret body",
+            "recipients": ["+15555550101"]
+        }
+    })
+    .to_string();
+    std::fs::write(
+        dir.join("engine-send-log.jsonl"),
+        format!("{legacy_entry}\n{{not-json\n"),
+    )
+    .expect("legacy dispatch log");
+
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    // 触发启动完成（迁移在 EngineState::load 内，先于任何请求处理）。
+    assert_eq!(
+        engine.request("listAccounts", json!({}))["result"],
+        json!([])
+    );
+
+    let log_dir = dir.join("engine-send-log");
+    assert!(
+        !dir.join("engine-send-log.jsonl").exists(),
+        "旧全局文件迁移后改名"
+    );
+    assert!(
+        !dir.join("engine-send-log.jsonl.migrated").exists(),
+        "成功迁移后暂存文件不残留"
+    );
+    let salt = dispatch_salt(&dir);
+    let first = log_dir.join(format!(
+        "{}.jsonl",
+        dispatch_account_tag(&salt, "+15550000000")
+    ));
+    assert!(first.is_file(), "迁移目标文件 = 加盐 tag 文件名");
+    let names: Vec<String> = std::fs::read_dir(&log_dir)
+        .expect("log dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".jsonl"))
+        .collect();
+    assert_eq!(names.len(), 1, "仅一个账号日志: {names:?}");
+    for name in &names {
+        assert_hashed_dispatch_name(name);
+        assert!(
+            !name.contains("+15550000000"),
+            "文件名不得含号码明文: {name}"
+        );
+    }
+
+    let migrated = std::fs::read_to_string(&first).expect("migrated account log");
+    assert!(
+        migrated.contains("\"migrated\":true"),
+        "迁移标记: {migrated}"
+    );
+    assert!(
+        !migrated.contains("legacy secret body") && !migrated.contains("+1555"),
+        "迁移行同样脱敏: {migrated}"
+    );
+    let migrated_entry: Value =
+        serde_json::from_str(migrated.lines().next().expect("line")).expect("json");
+    assert_eq!(
+        migrated_entry["params"]["message"]["redacted"],
+        json!("text")
+    );
+    assert_eq!(
+        migrated_entry["params"]["recipients"],
+        json!({ "redacted": "recipients", "count": 1 })
+    );
+
+    // 新调度落同一账号文件（迁移行 + 新行）。
+    let response = engine.request(
+        "send",
+        json!({
+            "account": "+15550000000",
+            "recipients": ["+15555550101"],
+            "message": "new secret body"
+        }),
+    );
+    assert!(
+        response["result"]["timestamp"].is_u64(),
+        "send ok: {response}"
+    );
+    let second_account = engine.request(
+        "send",
+        json!({
+            "account": "+15550001111",
+            "recipients": ["+15555550102"],
+            "message": "second secret"
+        }),
+    );
+    assert!(second_account["result"]["timestamp"].is_u64());
+
+    let account_log = std::fs::read_to_string(&first).expect("account log");
+    assert_eq!(account_log.lines().count(), 2, "迁移行 + 新行同文件");
+    assert!(
+        !account_log.contains("new secret body") && !account_log.contains("+1555"),
+        "新行脱敏: {account_log}"
+    );
+    for line in account_log.lines() {
+        let entry: Value = serde_json::from_str(line).expect("json");
+        assert_eq!(
+            entry["params"]["account"]["sha256Prefix"],
+            json!(dispatch_salted_prefix(&salt, "+15550000000")),
+            "账号文件只含该账号条目"
+        );
+    }
+    let other = log_dir.join(format!(
+        "{}.jsonl",
+        dispatch_account_tag(&salt, "+15550001111")
+    ));
+    let other_log = std::fs::read_to_string(&other).expect("other account log");
+    assert!(!other_log.contains("second secret") && !other_log.contains("+1555"));
+    for line in other_log.lines() {
+        let entry: Value = serde_json::from_str(line).expect("json");
+        assert_eq!(
+            entry["params"]["account"]["sha256Prefix"],
+            json!(dispatch_salted_prefix(&salt, "+15550001111")),
+            "账号隔离：B 文件只含 B 条目"
+        );
+    }
+
+    // 大小写归一：同一账号的大小写变体共用一个加盐文件。
+    for account in ["Acct-Case", "acct-case"] {
+        let response = engine.request(
+            "send",
+            json!({ "account": account, "recipients": ["+15555550103"], "message": "case" }),
+        );
+        assert!(response["result"]["timestamp"].is_u64(), "case send ok");
+    }
+    let case_path = log_dir.join(format!(
+        "{}.jsonl",
+        dispatch_account_tag(&salt, "ACCT-CASE")
+    ));
+    assert!(case_path.is_file(), "大小写变体落同一文件");
+    assert_eq!(
+        std::fs::read_to_string(&case_path)
+            .expect("case log")
+            .lines()
+            .count(),
+        2,
+        "两次大小写变体写入同一文件"
+    );
+
+    // 删号清该账号文件；其他账号文件保持。
+    assert_eq!(
+        engine.request(
+            "deleteLocalAccountData",
+            json!({ "account": "+15550000000" })
+        )["result"],
+        json!({})
+    );
+    assert!(!first.exists(), "deleteLocalAccountData 删除账号日志文件");
+    assert!(other.is_file(), "其他账号日志不受影响");
+    assert!(case_path.is_file(), "其他账号（大小写变体）日志不受影响");
+
+    // 被参数校验拒绝的请求不写日志——删除后不得把文件重建出来。
+    let rejected = engine.request(
+        "send",
+        json!({ "account": "+15550000000", "recipients": ["+15555550101"] }),
+    );
+    assert_eq!(rejected["error"]["code"], -32603);
+    assert!(!first.exists(), "被拒请求不得在删除后重建账号日志文件");
+
+    // 重启：迁移幂等（无旧文件可重放），已删账号日志不被重建。
+    drop(engine);
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    assert_eq!(
+        engine.request("listAccounts", json!({}))["result"],
+        json!([])
+    );
+    assert!(!first.exists(), "重启不重建已删账号日志");
+    assert_eq!(
+        std::fs::read_to_string(&other)
+            .expect("other log after restart")
+            .lines()
+            .count(),
+        1,
+        "B 日志不重复"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&case_path)
+            .expect("case log after restart")
+            .lines()
+            .count(),
+        2,
+        "大小写文件不重复"
+    );
+
+    // 崩溃残留 .migrated 不重放：无 legacy 文件时不追加任何行。
+    drop(engine);
+    std::fs::write(
+        dir.join("engine-send-log.jsonl.migrated"),
+        format!("{legacy_entry}\n"),
+    )
+    .expect("staged migration");
+    let mut engine = Engine::spawn_with_env(&dir, FAKE_SERVICE);
+    assert_eq!(
+        engine.request("listAccounts", json!({}))["result"],
+        json!([])
+    );
+    assert!(
+        !first.exists(),
+        "残留 .migrated 不重放（不重建已删账号日志）"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&other)
+            .expect("other log after staged restart")
+            .lines()
+            .count(),
+        1,
+        "残留 .migrated 不重复追加"
     );
 }

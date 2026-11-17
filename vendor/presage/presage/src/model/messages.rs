@@ -55,7 +55,7 @@ pub enum Received {
     /// They are stored before yielding; the consumer acks the source envelope.
     /// KT (P15a): carries the parsed records and source envelope for the
     /// engine projection.
-    Contacts(ContactSync, EnvelopeAck),
+    Contacts(ContactSync, Option<EnvelopeAck>),
 
     // Failed to receive a message from the specified service ID.
     // A session reset with the contact may fix this.
@@ -72,7 +72,7 @@ pub enum Received {
     /// Redelivered envelope: a `(sender, client_timestamp)` row already exists
     /// in the store. The message was stored (and is expected to have been
     /// projected) once already; consumers ack and must not re-project.
-    Duplicate(EnvelopeAck),
+    Duplicate(Box<Content>, EnvelopeAck),
 
     /// Incoming decrypted message with metadata and content, stored before
     /// yielding. The consumer acks after projecting the message.

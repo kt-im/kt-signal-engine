@@ -334,8 +334,14 @@ pub(crate) async fn send_story(
     // 上传成功 = 指针投影进应答（move 进 story 前产脸，与收投影同一函数）。
     let (story, pointer_face) = match attachment {
         Some(uri) => {
-            let (pointers, _) =
-                upload_attachments_for_send(&manager, &[uri.to_owned()], None, caption).await?;
+            let (pointers, _) = upload_attachments_for_send(
+                service.attachment_gate(),
+                &manager,
+                &[uri.to_owned()],
+                None,
+                caption,
+            )
+            .await?;
             let file_pointer = pointers.into_iter().next().ok_or(SendError::Internal)?;
             let face = super::project_attachment_pointer(&file_pointer);
             let story = build_media_story_message(allows_replies, body_ranges, file_pointer, None)?;
@@ -343,7 +349,16 @@ pub(crate) async fn send_story(
         }
         None => {
             let (_, preview_pointer) = match preview_image {
-                Some(uri) => upload_attachments_for_send(&manager, &[], Some(uri), None).await?,
+                Some(uri) => {
+                    upload_attachments_for_send(
+                        service.attachment_gate(),
+                        &manager,
+                        &[],
+                        Some(uri),
+                        None,
+                    )
+                    .await?
+                }
                 None => (Vec::new(), None),
             };
             let story = build_story_message(
@@ -548,8 +563,14 @@ pub(crate) async fn send_story_group(
     // 群腿应答面（move 进 story 前产脸，名单腿同构）。
     let story = match attachment {
         Some(uri) => {
-            let (pointers, _) =
-                upload_attachments_for_send(&manager, &[uri.to_owned()], None, caption).await?;
+            let (pointers, _) = upload_attachments_for_send(
+                service.attachment_gate(),
+                &manager,
+                &[uri.to_owned()],
+                None,
+                caption,
+            )
+            .await?;
             let file_pointer = pointers.into_iter().next().ok_or(SendError::Internal)?;
             group_face["fileAttachment"] = super::project_attachment_pointer(&file_pointer);
             build_media_story_message(
@@ -561,7 +582,16 @@ pub(crate) async fn send_story_group(
         }
         None => {
             let (_, preview_pointer) = match preview_image {
-                Some(uri) => upload_attachments_for_send(&manager, &[], Some(uri), None).await?,
+                Some(uri) => {
+                    upload_attachments_for_send(
+                        service.attachment_gate(),
+                        &manager,
+                        &[],
+                        Some(uri),
+                        None,
+                    )
+                    .await?
+                }
                 None => (Vec::new(), None),
             };
             build_story_message(

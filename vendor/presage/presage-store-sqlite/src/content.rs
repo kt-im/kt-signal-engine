@@ -21,6 +21,19 @@ use crate::{
     error::SqlxErrorExt,
 };
 
+fn log_slow_store_op(op: &'static str, phase: &'static str, started: std::time::Instant) {
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if elapsed_ms >= 1_000 {
+        tracing::warn!(
+            stage = "slow_store_op",
+            op,
+            phase,
+            elapsed_ms,
+            "slow store operation"
+        );
+    }
+}
+
 impl ContentsStore for SqliteStore {
     type ContentsStoreError = SqliteStoreError;
 
@@ -111,9 +124,13 @@ impl ContentsStore for SqliteStore {
         thread: &Thread,
         content: Content,
     ) -> Result<(), Self::ContentsStoreError> {
+        let begin_started = std::time::Instant::now();
         let mut tx = self.db.begin().await?;
+        log_slow_store_op("save_message", "begin", begin_started);
         save_message_on_tx(&mut tx, thread, content).await?;
+        let commit_started = std::time::Instant::now();
         tx.commit().await?;
+        log_slow_store_op("save_message", "commit", commit_started);
         Ok(())
     }
 
@@ -123,11 +140,15 @@ impl ContentsStore for SqliteStore {
         &self,
         messages: Vec<(Thread, Content)>,
     ) -> Result<(), Self::ContentsStoreError> {
+        let begin_started = std::time::Instant::now();
         let mut tx = self.db.begin().await?;
+        log_slow_store_op("save_messages", "begin", begin_started);
         for (thread, content) in messages {
             save_message_on_tx(&mut tx, &thread, content).await?;
         }
+        let commit_started = std::time::Instant::now();
         tx.commit().await?;
+        log_slow_store_op("save_messages", "commit", commit_started);
         Ok(())
     }
 
@@ -246,7 +267,9 @@ impl ContentsStore for SqliteStore {
         let avatar_bytes = contact.avatar.as_ref().map(|a| a.reader.to_vec());
         let phone_number = contact.phone_number.as_ref().map(|p| p.to_string());
 
+        let begin_started = std::time::Instant::now();
         let mut tx = self.db.begin().await?;
+        log_slow_store_op("save_contact", "begin", begin_started);
 
         query!(
             "INSERT OR REPLACE INTO contacts
@@ -748,7 +771,7 @@ async fn save_message_on_tx(
         unidentified_sender,
         server_guid: _,
         was_plaintext,
-        server_timestamp: _,
+        server_timestamp,
         pni_verified,
         story: _, // KT fork (stories): not persisted (stories are not saved).
         ephemeral: _,
@@ -762,8 +785,14 @@ async fn save_message_on_tx(
 
     let proto_bytes = prost::Message::encode_to_vec(&body.into_proto());
     let timestamp = timestamp.timestamp_millis();
+    // KT (receive duplicate phase1): persist the envelope server timestamp so
+    // a duplicate replay rebuilt from `thread_messages` keeps the original
+    // `Metadata.server_timestamp` instead of falling back to `ts`. Runtime
+    // query (no `query!` macro) on purpose — the checked-in `.sqlx` offline
+    // cache stays untouched (recent_threads precedent).
+    let server_timestamp = server_timestamp.timestamp_millis();
 
-    query!(
+    sqlx::query(
         "INSERT OR REPLACE INTO thread_messages (
             ts,
             thread_id,
@@ -774,20 +803,22 @@ async fn save_message_on_tx(
             unidentified_sender,
             content_body,
             was_plaintext,
-            pni_verified
+            pni_verified,
+            server_ts
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        timestamp,
-        thread_id,
-        sender_service_id,
-        sender_device,
-        destination_service_id,
-        needs_receipt,
-        unidentified_sender,
-        proto_bytes,
-        was_plaintext,
-        pni_verified.as_ref().map(|p| p.service_id_string())
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind(timestamp)
+    .bind(thread_id)
+    .bind(sender_service_id)
+    .bind(sender_device)
+    .bind(destination_service_id)
+    .bind(needs_receipt)
+    .bind(unidentified_sender)
+    .bind(proto_bytes)
+    .bind(was_plaintext)
+    .bind(pni_verified.as_ref().map(|p| p.service_id_string()))
+    .bind(server_timestamp)
     .execute(&mut *conn)
     .await?;
 
@@ -833,6 +864,68 @@ impl BoundExt for Bound<&u64> {
     }
 }
 
+/// KT (receive duplicate phase1): the `threads` + `thread_messages` row
+/// shape shared by the timestamp lookups.
+type StoredThreadMessageRow = (
+    Option<Vec<u8>>,
+    Option<Uuid>,
+    i64,
+    Option<i64>,
+    String,
+    i64,
+    String,
+    bool,
+    bool,
+    Vec<u8>,
+    bool,
+    Option<String>,
+);
+
+fn stored_message_into_thread_and_content(
+    row: StoredThreadMessageRow,
+) -> Result<(Thread, Content), SqliteStoreError> {
+    let (
+        group_master_key,
+        recipient_id,
+        ts,
+        server_ts,
+        sender_service_id,
+        sender_device_id,
+        destination_service_id,
+        needs_receipt,
+        unidentified_sender,
+        content_body,
+        was_plaintext,
+        pni_verified,
+    ) = row;
+    let thread = match (group_master_key, recipient_id) {
+        (Some(key), _) => Thread::Group(
+            key.try_into()
+                .map_err(|_| SqliteStoreError::InvalidFormat)?,
+        ),
+        (None, Some(recipient_id)) => Thread::Contact(ServiceId::Aci(recipient_id.into())),
+        (None, None) => return Err(SqliteStoreError::InvalidFormat),
+    };
+    let message = SqlMessage {
+        ts: u64::try_from(ts).map_err(|_| SqliteStoreError::InvalidFormat)?,
+        server_ts: server_ts
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| SqliteStoreError::InvalidFormat)?,
+        sender_service_id,
+        sender_device_id: u8::try_from(sender_device_id)
+            .map_err(|_| SqliteStoreError::InvalidFormat)?,
+        destination_service_id,
+        needs_receipt,
+        unidentified_sender,
+        content_body,
+        was_plaintext,
+        pni_verified,
+    };
+    let content: Content = message.try_into()?;
+    Ok((thread, content))
+}
+
 impl SqliteStore {
     /// KT (DERM): outgoing-message lookup for retry requests, mirroring the
     /// official Desktop `getSentProtoByRecipient` shape (by sending account +
@@ -847,23 +940,7 @@ impl SqliteStore {
         let timestamp: i64 = timestamp
             .try_into()
             .map_err(|_| SqliteStoreError::InvalidFormat)?;
-        let row = sqlx::query_as::<
-            _,
-            (
-                Option<Vec<u8>>,
-                Option<String>,
-                i64,
-                Option<i64>,
-                String,
-                i64,
-                String,
-                bool,
-                bool,
-                Vec<u8>,
-                bool,
-                Option<String>,
-            ),
-        >(
+        let row = sqlx::query_as::<_, StoredThreadMessageRow>(
             r#"SELECT t.group_master_key, t.recipient_id,
                       m.ts, m.server_ts, m.sender_service_id, m.sender_device_id,
                       m.destination_service_id, m.needs_receipt, m.unidentified_sender,
@@ -877,53 +954,49 @@ impl SqliteStore {
         .fetch_optional(&self.db)
         .await
         .into_protocol_error()?;
-        let Some((
-            group_master_key,
-            recipient_id,
-            ts,
-            server_ts,
-            sender_service_id,
-            sender_device_id,
-            destination_service_id,
-            needs_receipt,
-            unidentified_sender,
-            content_body,
-            was_plaintext,
-            pni_verified,
-        )) = row
-        else {
+        let Some(row) = row else {
             return Ok(None);
         };
-        let thread = match (group_master_key, recipient_id) {
-            (Some(key), _) => Thread::Group(
-                key.try_into()
-                    .map_err(|_| SqliteStoreError::InvalidFormat)?,
-            ),
-            (None, Some(recipient_id)) => {
-                let service_id = ServiceId::parse_from_service_id_string(&recipient_id)
-                    .ok_or(SqliteStoreError::InvalidFormat)?;
-                Thread::Contact(service_id)
-            }
-            (None, None) => return Err(SqliteStoreError::InvalidFormat),
-        };
-        let message = SqlMessage {
-            ts: u64::try_from(ts).map_err(|_| SqliteStoreError::InvalidFormat)?,
-            server_ts: server_ts
-                .map(u64::try_from)
-                .transpose()
-                .map_err(|_| SqliteStoreError::InvalidFormat)?,
-            sender_service_id,
-            sender_device_id: u8::try_from(sender_device_id)
-                .map_err(|_| SqliteStoreError::InvalidFormat)?,
-            destination_service_id,
-            needs_receipt,
-            unidentified_sender,
-            content_body,
-            was_plaintext,
-            pni_verified,
-        };
-        let content: Content = message.try_into()?;
+        let (thread, content) = stored_message_into_thread_and_content(row)?;
         Ok(Some((thread, content)))
+    }
+
+    /// KT (receive duplicate phase1): every stored row for one sender and
+    /// client timestamp, across threads.
+    ///
+    /// `fetch_all` is deliberate: the presage redelivery gate is thread-scoped,
+    /// so the same sender may legitimately emit two messages with one client
+    /// timestamp into two different groups. Both rows must stay replayable —
+    /// a single-row lookup would silently drop one of them. Thread-scoped
+    /// replay should prefer the [`ContentsStore::message`] trait method, which
+    /// also finds a row whose sender was rewritten to the nil ACI by a remote
+    /// delete.
+    pub async fn messages_by_sender_and_timestamp(
+        &self,
+        sender: &ServiceId,
+        timestamp: u64,
+    ) -> Result<Vec<(Thread, Content)>, SqliteStoreError> {
+        let timestamp: i64 = timestamp
+            .try_into()
+            .map_err(|_| SqliteStoreError::InvalidFormat)?;
+        let rows = sqlx::query_as::<_, StoredThreadMessageRow>(
+            r#"SELECT t.group_master_key, t.recipient_id,
+                      m.ts, m.server_ts, m.sender_service_id, m.sender_device_id,
+                      m.destination_service_id, m.needs_receipt, m.unidentified_sender,
+                      m.content_body, m.was_plaintext, m.pni_verified
+            FROM thread_messages m
+            JOIN threads t ON t.id = m.thread_id
+            WHERE m.ts = ? AND m.sender_service_id = ?
+            ORDER BY m.thread_id"#,
+        )
+        .bind(timestamp)
+        .bind(sender.service_id_string())
+        .fetch_all(&self.db)
+        .await
+        .into_protocol_error()?;
+        rows.into_iter()
+            .map(stored_message_into_thread_and_content)
+            .collect()
     }
 
     /// KT (pre-key maintenance): generic kv read for engine-side cadence
@@ -956,8 +1029,8 @@ mod test {
     use super::*;
     use crate::OnNewIdentity;
     use presage::libsignal_service::content::ContentBody;
-    use presage::libsignal_service::protocol::DeviceId;
-    use presage::proto::NullMessage;
+    use presage::libsignal_service::protocol::{DeviceId, Pni};
+    use presage::proto::{DataMessage, NullMessage};
 
     #[tokio::test]
     async fn upsert_profile_key_reports_the_write() -> Result<(), Box<dyn std::error::Error>> {
@@ -971,33 +1044,71 @@ mod test {
         Ok(())
     }
 
+    fn content_with(
+        sender: ServiceId,
+        ts: u64,
+        server_ts: u64,
+        pni_verified: Option<Pni>,
+        body: ContentBody,
+    ) -> Content {
+        Content::from_body(
+            body,
+            Metadata {
+                sender,
+                destination: sender,
+                sender_device: DeviceId::new(1).unwrap(),
+                pni_verified,
+                client_timestamp: chrono::DateTime::from_timestamp_millis(ts as i64).unwrap(),
+                server_timestamp: chrono::DateTime::from_timestamp_millis(server_ts as i64)
+                    .unwrap(),
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+                story: None,
+                ephemeral: None,
+                urgent: None,
+                report_spam_token: None,
+            },
+        )
+    }
+
+    fn text_body(content: &Content) -> Option<&str> {
+        match &content.body {
+            ContentBody::DataMessage(message) => message.body.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// KT (receive duplicate phase2): the recovery copy is gone — the schema
+    /// no longer carries kt_outbox at all.
+    async fn kt_outbox_table_exists(store: &SqliteStore) -> Result<bool, sqlx::Error> {
+        let present: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='kt_outbox'",
+        )
+        .fetch_one(&store.db)
+        .await?;
+        Ok(present == 1)
+    }
+
     // KT (receive batching): the batched path must land every message of a
     // window — three saves in one call read back as three rows in one thread.
+    // KT (receive duplicate phase2): save_messages has no recovery copy to
+    // write, and the migration chain has dropped kt_outbox.
     #[tokio::test]
-    async fn save_messages_persists_a_whole_window() -> Result<(), Box<dyn std::error::Error>> {
+    async fn save_messages_persists_a_whole_window_and_the_outbox_table_is_gone()
+    -> Result<(), Box<dyn std::error::Error>> {
         let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
         let sender = ServiceId::Aci(Uuid::from_u128(1).into());
         let thread = Thread::Contact(sender);
 
         let content = |ts: u64| {
-            Content::from_body(
+            content_with(
+                sender,
+                ts,
+                ts,
+                None,
                 ContentBody::NullMessage(NullMessage::default()),
-                Metadata {
-                    sender,
-                    destination: sender,
-                    sender_device: DeviceId::new(1).unwrap(),
-                    pni_verified: None,
-                    client_timestamp: chrono::DateTime::from_timestamp_millis(ts as i64).unwrap(),
-                    server_timestamp: chrono::DateTime::from_timestamp_millis(ts as i64).unwrap(),
-                    needs_receipt: false,
-                    unidentified_sender: false,
-                    was_plaintext: false,
-                    server_guid: None,
-                    story: None,
-                    ephemeral: None,
-                    urgent: None,
-                    report_spam_token: None,
-                },
             )
         };
 
@@ -1016,6 +1127,157 @@ mod test {
             );
         }
         assert_eq!(store.messages(&thread, ..).await?.count(), 3);
+        assert!(
+            !kt_outbox_table_exists(&store).await?,
+            "phase2: the migration chain drops kt_outbox"
+        );
+
+        Ok(())
+    }
+
+    // KT (receive duplicate phase1): the presage redelivery gate is
+    // thread-scoped, so one sender may emit two messages with the same client
+    // timestamp into two groups. Replay must not collapse them: sender+ts
+    // returns both rows and each thread rebuilds its own body.
+    #[tokio::test]
+    async fn two_group_messages_sharing_sender_and_ts_both_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let sender = ServiceId::Aci(Uuid::from_u128(9).into());
+        let ts = 1_700_000_000_500u64;
+        let group_a: GroupMasterKeyBytes = [1u8; 32];
+        let group_b: GroupMasterKeyBytes = [2u8; 32];
+        let data = |text: &str| {
+            ContentBody::DataMessage(DataMessage {
+                body: Some(text.to_owned()),
+                ..Default::default()
+            })
+        };
+
+        store
+            .save_messages(vec![
+                (
+                    Thread::Group(group_a),
+                    content_with(sender, ts, ts + 1, None, data("group-a")),
+                ),
+                (
+                    Thread::Group(group_b),
+                    content_with(sender, ts, ts + 2, None, data("group-b")),
+                ),
+            ])
+            .await?;
+
+        let rows = store.messages_by_sender_and_timestamp(&sender, ts).await?;
+        assert_eq!(rows.len(), 2, "both group rows must stay replayable");
+        let threads: Vec<&Thread> = rows.iter().map(|(thread, _)| thread).collect();
+        assert!(threads.contains(&&Thread::Group(group_a)));
+        assert!(threads.contains(&&Thread::Group(group_b)));
+
+        let replay_a = store.message(&Thread::Group(group_a), ts).await?.unwrap();
+        let replay_b = store.message(&Thread::Group(group_b), ts).await?.unwrap();
+        assert_eq!(text_body(&replay_a), Some("group-a"));
+        assert_eq!(text_body(&replay_b), Some("group-b"));
+
+        Ok(())
+    }
+
+    // KT (receive duplicate phase1): a remote delete rewrites the stored row
+    // to a nil-ACI NullMessage tombstone. The sender+ts lookup misses it, but
+    // the thread-scoped replay used by the receive arm still finds the row and
+    // replays NullMessage — never the deleted text.
+    #[tokio::test]
+    async fn remote_deleted_message_replays_as_null_message()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let sender = ServiceId::Aci(Uuid::from_u128(11).into());
+        let thread = Thread::Group([3u8; 32]);
+        let ts = 1_700_000_000_700u64;
+
+        store
+            .save_message(
+                &thread,
+                content_with(
+                    sender,
+                    ts,
+                    ts,
+                    None,
+                    ContentBody::DataMessage(DataMessage {
+                        body: Some("deleted text".to_owned()),
+                        ..Default::default()
+                    }),
+                ),
+            )
+            .await?;
+
+        // Same transform as presage's remote-delete arm.
+        let mut existing = store.message(&thread, ts).await?.unwrap();
+        existing.metadata.sender = ServiceId::Aci(Uuid::nil().into());
+        existing.body = NullMessage::default().into();
+        store.save_message(&thread, existing).await?;
+
+        assert!(
+            store
+                .messages_by_sender_and_timestamp(&sender, ts)
+                .await?
+                .is_empty(),
+            "tombstone no longer matches the original sender"
+        );
+        let replay = store.message(&thread, ts).await?.unwrap();
+        assert!(matches!(replay.body, ContentBody::NullMessage(_)));
+        assert_eq!(replay.metadata.sender, ServiceId::Aci(Uuid::nil().into()));
+
+        Ok(())
+    }
+
+    // KT (receive duplicate phase1): a redelivered envelope replaces the row
+    // in place (no duplicate row), keeps the outbox empty, and the rebuilt
+    // Content keeps pni_verified + the envelope server timestamp.
+    #[tokio::test]
+    async fn redelivery_keeps_one_row_and_preserves_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let sender = ServiceId::Aci(Uuid::from_u128(13).into());
+        let thread = Thread::Contact(sender);
+        let ts = 1_700_000_000_900u64;
+        let pni =
+            Pni::parse_from_service_id_string("PNI:11111111-2222-4333-8444-555555555555").unwrap();
+        let body = |text: &str| {
+            ContentBody::DataMessage(DataMessage {
+                body: Some(text.to_owned()),
+                ..Default::default()
+            })
+        };
+
+        store
+            .save_message(
+                &thread,
+                content_with(sender, ts, ts + 7, Some(pni), body("first")),
+            )
+            .await?;
+        store
+            .save_message(
+                &thread,
+                content_with(sender, ts, ts + 7, Some(pni), body("first")),
+            )
+            .await?;
+
+        assert_eq!(store.messages(&thread, ..).await?.count(), 1);
+        assert!(!kt_outbox_table_exists(&store).await?);
+
+        let replay = store.message(&thread, ts).await?.unwrap();
+        assert_eq!(text_body(&replay), Some("first"));
+        assert_eq!(replay.metadata.pni_verified, Some(pni));
+        assert_eq!(
+            replay.metadata.server_timestamp,
+            chrono::DateTime::from_timestamp_millis((ts + 7) as i64).unwrap()
+        );
+        assert_eq!(
+            store
+                .messages_by_sender_and_timestamp(&sender, ts)
+                .await?
+                .len(),
+            1
+        );
 
         Ok(())
     }

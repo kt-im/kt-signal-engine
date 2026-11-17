@@ -111,6 +111,17 @@ pub struct CaptchaAttributes<'a> {
     pub captcha: &'a str,
 }
 
+/// KT fork（BUG-16 proof 批，2026-11-13）：push 挑战应答面——官方
+/// ChallengeController 的 type="push" 形（answer = GET /v1/challenge 拿到的
+/// challenge 串，零人工）；captcha 族的 recaptcha 需人工不走此结构。
+#[derive(Debug, Serialize)]
+pub struct PushChallengeAttributes<'a> {
+    #[serde(rename = "type")]
+    pub challenge_type: &'a str,
+    pub token: &'a str,
+    pub challenge: &'a str,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistrationSessionMetadataResponse {

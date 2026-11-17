@@ -167,7 +167,7 @@ impl SignalWebSocket<Identified> {
 /// as every other transport in the process. A missing or malformed value
 /// degrades to direct routes; `NO_PROXY` is not consulted (the process
 /// configures a single global egress variable).
-fn proxy_from_environment() -> Option<ConnectionProxyConfig> {
+pub(crate) fn proxy_from_environment() -> Option<ConnectionProxyConfig> {
     let value = std::env::var("ALL_PROXY")
         .or_else(|_| std::env::var("all_proxy"))
         .ok()?;

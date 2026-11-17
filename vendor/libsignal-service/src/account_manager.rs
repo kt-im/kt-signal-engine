@@ -746,6 +746,61 @@ impl AccountManager {
         Ok(())
     }
 
+    /// KT fork（BUG-16 proof 批，2026-11-13）：push 挑战全自动求解对。
+    /// GET /v1/challenge/{aci}/{token} → challenge 串（Signal-Server
+    /// ChallengeController.java:79，零人工）；PUT /v1/challenge type="push"
+    /// 回答后服务器放行该 token 的后续发送。
+    pub async fn get_push_challenge(
+        &mut self,
+        aci: &str,
+        token: &str,
+    ) -> Result<String, ServiceError> {
+        #[derive(serde::Deserialize)]
+        struct ChallengeBody {
+            #[serde(default)]
+            challenge: String,
+        }
+        let body: ChallengeBody = self
+            .service
+            .request(
+                Method::GET,
+                Endpoint::service(&format!("/v1/challenge/{aci}/{token}")),
+                HttpAuthOverride::NoOverride,
+            )?
+            .send()
+            .await?
+            .service_error_for_status()
+            .await?
+            .json()
+            .await?;
+        Ok(body.challenge)
+    }
+
+    /// PUT /v1/challenge（type="push"）：回答 push 挑战。静默 OK 或抛
+    /// ChallengeNotAccepted（428 残留=token 过期/回答不符，确定性失败）。
+    pub async fn submit_push_challenge(
+        &mut self,
+        token: &str,
+        challenge: &str,
+    ) -> Result<(), ServiceError> {
+        self.service
+            .request(
+                Method::PUT,
+                Endpoint::service("/v1/challenge"),
+                HttpAuthOverride::NoOverride,
+            )?
+            .json(&crate::websocket::registration::PushChallengeAttributes {
+                challenge_type: "push",
+                token,
+                challenge,
+            })
+            .send()
+            .await?
+            .service_error_for_status_with(submit_challenge_errors)
+            .await?;
+        Ok(())
+    }
+
     /// Initialize PNI on linked devices.
     ///
     /// Should be called as the primary device to migrate from pre-PNI to PNI.
