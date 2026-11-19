@@ -50,9 +50,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # libssl-dev/pkg-config：sqlite3.c 的产物需要 OpenSSL 头文件才能编译。
-      - name: install protoc and libssl-dev
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
+      # 只需要 protoc（vendor libsignal 的 build.rs 生成 gRPC 代码）。
+      # libssl-dev / pkg-config 曾是为 vendored OpenSSL 准备的；改用纯 Rust
+      # provider 后依赖图里已没有 openssl-sys（cargo tree -i openssl-sys 为空），
+      # 不再需要。顺带加 apt 重试：Ubuntu 源偶发连不上（azure.archive 超时）
+      # 不该让整条 CI 变红。
+      - name: install protoc
+        run: |
+          sudo apt-get update || sudo apt-get update
+          for i in 1 2 3; do
+            sudo apt-get install -y --no-install-recommends protobuf-compiler && break
+            echo "apt install failed (attempt $i), retrying in 15s..." >&2
+            sleep 15
+          done
+          protoc --version
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -100,16 +111,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # 构建期外部工具：protoc 与主 job 同源（vendor libsignal 的 build.rs）；
-      # Perl/CMake 是 vendored OpenSSL 的硬前置（openssl-src 的 Configure 是
-      # perl 脚本，bundled sqlite 的构建探测要 cmake）。镜像通常自带，缺了才装，
-      # 免得 choco 包与镜像自带的 Strawberry Perl 抢同一个安装目录。
+      # 构建期外部工具：protoc（vendor libsignal 的 build.rs）+ cmake/ninja
+      # （boring-sys 构建 BoringSSL 用）。KT 定制后 Windows 侧不再编译 vendored
+      # OpenSSL（SQLCipher 的 crypto 改由本仓纯 Rust provider 提供），因此 Perl
+      # 不再是硬前置。镜像通常自带，缺了才装。
       - name: install build deps (protoc, perl, cmake)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
           $deps = @(
-            [pscustomobject]@{ cmd = 'perl'; pkg = 'strawberryperl' },
             [pscustomobject]@{ cmd = 'cmake'; pkg = 'cmake' },
             [pscustomobject]@{ cmd = 'protoc'; pkg = 'protoc' }
           )
@@ -124,7 +134,7 @@ jobs:
           } else {
             Write-Host "perl / cmake / protoc already on PATH; nothing to install"
           }
-          foreach ($tool in @('perl', 'cmake', 'protoc')) {
+          foreach ($tool in @('cmake', 'protoc')) {
             $cmd = Get-Command $tool -ErrorAction SilentlyContinue
             if ($cmd) { Write-Host "$tool -> $($cmd.Source)" }
             else { Write-Host "$tool -> not on PATH in this step (choco shims land from the next step)" }
@@ -140,8 +150,20 @@ jobs:
           key: x86_64-pc-windows-msvc-check
 
       # 门禁本体：Windows 目标的 sqlcipher vendored-OpenSSL 链能解析、能编译。
-      - name: cargo check (x86_64-pc-windows-msvc)
-        run: cargo check --target x86_64-pc-windows-msvc
+      # KT 定制（2026-11-19）：这里必须 build 而不是 check —— check 不做链接，
+      # 抓不到 openssl/boring 的符号重复定义（LNK2005，1614 个符号）。历史上
+      # 这个冲突只在 release.yml 的 cargo build 才暴露，即「发版当天才发现」。
+      - name: cargo build (x86_64-pc-windows-msvc)
+        run: cargo build --target x86_64-pc-windows-msvc
+
+      # KT 定制（2026-11-19）：编译通过 ≠ 加密能用。SQLCipher 的 crypto provider
+      # 是本仓的纯 Rust 实现（SQLCIPHER_CRYPTO_CUSTOM），以下四件事编译期看不出来：
+      #   ① cipher_version 非空（否则链的是纯 SQLite，加密根本没生效）
+      #   ② 落盘文件头不是 "SQLite format 3"（密文真的写下去了）
+      #   ③ 换密钥重开能读回（AES-CBC + HMAC 往返正确）
+      #   ④ 错误密钥打不开（HMAC 校验真的在跑）
+      - name: provider roundtrip (SQLCipher crypto really works)
+        run: cargo test --release --test provider_roundtrip -- --nocapture
 
       # M6 能力门回归（Windows）：同一门、同一判据（exit != 0）。依赖图与上一步
       # 完全一致——sqlcipher 是空 feature，不转发任何依赖特性，所以这一步的唯一
