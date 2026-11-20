@@ -116,6 +116,7 @@ jobs:
           role-session-name: kt-signal-runtime-engine
 
       - name: Publish engine to download.ktai.im
+        shell: bash
         if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
         env:
           OSS_ACCESS_KEY_ID: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-id }}
@@ -129,7 +130,13 @@ jobs:
           set -euo pipefail
           if [ -z "${OSS_ACCESS_KEY_ID:-}" ]; then echo "OIDC STS outputs missing" >&2; exit 1; fi
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          if [ "$TARGET" = "x86_64-pc-windows-msvc" ]; then artifact="kt-signal-engine-windows-x64.exe"; src="dist/kt-signal-engine-$TARGET.exe"; else artifact="kt-signal-engine-macos-arm64"; src="dist/kt-signal-engine-$TARGET"; fi
+          if [ "$TARGET" = "x86_64-pc-windows-msvc" ]; then
+            artifact="kt-signal-engine-windows-x64.exe"; src="dist/kt-signal-engine-$TARGET.exe"
+          elif [ "$TARGET" = "aarch64-apple-darwin" ]; then
+            artifact="kt-signal-engine-macos-arm64"; src="dist/kt-signal-engine-$TARGET"
+          else
+            echo "platform $TARGET not published (only windows-x64 / macos-arm64 are consumed)"; exit 0
+          fi
           obj="$OSS_PREFIX/$version/$artifact"
           echo "publishing $src -> oss://$OSS_BUCKET/$obj"
 
@@ -163,6 +170,7 @@ jobs:
       # matrix 每个平台只更新 engine 记录里**自己那个 platform** 的 artifact，
       # 保留另一个平台的既有条目（两个 job 并发写同一记录，读-改-写 + 重试）。
       - name: Publish catalog entry to download.ktai.im
+        shell: bash
         if: ${{ vars.KT_SIGNAL_RUNTIME_OSS_ENABLED == 'true' }}
         env:
           OSS_ACCESS_KEY_ID: ${{ steps.aliyun-oidc.outputs.aliyun-access-key-id }}
