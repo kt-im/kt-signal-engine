@@ -69,3 +69,4 @@ Cargo.lock.bak
 # vendor 子 crate 独立测试构建产物（R2 起 vendor crate 带独立 [workspace]）
 vendor/**/target/
 vendor/**/Cargo.lock
+!vendor/libsqlite3-sys/

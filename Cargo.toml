@@ -1,6 +1,6 @@
 [package]
 name = "kt-signal-engine"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "AGPL-3.0-only"
 publish = false
@@ -161,12 +161,12 @@ opus-decoder = "0.1"
 # 实际解析的 sqlx 同版为准（sqlx-sqlite 传递同版，`links = "sqlite3"` 全图
 # 只能有一个包，特性在这里归一）。
 
-# 非 Windows（macOS / Linux）：bundled SQLite + SQLCipher，crypto 走平台
-# 自带实现——macOS 是 CommonCrypto（-DSQLCIPHER_CRYPTO_CC + Security/
-# CoreFoundation，build.rs:220-223），**不引 OpenSSL**，产物与换 feature 前
-# 一致；Linux 走系统 `libcrypto`（release matrix 无 Linux，仅编译面）。
+# 全平台统一：SQLCipher 的 crypto provider 由本仓纯 Rust 实现提供
+# （vendor/libsqlite3-sys/src/provider.rs，SQLCIPHER_CRYPTO_CUSTOM）。
+# 不再链接 OpenSSL / LibTomCrypt，也不依赖 CommonCrypto —— 一份实现覆盖三平台，
+# 从根本上消除「SQLCipher 的 crypto 与 libsignal 的 BoringSSL 符号冲突」。
 [target.'cfg(not(windows))'.dependencies]
-libsqlite3-sys = { version = "0.36", features = ["bundled", "bundled-sqlcipher"] }
+libsqlite3-sys = { version = "0.36", features = ["bundled", "bundled-sqlcipher", "bundled-sqlcipher-custom"] }
 
 # Windows 专用（`cfg(windows)` 分支，只在 x86_64-pc-windows-msvc 上生效）：
 # MSVC 没有 CommonCrypto，单用 `bundled-sqlcipher` 会让 build.rs 在
@@ -177,7 +177,7 @@ libsqlite3-sys = { version = "0.36", features = ["bundled", "bundled-sqlcipher"]
 # 许可/代价）见 docs/plan/engine-store-encryption.md §2.1 与 §7 P0
 # 「Windows 依赖报备（AGENTS.md：依赖最小化）」。
 [target.'cfg(windows)'.dependencies]
-libsqlite3-sys = { version = "0.36", features = ["bundled-sqlcipher-vendored-openssl"] }
+libsqlite3-sys = { version = "0.36", features = ["bundled", "bundled-sqlcipher", "bundled-sqlcipher-custom"] }
 
 [dev-dependencies]
 # 接收重连/维护超时单测用 paused 时钟（tokio test-util；仅测试编译面合并，
@@ -196,6 +196,12 @@ libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag
 # URL 的 [patch] 段（汇报偏差项）。
 # 许可：libsignal-service AGPL-3.0-only、presage AGPL-3.0-only（与其 git
 # 源一致，本仓同为 AGPL-3.0-only，无新增许可面）。
+# KT 定制（2026-11-19）：libsqlite3-sys 加 bundled-sqlcipher-libtomcrypt 分支
+# —— 上游 0.36 的 build.rs 在 Windows 只认 vendored-openssl（会撞 BoringSSL），
+# 这里 fork 出 LibTomCrypt 路径（自带 crypto，与 macOS 的 CommonCrypto 对称）。
+[patch.crates-io]
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
+
 [patch."https://github.com/whisperfish/libsignal-service-rs"]
 libsignal-service = { path = "vendor/libsignal-service" }
 

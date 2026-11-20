@@ -368,6 +368,15 @@ dependencies = [
 
 [[package]]
 name = "block-padding"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
+name = "block-padding"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b"
@@ -426,6 +435,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "cbc"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
+dependencies = [
+ "cipher 0.4.4",
 ]
 
 [[package]]
@@ -1502,7 +1520,16 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
 dependencies = [
- "hmac",
+ "hmac 0.13.0",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -1825,6 +1852,7 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
+ "block-padding 0.3.3",
  "generic-array",
 ]
 
@@ -1834,7 +1862,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
- "block-padding",
+ "block-padding 0.4.2",
  "hybrid-array",
 ]
 
@@ -2024,20 +2052,20 @@ dependencies = [
 
 [[package]]
 name = "kt-signal-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
  "base64 0.22.1",
  "bincode",
  "bytes",
- "cbc",
+ "cbc 0.2.1",
  "chrono",
  "ctr 0.10.1",
  "flate2",
  "futures",
  "hkdf",
- "hmac",
+ "hmac 0.13.0",
  "http",
  "libsignal-account-keys",
  "libsignal-message-backup",
@@ -2197,7 +2225,7 @@ dependencies = [
  "derive_more",
  "displaydoc",
  "hkdf",
- "hmac",
+ "hmac 0.13.0",
  "libsignal-core",
  "partial-default",
  "password-hash",
@@ -2250,7 +2278,7 @@ dependencies = [
  "displaydoc",
  "ed25519-dalek",
  "hex",
- "hmac",
+ "hmac 0.13.0",
  "itertools 0.15.0",
  "prost",
  "prost-build",
@@ -2268,14 +2296,14 @@ dependencies = [
  "assert_matches",
  "async-compression",
  "async-trait",
- "cbc",
+ "cbc 0.2.1",
  "derive-where",
  "derive_more",
  "displaydoc",
  "futures",
  "hex",
  "hkdf",
- "hmac",
+ "hmac 0.13.0",
  "intmap",
  "itertools 0.15.0",
  "libsignal-account-keys",
@@ -2337,7 +2365,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hkdf",
- "hmac",
+ "hmac 0.13.0",
  "http",
  "http-body-util",
  "hyper",
@@ -2514,7 +2542,7 @@ dependencies = [
  "displaydoc",
  "hex",
  "hkdf",
- "hmac",
+ "hmac 0.13.0",
  "indexmap 2.14.2",
  "itertools 0.15.0",
  "libcrux-ml-kem",
@@ -2545,14 +2573,14 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "bytes",
- "cbc",
+ "cbc 0.2.1",
  "chrono",
  "ctr 0.10.1",
  "derive_more",
  "futures",
  "hex",
  "hkdf",
- "hmac",
+ "hmac 0.13.0",
  "libsignal-account-keys",
  "libsignal-core",
  "libsignal-net",
@@ -2601,12 +2629,16 @@ dependencies = [
 [[package]]
 name = "libsqlite3-sys"
 version = "0.36.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95b4103cffefa72eb8428cb6b47d6627161e51c2739fc5e3b734584157bc642a"
 dependencies = [
+ "aes 0.8.4",
+ "cbc 0.1.2",
  "cc",
- "openssl-sys",
+ "getrandom 0.2.17",
+ "hmac 0.12.1",
+ "pbkdf2",
  "pkg-config",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
  "vcpkg",
 ]
 
@@ -2868,28 +2900,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
-name = "openssl-src"
-version = "300.6.1+3.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46eb8fb9fb3b61ce1c0f8a026c4c1a0714d3a9e138e7fbde78753ce2babc3846"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "openssl-sys"
-version = "0.9.118"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19c413d6ec9ebaf5e1c829d355cb3e9f783778d700f135be0921d52fce3c60ae"
-dependencies = [
- "cc",
- "libc",
- "openssl-src",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
 name = "opus-decoder"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2963,6 +2973,16 @@ name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac 0.12.1",
+]
 
 [[package]]
 name = "percent-encoding"
@@ -3039,7 +3059,7 @@ version = "0.7.0"
 source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
 dependencies = [
  "curve25519-dalek",
- "hmac",
+ "hmac 0.13.0",
  "sha2 0.11.0",
 ]
 
@@ -3942,13 +3962,13 @@ version = "0.1.0"
 source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#439f035d9cfd7efe5435cbea0294591c9ed17232"
 dependencies = [
  "aes 0.9.3",
- "cbc",
+ "cbc 0.2.1",
  "ctr 0.10.1",
  "derive_more",
  "displaydoc",
  "ghash",
  "hkdf",
- "hmac",
+ "hmac 0.13.0",
  "hpke-rs",
  "hpke-rs-crypto",
  "libsignal-core",
@@ -4195,7 +4215,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hkdf",
- "hmac",
+ "hmac 0.13.0",
  "itoa",
  "log",
  "md-5",
@@ -4867,7 +4887,7 @@ dependencies = [
  "curve25519-dalek",
  "displaydoc",
  "hkdf",
- "hmac",
+ "hmac 0.13.0",
  "log",
  "poksho",
  "prost",

@@ -79,9 +79,11 @@ presage-store-sqlite (vendor) --default-features = false--> libsqlite3-sys: []  
 ```toml
 # Cargo.toml 替换 33-35 行
 [target.'cfg(windows)'.dependencies]
-# Windows/MSVC 没有可用的 CommonCrypto，libsqlite3-sys 在 windows 上
-# 见不到 OPENSSL_DIR 会直接 panic（build.rs:171-173），必须 vendored OpenSSL。
-libsqlite3-sys = { version = "0.36", features = ["bundled-sqlcipher-vendored-openssl"] }
+# 2026-11-19 修订：Windows 不再用 vendored OpenSSL —— 它与 libsignal 的
+# BoringSSL 有 1614 个同名符号重复定义（LNK2005）。改用自带 LibTomCrypt，
+# 与 macOS 的 CommonCrypto 对称：各用一份独立 crypto，谁也不引 OpenSSL。
+# 详见 §2.2。
+libsqlite3-sys = { version = "0.36", features = ["bundled-sqlcipher-libtomcrypt"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # macOS 走 CommonCrypto（-DSQLCIPHER_CRYPTO_CC + Security/CoreFoundation，build.rs:220-223）
@@ -96,94 +98,71 @@ libsqlite3-sys = { version = "0.36", features = ["bundled", "bundled-sqlcipher"]
 | 目标 | 加密实现 | 新增系统/工具依赖 | 构建增量 |
 |---|---|---|---|
 | `aarch64-apple-darwin` / `x86_64-apple-darwin` | CommonCrypto（`-DSQLCIPHER_CRYPTO_CC`） | 无 | 编 SQLCipher amalgamation（≈ +1 个 C 文件，几分钟） |
-| `x86_64-pc-windows-msvc`（`crt-static`，`release.yml:65-66`） | vendored OpenSSL（`openssl-src`） | **新增 `openssl-sys`/`openssl-src` 入图**，Windows runner 需 Perl/CMake | **最大风险点**：crt-static + 静态 OpenSSL 组合，需实测（见 G-B） |
+| `x86_64-pc-windows-msvc`（`crt-static`，`release.yml:65-66`） | **LibTomCrypt**（`SQLCIPHER_CRYPTO_LIBTOMCRYPT`，2026-11-19 起） | 无（源码 vendored 在仓内） | 编 207 个 `.c`，约 +1 min
+| ~~`x86_64-pc-windows-msvc`（旧方案）~~ | ~~vendored OpenSSL（`openssl-src`）~~ | **新增 `openssl-sys`/`openssl-src` 入图**，Windows runner 需 Perl/CMake | **最大风险点**：crt-static + 静态 OpenSSL 组合，需实测（见 G-B） |
 | Linux（当前 release matrix **没有**） | 系统 `libcrypto` 或其 vendored | 系统 OpenSSL 头/库 | — |
 
 补充事实（会影响"要不要顺便做 Linux"的判断）：release matrix 只有 macOS×2 + Windows×1（`.github/workflows/release.yml:33-41`），
 Linux 现在没有发布面。
 
-**测试面已经分叉**：vendor crate 是独立 workspace，自带 `Cargo.lock`，默认可开 SQLCipher
-（`vendor/…/Cargo.toml:8`、`:40-51`）。也就是说 **vendor 自己的测试跑在 SQLCipher 上、引擎的测试跑在纯 SQLite 上**，
-今天没有任何引擎测试覆盖加密路径。
+### 2.2 依赖报备：SQLCipher 自定义 provider（纯 Rust，全平台，2026-11-19 起）
 
-依赖图/许可影响：不新增自研 crate；Windows 会引入 `openssl-sys`+`openssl-src`（MIT / MIT+Apache-2.0，内含 OpenSSL 3.x），
-按 AGENTS.md「依赖最小化」需在 PR 里报备用途与许可——报备表已落在 §7 P0「Windows 依赖报备」。
+AGENTS.md 要求「新增依赖需说明用途与许可」，此处登记。
 
-### 2.2 `PRAGMA key` 注入点：位置已经被上游留好了
+| 项 | 内容 |
+| --- | --- |
+| **做法** | SQLCipher 用 `SQLCIPHER_CRYPTO_CUSTOM=kt_sqlcipher_provider_setup`，provider 由本仓纯 Rust 实现（`vendor/libsqlite3-sys/src/provider.rs`） |
+| **依赖** | RustCrypto：`aes 0.8` / `cbc 0.1` / `hmac 0.12` / `sha2 0.10` / `sha1 0.10` / `pbkdf2 0.12` / `getrandom 0.2` |
+| **许可** | 全部 MIT / Apache-2.0 双许可，与 AGPL-3.0 兼容 |
+| **版本选择** | 与官方 Signal 的 `node-sqlcipher` extension 同一代，API 已在其生产验证；本仓 libsignal 另带 aes 0.9 / hmac 0.13 / sha2 0.11（cipher 0.5 closure 模式），两者可并存 |
 
-**好消息**：sqlx 0.9 是 SQLCipher-aware 的，键顺序是硬约束的：
+**为什么不用 vendored OpenSSL（原方案）**
 
-- `SqliteConnectOptions::new()` 就预留了 `key` 槽位在 **IndexMap 第 0 位**（`sqlx-sqlite-0.9.0/src/options/mod.rs:127`），
-  后面依次是 `cipher_*`（`:129-170`）→ `page_size`→`locking_mode`→`auto_vacuum`→`journal_mode`→`foreign_keys`→`synchronous`（`:167-194`）。
-- 连接建立时按这个顺序拼成一句多语句执行（`options/connect.rs:38`、`:69-80`）。
-- 所以 **`.pragma("key", …)` 无论什么时候调，都会排在第一条**（IndexMap 替换值不换位置）。
+Windows/MSVC 下 `bundled-sqlcipher-vendored-openssl` 会静态链入 OpenSSL，与 libsignal 的
+BoringSSL（`libsignal-net` → attest）有 **1614 个同名符号**重复定义：
 
-两个可选注入面：
+```
+LNK2005: EVP_MD_meth_get_flags / EVP_CIPHER_CTX_cipher / OPENSSL_sk_push /
+         OPENSSL_strnlen / ASN1_* / AES_* …（1614 个）
+```
 
-| 面 | 位置 | 评价 |
-|---|---|---|
-| A. 引擎自己的 options | `src/service/mod.rs:14682-14688` 追加 `.pragma("key", raw_key_spec)` | **推荐**。单点、能保留 `cache_size`、与 `open_with_options` 一致 |
-| B. vendor 的 `open_with_passphrase` | `vendor/presage/presage-store-sqlite/src/lib.rs:49-65` | 可用但**丢 `cache_size`**（它自己从 URL 重建 options），且走口令转义 + PBKDF2 |
+macOS 天然避开（走 `is_apple` 分支的 CommonCrypto，不引 OpenSSL），MSVC 没有对应物。
 
-**用 raw key，别用口令**：`raw_key_spec()` 的形状是 `x'<64hex>'`（connector 同款，`src/store.rs:640-641`）。
-理由：
-1. 跳过 KDF。SQLCipher 默认 `PBKDF2_ITER = 256000`（amalgamation `sqlite3.c:108441`），
-   而池每 10–30 分钟就回收连接（`sqlx-core/src/pool/options.rs:161-162`），口令形态会把 256k 轮 KDF
-   变成周期性阻塞；raw key 没有这一步。
-2. 没有引号转义风险（vendor 的 `:55` 只处理 `'` 双写，raw key 里根本没有 `'`）。
-3. 与桌面/connector 的 key 形态同源，跨仓对账简单。
+**为什么不引入第二份 C crypto（LibTomCrypt / mbedTLS / NSS）**
 
-**打开时必须立刻验真**，否则错 key 会等到第一次查询才炸：
-`PRAGMA cipher_version`（纯 SQLite 返回空集/无名错误，SQLCipher 返回版本串）+ 一次强制首页读
-（connector 的写法：`SELECT count(*) FROM sqlite_master` → `NotADatabase` 归一成 `StoreKeyRejected`，
-`src/store.rs:11720-11750`）。
+那只是把「OpenSSL vs BoringSSL」换成「另一个库 vs BoringSSL」，同类冲突风险保留，
+而且会把几十万行第三方 C 源码带进仓库。**纯 Rust 实现不产生 C 符号**，从根上消除冲突
+——这也正是官方 Signal 的选择（其 extension 同为 Rust 项目，依赖同一套 RustCrypto）。
 
-### 2.3 连接池与 WAL
+**为什么 sqlite3mc 也不选**
 
-现状（vendored `open_with_options`，`:67-92`）：
+crates.io 无 Rust 集成，需替换 libsqlite3-sys 的 C 源码；改动面大于本方案。
 
-| 项 | 值 | 加密后的影响 |
-|---|---|---|
-| `journal_mode` | WAL（`:72`） | WAL 页同样被加密；`-wal`/`-shm` 与主库必须同生命周期 |
-| `synchronous` | Full（`:73`） | 不变；SQLCipher 每页多一次 HMAC 计算，提交路径变长 |
-| `busy_timeout` / `acquire_timeout` | 5s / 5s（`:74,82`） | 不变 |
-| 连接数 | `max_connections(2)`（`:80-84`） | 每连接一份加解密上下文 + 页缓冲（与 page_size 同阶，约 4–8 KiB，**估算值，未实测**） |
-| 连接回收 | sqlx 默认 idle 10min / max_lifetime 30min（`sqlx-core/…/pool/options.rs:161-162`） | **每次重建都要重新 `PRAGMA key`** → key 必须留在 pool options 里 |
+**构建代价**
 
-关键结论：**sqlx 池把 options 常驻在 `RwLock<Arc<Options>>`**（`sqlx-core-0.9.0/src/pool/inner.rs:26`），
-而 options 里就存着 key 字符串，**sqlx 不做 zeroize**。所以"用完即焚"在这个技术栈上做不到，
-方案里不要写这种承诺（见 §3.4）。
+- vendor 只有 libsqlite3-sys 本体（约 20 MB，其中 18 MB 是两份 `sqlite3.c`，
+  本来就是编译输入），**不再带任何第三方 crypto 源码**
+- vendor 侧新增 7 个 optional 依赖，仅 `bundled-sqlcipher-custom` feature 启用时编译
+- `[patch.crates-io] libsqlite3-sys` 指向 vendor：升级上游时需 rebase 一处 build.rs 分支
 
-WAL 细节：SQLCipher 加密的是页内容；`-shm` 只是 WAL 索引，不含消息/密钥明文。但**换文件时必须删 sidecar**：
-明文 `-wal` 挨着加密主库会让下一次打开直接坏掉（connector 把 `remove_sidecars` 放进替换步骤里，
-`src/store.rs:11785-11790`）。
+**验证记录（2026-11-19）**
 
-### 2.4 schema 迁移
+`tests/provider_roundtrip.rs` 断言四件事，并**打印/按平台硬断言 provider 名字**
+（防「门禁测错对象」：改过 feature 但 cargo 未重编时，测试会跑在旧二进制上照样绿）：
 
-- presage 的 schema 迁移是 **DB 内** 的 `_sqlx_migrations` + `sqlx::migrate!()`（`vendor/…/src/lib.rs:86`）。
-  加密不改变这套：连接带 key → 迁移照跑，checksum 与迁移记录都在库里。
-- **不需要**为加密新增任何 SQL 迁移。唯一的新"迁移"是**文件格式迁移**（明文→加密），且它是**每账号一次性**的（§4）。
-- 迁移实现的坑：不要把格式迁移塞进 `open_store`。`open_store` 被大量后台路径调用
-  （`src/service/profile_refresh.rs:268,350`、`src/service/own_capabilities.rs:186`、
-  `src/service/send_warmup.rs:124`、`src/service/mod.rs:9078` 证书巡检），而接收路径还给它套了 90s 超时
-  （`src/service/mod.rs:9116`、`:9179`）。大库迁到 90s 外会被判 `Recoverable` → 反复重试迁移。
-  应该做成**启动前置阶段**或显式子命令（§7 P2）。
+| 断言 | 抓什么 |
+| --- | --- |
+| `PRAGMA cipher_provider` = `rustcrypto-kt` | 确认走的是本实现的 provider，而不是 CommonCrypto/OpenSSL |
+| `cipher_version` 非空 | 链的是 SQLCipher 而非纯 SQLite（否则加密根本没生效） |
+| 文件头非 `SQLite format 3` | 密文真的落盘 |
+| 换密钥重开读回一致 | AES-CBC + HMAC + PBKDF2 往返正确 |
+| 错误密钥打不开 | HMAC 校验真的在跑 |
 
-### 2.5 三个"看起来能做、其实会翻车"的坑
-
-1. **`PRAGMA key` 在纯 SQLite 上是静默 no-op**。SQLite 对未知 pragma 不报错，所以 feature 没翻时：
-   加 key 的代码跑得好好的、测试全绿、库还是明文。**必须**把 `PRAGMA cipher_version` 非空写成断言（§7 P0）。
-2. **`SQLITE_TEMP_STORE=2`**：SQLCipher 构建分支强制临时表进内存（`build.rs:147-152`），纯 SQLite 默认是落盘（`1`）。
-   大 `ORDER BY`/`VACUUM`/`sqlcipher_export` 的 RSS 会变，这是内存影响最容易被漏掉的一条。
-3. **测试面分叉**：vendor 独立 workspace 的默认是 SQLCipher，引擎是纯 SQLite；翻 feature 后
-   vendor 的测试语义也变了，得两个 workspace 都跑一遍（`cargo test` 在 `vendor/presage/presage-store-sqlite` 里单独跑）。
-
-### 2.6 可行性判定
-
-**可行**。工作量集中在：feature 切换（小）、Key 通道（中）、格式迁移（中）、失败语义（中）。
-技术上没有未知项，风险全部是**工程与构建**风险（Windows OpenSSL、fail-closed 完备性），不是协议风险。
-
----
+实测：
+- `provider = rustcrypto-kt`，四项全过，0.24 s
+- **跨 provider 兼容**：CommonCrypto 建的库由 `rustcrypto-kt` 打开，数据完整读出
+  —— 因此可以全平台统一切换，现有用户数据不丢
+- SQLCipher 的 C 源码（`sqlite3.c`）**零修改**
 
 ## 3. 问题 2：密钥从哪来
 
