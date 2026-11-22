@@ -1213,6 +1213,17 @@ pub(crate) struct GroupUpdateWrite {
     pub(crate) avatar: Option<AvatarWrite>,
     pub(crate) add_members: Vec<String>,
     pub(crate) remove_members: Vec<String>,
+    /// 群描述写面（§4.287）：modify_description 加密 blob（与 title 同构，
+    /// 空串 = 清除——与 title 的空串整拒不同，官方 modifyDescription 同语义）。
+    pub(crate) description: Option<String>,
+    /// 升管理员写面（§4.287）：modify_member_roles role=Administrator。
+    pub(crate) promote_admins: Vec<String>,
+    /// 降管理员写面（§4.287）：modify_member_roles role=Default。
+    pub(crate) demote_admins: Vec<String>,
+    /// Ban 写面（§4.287）：add_members_banned（timestamp=0 服务器回填）。
+    pub(crate) ban_members: Vec<String>,
+    /// Unban 写面（§4.287）：delete_members_banned。
+    pub(crate) unban_members: Vec<String>,
     /// 链接访问权写面（P13/任务2，词 ANY/MEMBER/ADMINISTRATOR/UNSATISFIABLE
     /// 由 handler 解析；UNKNOWN 不作写意图词）。
     pub(crate) add_from_invite_link_access:
@@ -1338,6 +1349,11 @@ pub(crate) async fn update_group_change(
         avatar,
         add_members,
         remove_members,
+        description,
+        promote_admins,
+        demote_admins,
+        ban_members,
+        unban_members,
         add_from_invite_link_access,
         invite_link_password,
         announcements_only,
@@ -1354,6 +1370,11 @@ pub(crate) async fn update_group_change(
         && avatar.is_none()
         && add_members.is_empty()
         && remove_members.is_empty()
+        && description.is_none()
+        && promote_admins.is_empty()
+        && demote_admins.is_empty()
+        && ban_members.is_empty()
+        && unban_members.is_empty()
         && add_from_invite_link_access.is_none()
         && invite_link_password.is_none()
         && announcements_only.is_none()
@@ -1519,6 +1540,74 @@ pub(crate) async fn update_group_change(
                 actions.modify_member_labels =
                     build_member_label_clear_actions(&secret_params, &state.members);
             }
+        }
+    }
+    // —— §4.287 五写臂：description + promote/demote + ban/unban ——
+    // description：加密 blob（与 title 同构；空串 = 清除，官方同语义）。
+    if let Some(desc) = description.as_deref() {
+        let blob = presage::proto::GroupAttributeBlob {
+            content: Some(
+                presage::proto::group_attribute_blob::Content::DescriptionText(desc.to_owned()),
+            ),
+        }
+        .encode_to_vec();
+        actions.modify_description = Some(
+            presage::proto::group_change::actions::ModifyDescriptionAction {
+                description: secret_params.encrypt_blob_with_padding(randomness, &blob, 0),
+            },
+        );
+    }
+    // promote/demote：modify_member_roles（加密 user_id + Role 枚举）。
+    // 加密用 zkgroup::serialize + secret_params.encrypt_service_id（与
+    // build_member_label_clear_actions 同原语，不依赖 GroupOperations 私有方法）。
+    let encrypt_user_id = |entry: &str| -> Option<Vec<u8>> {
+        uuid::Uuid::parse_str(entry)
+            .ok()
+            .map(Aci::from)
+            .map(ServiceId::Aci)
+            .map(|sid| zkgroup::serialize(&secret_params.encrypt_service_id(sid)))
+    };
+    for entry in &promote_admins {
+        if let Some(user_id) = encrypt_user_id(entry) {
+            actions.modify_member_roles.push(
+                presage::proto::group_change::actions::ModifyMemberRoleAction {
+                    user_id,
+                    role: presage::proto::member::Role::Administrator as i32,
+                },
+            );
+        }
+    }
+    for entry in &demote_admins {
+        if let Some(user_id) = encrypt_user_id(entry) {
+            actions.modify_member_roles.push(
+                presage::proto::group_change::actions::ModifyMemberRoleAction {
+                    user_id,
+                    role: presage::proto::member::Role::Default as i32,
+                },
+            );
+        }
+    }
+    // ban：add_members_banned（timestamp=0 服务器回填，官方同语义）。
+    for entry in &ban_members {
+        if let Some(user_id) = encrypt_user_id(entry) {
+            actions.add_members_banned.push(
+                presage::proto::group_change::actions::AddMemberBannedAction {
+                    added: Some(presage::proto::MemberBanned {
+                        user_id,
+                        timestamp: 0,
+                    }),
+                },
+            );
+        }
+    }
+    // unban：delete_members_banned。
+    for entry in &unban_members {
+        if let Some(user_id) = encrypt_user_id(entry) {
+            actions.delete_members_banned.push(
+                presage::proto::group_change::actions::DeleteMemberBannedAction {
+                    deleted_user_id: user_id,
+                },
+            );
         }
     }
     if !candidates.is_empty() {

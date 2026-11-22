@@ -4141,6 +4141,47 @@ async fn dispatch(
                 .and_then(Value::as_u64)
                 .and_then(|seconds| u32::try_from(seconds).ok());
             let title = params.get("title").and_then(Value::as_str);
+            // §4.287 五写臂参数提取（description/promote/demote/ban/unban）。
+            let description = match params.get("description") {
+                None => None,
+                Some(Value::String(text)) => Some(text.clone()),
+                Some(_) => return internal_error(id),
+            };
+            let parse_string_array = |key: &str| -> Option<Vec<String>> {
+                match params.get(key) {
+                    None => Some(Vec::new()),
+                    Some(Value::Array(entries)) => {
+                        if entries.is_empty() {
+                            return None;
+                        }
+                        let mut parsed = Vec::with_capacity(entries.len());
+                        for entry in entries {
+                            match entry.as_str() {
+                                Some(text) => parsed.push(text.to_owned()),
+                                None => return None,
+                            }
+                        }
+                        Some(parsed)
+                    }
+                    Some(_) => None,
+                }
+            };
+            let promote_admins = match parse_string_array("promoteAdmins") {
+                Some(v) => v,
+                None => return internal_error(id),
+            };
+            let demote_admins = match parse_string_array("demoteAdmins") {
+                Some(v) => v,
+                None => return internal_error(id),
+            };
+            let ban_members = match parse_string_array("banMembers") {
+                Some(v) => v,
+                None => return internal_error(id),
+            };
+            let unban_members = match parse_string_array("unbanMembers") {
+                Some(v) => v,
+                None => return internal_error(id),
+            };
             let add_members = match params.get("addMembers") {
                 None => Vec::new(),
                 Some(Value::Array(entries)) => {
@@ -4286,6 +4327,11 @@ async fn dispatch(
                 && avatar.is_none()
                 && add_members.is_empty()
                 && remove_members.is_empty()
+                && description.is_none()
+                && promote_admins.is_empty()
+                && demote_admins.is_empty()
+                && ban_members.is_empty()
+                && unban_members.is_empty()
                 && add_from_invite_link_access.is_none()
                 && invite_link_password.is_none()
                 && announcements_only.is_none()
@@ -4305,6 +4351,11 @@ async fn dispatch(
                 avatar,
                 add_members,
                 remove_members,
+                description,
+                promote_admins,
+                demote_admins,
+                ban_members,
+                unban_members,
                 add_from_invite_link_access,
                 invite_link_password,
                 announcements_only,
