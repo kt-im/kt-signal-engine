@@ -1282,6 +1282,142 @@ pub(crate) async fn contact_whitelist_map(
 }
 
 // ---------------------------------------------------------------------------
+// contacts 同步投影 pni 补面（fix/sync-contact-pni 批）
+// ---------------------------------------------------------------------------
+
+/// 单条明文 StorageRecord → (aci 小写, "PNI:<uuid>")：仅 Contact 类参与。
+/// aci 半边 = 官方 fromAciUuidBytesOrString 同构（aciBinary 16B 优先；aci
+/// 字符串仅收 ACI 形态——"PNI:" 形不当 ACI 收，storage_merge::service_id_of
+/// 同域）；pni 半边 = 官方 fromPniUuidBytesOrUntaggedString 同构（pniBinary
+/// 16B 优先 → pni 字段裸 UUID（untagged PNI 官方语义）→ "PNI:" 标签形
+/// 宽容）。值一律归一为引擎 PNI service-id 串（"PNI:<uuid>"，
+/// sourceUuid/destinationUuid 同词表）。任一半边缺席/空串/不可解析 →
+/// None（宁缺勿错，键不投）。
+pub(crate) fn contact_pni_of(plaintext: &[u8]) -> Option<(String, String)> {
+    let record = storage_proto::StorageRecord::decode(plaintext)
+        .ok()?
+        .record?;
+    match record {
+        storage_proto::storage_record::Record::Contact(contact) => {
+            Some((contact_aci_of(&contact)?, contact_pni_string(&contact)?))
+        }
+        _ => None,
+    }
+}
+
+/// ContactRecord aci 半边 → 小写 UUID 串（contacts 同步投影的 join 键，
+/// blob 投影 aci 同形）。aciBinary 畸形（非空但非 16B）→ 落 aci 字符串臂
+/// （官方 fromAciUuidBytesOrString 的 bytes→string fallthrough；与 pni
+/// 半边/storage_merge::service_id_of 同阶梯，2026-11-22 审计应修①对齐）。
+fn contact_aci_of(contact: &storage_proto::ContactRecord) -> Option<String> {
+    use presage::libsignal_service::protocol::ServiceId;
+
+    if !contact.aci_binary.is_empty() {
+        if let Ok(uuid) = presage::libsignal_service::prelude::Uuid::from_slice(&contact.aci_binary)
+        {
+            return Some(uuid.to_string());
+        }
+    }
+    if !contact.aci.is_empty() {
+        if let Some(sid @ ServiceId::Aci(_)) = ServiceId::parse_from_service_id_string(&contact.aci)
+        {
+            return Some(sid.service_id_string());
+        }
+    }
+    None
+}
+
+/// ContactRecord pni 半边 → "PNI:<uuid>"（pni 空串/缺席/pniBinary 畸形且
+/// 字段不可解析 → None，空串折缺席）。
+fn contact_pni_string(contact: &storage_proto::ContactRecord) -> Option<String> {
+    use presage::libsignal_service::prelude::Uuid;
+    use presage::libsignal_service::protocol::ServiceId;
+
+    if !contact.pni_binary.is_empty() {
+        if let Ok(uuid) = Uuid::from_slice(&contact.pni_binary) {
+            return Some(ServiceId::Pni(uuid.into()).service_id_string());
+        }
+    }
+    if !contact.pni.is_empty() {
+        // pni 字段官方语义 = untagged PNI 串（fromPniUuidBytesOrUntagged
+        // String：字段本身声明种类，裸 UUID 即 PNI）；"PNI:" 标签形宽容
+        // 解析（storage_merge::service_id_of 同阶梯）。
+        if let Ok(uuid) = Uuid::parse_str(&contact.pni) {
+            return Some(ServiceId::Pni(uuid.into()).service_id_string());
+        }
+        if let Some(sid @ ServiceId::Pni(_)) = ServiceId::parse_from_service_id_string(&contact.pni)
+        {
+            return Some(sid.service_id_string());
+        }
+    }
+    None
+}
+
+/// 全量联系人 pni map（aci 小写 → "PNI:<uuid>"）：contacts 同步投影
+///（`syncMessage.contacts` records 的 additive `pni` 键）的 enrichment
+/// 输入——PNI 归属真相源是 Storage Service ContactRecord（官方 pni/
+/// pniBinary 字段；contacts blob 的 ContactDetails 无 pni 位，上游 proto
+/// NEXT ID 14 无此字段）。返回值两义与 `contact_whitelist_map` 同构：
+/// `Some(map)` = 读面确实完成（含「零联系人」「manifest 404 = 账号从未有
+/// storage 状态」两个真实空面）；`None` = 任一环节失败（调用方按空 map
+/// 投影，pni 键缺席照投，宁缺勿错）。
+pub(crate) async fn contact_pni_map(context: &StorageContext) -> Option<HashMap<String, String>> {
+    let master_key = context.store.fetch_master_key().await.ok()??;
+    let storage_key = StorageServiceKey::from_master_key(&master_key);
+    let Ok(storage) = open_storage_service(
+        context.push.clone(),
+        StorageServiceKey::from_master_key(&master_key),
+    )
+    .await
+    else {
+        return None;
+    };
+    let manifest = match storage.manifest().await {
+        Ok(manifest) => manifest,
+        // 从未有过 storage 状态 = 真实空面（与 contact_whitelist_map 同口径）。
+        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
+            return Some(HashMap::new())
+        }
+        Err(_) => return None,
+    };
+    let keys: Vec<Vec<u8>> = manifest
+        .identifiers
+        .iter()
+        .filter(|identifier| {
+            matches!(
+                identifier.r#type(),
+                manifest_record::identifier::Type::Contact
+            )
+        })
+        .map(|identifier| identifier.raw.clone())
+        .collect();
+    if keys.is_empty() {
+        // 真实空面：账号有 manifest 但零联系人记录。
+        return Some(HashMap::new());
+    }
+    let record_ikm = if manifest.record_ikm.is_empty() {
+        None
+    } else {
+        Some(manifest.record_ikm.as_slice())
+    };
+    let Ok(auth) = storage_auth(&context.push).await else {
+        return None;
+    };
+    let Ok(items) = read_raw_items(&context.push, auth, keys).await else {
+        return None;
+    };
+    let mut out = HashMap::new();
+    for item in &items {
+        if let Ok(plaintext) = decrypt_raw_item(&storage_key, item, record_ikm) {
+            if let Some((aci, pni)) = contact_pni_of(&plaintext) {
+                out.insert(aci, pni);
+            }
+        }
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
 // 拉黑写面（setConversationBlocked，官方 storageRecordOps 行为对齐不抄码：
 // 逐会话记录 blocked 位 + blockedAt；解除 = blocked=false；纯拉黑不删会话；
 // 多设备/手机经 storage sync 收敛，无 SyncMessage.Blocked 通道——compat §5）
@@ -4181,5 +4317,122 @@ mod tests {
                 .expect("upstream decrypts local item");
             assert_eq!(back, record);
         }
+    }
+
+    /// contacts 同步投影 pni 补面（fix/sync-contact-pni 批）：解码三臂
+    /// ——pni 在场（pni 字段裸 UUID / "PNI:" 标签形 / pniBinary 16B）归一
+    /// "PNI:<uuid>"、pni 空串/缺席 → None（空串折缺席）、aci 半边缺席或
+    /// "PNI:" 形 → None（join 无键，宁缺勿错）；非 Contact 记录与坏明文
+    /// 整拒。
+    #[test]
+    fn contact_pni_of_faces() {
+        use storage_proto::ContactRecord;
+
+        fn record(aci_binary: &[u8], aci: &str, pni_binary: &[u8], pni: &str) -> Vec<u8> {
+            storage_proto::StorageRecord {
+                record: Some(storage_proto::storage_record::Record::Contact(
+                    ContactRecord {
+                        aci_binary: aci_binary.to_vec(),
+                        aci: aci.to_owned(),
+                        pni_binary: pni_binary.to_vec(),
+                        pni: pni.to_owned(),
+                        ..ContactRecord::default()
+                    },
+                )),
+            }
+            .encode_to_vec()
+        }
+
+        let aci_uuid = [
+            0x11u8, 0x11, 0x11, 0x11, 0x22, 0x22, 0x43, 0x33, 0x84, 0x44, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55,
+        ];
+        let pni_uuid = [
+            0x22u8, 0x22, 0x22, 0x22, 0x22, 0x22, 0x43, 0x33, 0x84, 0x44, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55,
+        ];
+        let expected = (
+            "11111111-2222-4333-8444-555555555555".to_owned(),
+            "PNI:22222222-2222-4333-8444-555555555555".to_owned(),
+        );
+
+        // pni 字段裸 UUID（untagged PNI 官方语义）→ 归一 "PNI:<uuid>"。
+        assert_eq!(
+            contact_pni_of(&record(
+                &aci_uuid,
+                "",
+                &[],
+                "22222222-2222-4333-8444-555555555555"
+            )),
+            Some(expected.clone())
+        );
+        // "PNI:" 标签形宽容解析 → 同一归一值；aci 字符串键同形。
+        assert_eq!(
+            contact_pni_of(&record(
+                &[],
+                "11111111-2222-4333-8444-555555555555",
+                &[],
+                "PNI:22222222-2222-4333-8444-555555555555"
+            )),
+            Some(expected.clone())
+        );
+        // pniBinary 16B 优先（pni 字段空串）。
+        assert_eq!(
+            contact_pni_of(&record(&aci_uuid, "", &pni_uuid, "")),
+            Some(expected)
+        );
+        // pni 空串/缺席（prost 裸 String 面两态同形）→ 折缺席。
+        assert_eq!(contact_pni_of(&record(&aci_uuid, "", &[], "")), None);
+        // pni 畸形串（非 UUID 非 service-id）→ None。
+        assert_eq!(
+            contact_pni_of(&record(&aci_uuid, "", &[], "not-a-uuid")),
+            None
+        );
+        // aci 半边缺席（pni-only 记录无 join 键）→ None。
+        assert_eq!(
+            contact_pni_of(&record(
+                &[],
+                "",
+                &[],
+                "22222222-2222-4333-8444-555555555555"
+            )),
+            None
+        );
+        // aci 字段 "PNI:" 形不当 ACI 收（join 键不成立）→ None。
+        assert_eq!(
+            contact_pni_of(&record(
+                &[],
+                "PNI:11111111-2222-4333-8444-555555555555",
+                &[],
+                "22222222-2222-4333-8444-555555555555"
+            )),
+            None
+        );
+        // aciBinary 畸形（非空但非 16B）→ 落 aci 字符串臂（bytes→string
+        // fallthrough，与 pni 半边/storage_merge::service_id_of 同阶梯；
+        // 2026-11-22 审计应修①：旧实现此处直接 None，与官方
+        // fromAciUuidBytesOrString 的宽容序不对称）。
+        assert_eq!(
+            contact_pni_of(&record(
+                &[0xde, 0xad, 0xbe, 0xef],
+                "11111111-2222-4333-8444-555555555555",
+                &[],
+                "22222222-2222-4333-8444-555555555555"
+            )),
+            Some((
+                "11111111-2222-4333-8444-555555555555".to_owned(),
+                "PNI:22222222-2222-4333-8444-555555555555".to_owned()
+            ))
+        );
+        // 非 Contact 记录 → None。
+        let group = storage_proto::StorageRecord {
+            record: Some(storage_proto::storage_record::Record::GroupV1(
+                storage_proto::GroupV1Record::default(),
+            )),
+        }
+        .encode_to_vec();
+        assert_eq!(contact_pni_of(&group), None);
+        // 坏明文 → None。
+        assert_eq!(contact_pni_of(&[0xffu8, 0xff]), None);
     }
 }

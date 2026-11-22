@@ -10677,7 +10677,29 @@ async fn serve_account_stream(
                     );
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTACTS, 1);
                     quick_seen += 1;
-                    for notification in project_contacts_sync(number, &sync) {
+                    // pni enrichment（fix/sync-contact-pni 批）：PNI 归属
+                    // 真相源 = Storage Service ContactRecord（`contact_pni_map`）。
+                    // 读取失败/账号无 storage 态 → 空 map（pni 键缺席照投，
+                    // 宁缺勿错）；空记录批不读 Storage（complete 旗标即信号，
+                    // 官方空 blob 同构）。
+                    let pni_by_aci = if sync.contacts.is_empty() {
+                        HashMap::new()
+                    } else {
+                        match storage_context(service, number).await {
+                            Ok(context) => storage_sync::contact_pni_map(&context)
+                                .await
+                                .unwrap_or_else(|| {
+                                    tracing::warn!(
+                                        target: "engine.receive",
+                                        stage = "contact_sync_pni_unavailable",
+                                        "contact pni map unavailable; projecting without pni"
+                                    );
+                                    HashMap::new()
+                                }),
+                            Err(_) => HashMap::new(),
+                        }
+                    };
+                    for notification in project_contacts_sync(number, &sync, &pni_by_aci) {
                         service.notify(number, notification).await;
                     }
                     if !service.flush_barrier(number).await {
@@ -13799,11 +13821,15 @@ fn project_attachment_backfill_response(
 /// （parse 失败上游 filter_map 丢、store save 失败 break 后不再投影——
 /// 如实登记）；avatar 字节不投影（gap 登记后续批）。expireTimer/
 /// expireTimerVersion/inboxPosition 0 与缺席不可分（presage u32 模型），
-/// 0 不投（§5 记档）。空记录照投事件（complete 旗标即信号，官方
+/// 0 不投（§5 记档）。pni = Storage Service ContactRecord 归一
+/// "PNI:<uuid>"（fix/sync-contact-pni 批，additive absent-key：blob 的
+/// ContactDetails 无 pni 位，按 aci join，缺席/空串键不在——§5 块）。
+/// 空记录照投事件（complete 旗标即信号，官方
 /// contactSync:complete 事件空 blob 照发同构）。
 fn project_contacts_sync(
     account: &str,
     sync: &presage::model::messages::ContactSync,
+    pni_by_aci: &HashMap<String, String>,
 ) -> Vec<Value> {
     let metadata = &sync.content.metadata;
     let mut records = Vec::new();
@@ -13815,6 +13841,17 @@ fn project_contacts_sync(
         }
         if !contact.name.is_empty() {
             entry.insert("name".into(), json!(contact.name));
+        }
+        // pni 补面（fix/sync-contact-pni 批，additive absent-key）：PNI 归属
+        // 真相源 = Storage Service ContactRecord（官方 pni/pniBinary 字段；
+        // blob 的 ContactDetails 无 pni 位），按 aci join（`contact_pni_map`），
+        // 值 = 引擎 PNI service-id 串（"PNI:<uuid>"，sourceUuid 同词表）。
+        // enrichment 缺席/空串 → 键不在（宁缺勿错，绝不发明）。
+        if let Some(pni) = pni_by_aci
+            .get(&contact.uuid.to_string())
+            .filter(|pni| !pni.is_empty())
+        {
+            entry.insert("pni".into(), json!(pni));
         }
         if contact.expire_timer != 0 {
             entry.insert("expireTimer".into(), json!(contact.expire_timer));
@@ -24440,7 +24477,7 @@ mod tests {
             contacts,
         };
         let notification = pop_unwrap(
-            project_contacts_sync("acct", &sync),
+            project_contacts_sync("acct", &sync, &HashMap::new()),
             "contacts sync projects",
         );
         assert_eq!(notification["method"], json!("receive"));
@@ -24476,10 +24513,103 @@ mod tests {
             complete: false,
             contacts: Vec::new(),
         };
-        let face = &pop_unwrap(project_contacts_sync("acct", &sync), "empty projects")["params"]
-            ["envelope"]["syncMessage"]["contacts"];
+        let face = &pop_unwrap(
+            project_contacts_sync("acct", &sync, &HashMap::new()),
+            "empty projects",
+        )["params"]["envelope"]["syncMessage"]["contacts"];
         assert_eq!(face["complete"], json!(false));
         assert_eq!(face["records"], json!([]));
+    }
+
+    /// contacts sync 投影 pni 补面（fix/sync-contact-pni 批，additive
+    /// absent-key）：enrichment 命中 → "pni" 键逐字（"PNI:<uuid>"）；aci
+    /// 不在 map → 键不在；空串值 → 折缺席（键不在）。
+    #[test]
+    fn contacts_sync_projects_pni_additively() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::model::contacts::Contact;
+        use presage::model::messages::ContactSync;
+        use presage::proto::DataMessage;
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let metadata = Metadata {
+            sender,
+            destination: sender,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+        let contact = |uuid: &str| Contact {
+            uuid: presage::libsignal_service::prelude::Uuid::parse_str(uuid).expect("uuid"),
+            phone_number: None,
+            name: String::new(),
+            verified: Default::default(),
+            profile_key: Vec::new(),
+            expire_timer: 0,
+            expire_timer_version: 0,
+            inbox_position: 0,
+            avatar: None,
+        };
+        let sync = ContactSync {
+            content: Box::new(Content::from_body(
+                ContentBody::DataMessage(DataMessage::default()),
+                metadata,
+            )),
+            complete: false,
+            contacts: vec![
+                contact("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"),
+                contact("0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283"),
+                contact("1c2d3e4f-5061-4a2b-9d3e-4f5061728394"),
+            ],
+        };
+        let mut pni_by_aci = HashMap::new();
+        pni_by_aci.insert(
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae".to_owned(),
+            "PNI:22222222-2222-4333-8444-555555555555".to_owned(),
+        );
+        // 空串值：折缺席（键不在）。
+        pni_by_aci.insert(
+            "1c2d3e4f-5061-4a2b-9d3e-4f5061728394".to_owned(),
+            String::new(),
+        );
+        let face = &pop_unwrap(
+            project_contacts_sync("acct", &sync, &pni_by_aci),
+            "contacts sync projects",
+        )["params"]["envelope"]["syncMessage"]["contacts"];
+        let records = face["records"].as_array().expect("records");
+        assert_eq!(records.len(), 3);
+        // 命中：逐字（"PNI:<uuid>"，其余键零变化）。
+        assert_eq!(
+            records[0],
+            json!({
+                "aci": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                "pni": "PNI:22222222-2222-4333-8444-555555555555",
+            })
+        );
+        // aci 不在 map：键不在。
+        assert_eq!(
+            records[1],
+            json!({ "aci": "0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283" })
+        );
+        // 空串值：折缺席。
+        assert_eq!(
+            records[2],
+            json!({ "aci": "1c2d3e4f-5061-4a2b-9d3e-4f5061728394" })
+        );
     }
 
     /// P15a 项4 Blocked 同步收投影：modern/legacy 家族选择（官方

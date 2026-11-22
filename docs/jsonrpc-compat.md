@@ -529,7 +529,7 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   臂），引擎投影 additive 上抛供 connector 删自有库行（conversationDeletes/
   attachmentDeletes 的引擎 store 行不删——vendored TODO 面，§5 如实
   登记）。
-- `syncMessage.contacts {complete, records: [{aci, number?, name?,
+- `syncMessage.contacts {complete, records: [{aci, number?, name?, pni?,
   expireTimer?, expireTimerVersion?, inboxPosition?}]}`（P15a 项3，官方
   SyncMessage.contacts blob 消费面投影——handleContacts
   MessageReceiver.preload.ts:3934 → doContactSync services/
@@ -538,7 +538,10 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   落库成功记录（parse 失败上游 filter_map 丢、store save 失败 break 后
   剩余不投影，§5 如实登记）；aci = ContactDetails aciBinary/aci 解析
   UUID 串；number = E.164（缺席键不在）；name 空串不投（官方 dropNull
-  同构）；expireTimer/expireTimerVersion/inboxPosition = 0 不投（presage
+  同构）；pni = Storage Service ContactRecord 归一 "PNI:<uuid>"（2026-11-21
+  fix/sync-contact-pni 批，additive——blob 的 ContactDetails 无 pni 位，
+  按 aci join，缺席/空串/读失败键不在，偏差登记见文末附录同族段）；
+  expireTimer/expireTimerVersion/inboxPosition = 0 不投（presage
   u32 模型 0 与缺席不可分，§5 记档）；avatar 字节不投影（gap 登记后续
   批）；complete = blob complete 旗标（官方 isFullSync 同位，connector
   据此决定全量重置语义）；空 records 照投事件（complete 旗标即信号，
@@ -7332,3 +7335,39 @@ release build；connector 侧 `cargo fmt` / `cargo clippy --all-targets -- -D wa
   `profileSharing` / `inSystemContacts`。
 - 测试：`project_contact_entry_shapes`（新签名、两键在场/缺席、非通讯录行
   hidden=true）；wire 形状逐键钉定。
+
+### contacts 同步投影 pni 补面（2026-11-21，wire additive【engine-compat】）
+
+官方锚（AGPL 只读零抄码）：PNI↔ACI 归属的官方真相源是 Storage Service
+`ContactRecord.pni`/`pniBinary`（桌面 storage 通道消费面）；contacts 同步
+blob 的 `ContactDetails` 无 pni 位（上游 SignalService.proto NEXT ID 14 无
+此字段），官方 blob 消费面（contactSync.preload.ts）也不读 pni——本批是
+KT 独立扩展：桌面把 PNI 键会话归并到 ACI 需要该映射，connector 契约
+1.136 §4.122 的 `SyncContactRecord` 增设 `pni` 消费位（connector 侧另行
+落批，跨仓改动不进本仓）。
+
+- **wire 面**：`syncMessage.contacts.records[]` 每条 additive `pni`
+  （string，`"PNI:<uuid>"`——引擎 PNI service-id 串，`sourceUuid`/
+  `destinationUuid` 同词表）。absent-key 纪律：join 缺席/空串/不可解析 →
+  键不在，绝不发明。
+- **数据源**：Storage Service ContactRecord（`storage_sync::contact_pni_map`，
+  镜像 `contact_whitelist_map` 两义读面：`Some` = 读完成含真实空面、
+  `None` = 失败 → 空 map 投影，pni 键缺席照投，宁缺勿错）。aci 半边 =
+  aciBinary 16B 优先 / aci 字符串仅收 ACI 形态；pni 半边 = pniBinary 16B
+  优先 / pni 字段裸 UUID（untagged PNI 官方语义）/ "PNI:" 标签形宽容
+  （`storage_merge::service_id_of` 同阶梯）。按 aci 与 blob 记录 join；
+  pni-only 记录（无 aci）无 join 键不参与本面。
+- **触发面**：仅非空 records 的 contacts 信封在读一次 manifest+items
+  （`contact_whitelist_map` 同网络形状，2-3 往返）；空记录批不读
+  （complete 旗标即信号）。TTL 缓存未做（信封低频、初始同步节奏），gap
+  登记后续批。
+- **偏差如实登记**：enrichment 读取失败（网络/auth/master key 缺失/无
+  storage 态）→ 该批 records 无 pni 键（G1 投影照投）；fake 账号 storage
+  上下文不可得（UnknownAccount）→ 同缺席面；blob 先到、manifest 后拉
+  （登录窗时序）→ 首批可能无 pni，后续批/重放收敛。
+- **测试**：`contact_pni_of_faces`（storage_sync：解码三臂 + 空串折缺席
+  + 畸形/非 Contact/pni-only/"PNI:" 形 aci 整拒）；
+  `contacts_sync_projects_pni_additively`（mod：命中逐字 / 键缺席 /
+  空串折缺席）；既有 contacts sync 投影测试改空 map 臂，语义零变化。
+- **门禁**：`cargo fmt` / `cargo clippy --all-targets -- -D warnings` /
+  `cargo test` 全绿。
