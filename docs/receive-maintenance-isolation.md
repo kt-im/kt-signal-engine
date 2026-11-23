@@ -12,6 +12,12 @@
 量触发另有计数错误：每封处理后都把 `quick_seen` 清零，而阈值是 200，导致
 正常单封处理路径无法累计到触发线。
 
+运行日志同时证明旧 `receive_loop_gap` 口径含正常空闲 `select!` 等待：多条
+`gap≈1800000ms` 与 30min quick timer 完全一致，不能作为头阻塞证据。该指标
+改为实际工作入口打点（sync 在沉降 sleep 后、锁与网络前；其余在分支处理器
+入口），只测真实分支处理时长；帧等待延迟继续由 `ws_frame_to_loop` 独立测量。自转录现有 11 次样本均成功且为 242–1577ms，
+暂无降级 websocket 长等证据，本批不改变其发送锁协议。
+
 ## 决策
 
 1. `manager.receive_messages()` 建立独立 stream 后，Manager 由本线程异步互斥保护。

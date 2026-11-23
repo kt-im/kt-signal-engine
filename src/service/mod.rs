@@ -10596,20 +10596,22 @@ async fn serve_account_stream(
     // （maintenance_tick 书签判到期同纪律），量触发刷新书签让时间窗重开。
     let mut quick_last_ms: Option<u64> = None;
     let mut quick_seen: u64 = 0;
-    // 诊断面（2026-11-12）：接收循环每轮入口记gap。gap 大 = 上一轮在循环内
-    // 忙别的（或没被唤醒）；配合 ws_frame_to_loop 可区分「没取」与「取了没处理」。
-    let mut last_iter_at = std::time::Instant::now();
+    // 诊断面：时间戳必须在分支处理器入口更新。旧口径在 select 前计时，
+    // 把正常空闲等待（例如 30min quick timer）也报成 receive_loop_gap。
+    // 新口径只测上一个分支的真实处理时长；帧等待延迟仍由 ws_frame_to_loop 承载。
+    let last_branch_at = std::cell::Cell::new(None::<std::time::Instant>);
     loop {
-        let iter_gap_ms = last_iter_at.elapsed().as_millis() as u64;
-        if iter_gap_ms >= 200 {
-            tracing::warn!(
-                target: "engine.latency",
-                stage = "receive_loop_gap",
-                gap_ms = iter_gap_ms,
-                "receive loop iteration gap"
-            );
+        if let Some(started) = last_branch_at.get() {
+            let iter_gap_ms = started.elapsed().as_millis() as u64;
+            if iter_gap_ms >= 200 {
+                tracing::warn!(
+                    target: "engine.latency",
+                    stage = "receive_loop_gap",
+                    gap_ms = iter_gap_ms,
+                    "receive branch processing gap"
+                );
+            }
         }
-        last_iter_at = std::time::Instant::now();
         tokio::select! {
             _ = shutdown.changed() => return StreamOutcome::Connected,
             worker_result = &mut _prekey_worker_guard.task => {
@@ -10628,6 +10630,9 @@ async fn serve_account_stream(
             _ = async {
                 if let Some(at) = sync_pending {
                     tokio::time::sleep_until(at).await;
+                    // sync 的实际工作在 future 内，起点必须在锁等待与网络调用之前；
+                    // 完成 handler 不再覆盖此起点。
+                    last_branch_at.set(Some(std::time::Instant::now()));
                     // 与 prekey worker 共用 Manager；锁等待不阻塞 stream.next()。
                     let mut manager = manager.lock().await;
                     // 链接完成 sync 上行三请求（P15c 项4）：官方
@@ -10825,6 +10830,7 @@ async fn serve_account_stream(
                     .await;
                 }
             }, if manifest_debounce.pending_deadline().is_some() => {
+                last_branch_at.set(Some(std::time::Instant::now()));
                 if manifest_debounce.take_due(now_ms()) {
                     // 同登录期腿：manifest 拉取转后台 + 30s 上限，收流循环
                     // 绝不在维护调用上无限等待。
@@ -10857,6 +10863,7 @@ async fn serve_account_stream(
                     tokio::time::sleep_until(at).await;
                 }
             }, if maint_at.is_some() => {
+                last_branch_at.set(Some(std::time::Instant::now()));
                 // 只投递，网络维护由流级 worker 执行；同类在飞作业自动合并。
                 let _ = schedule_receive_prekey_job(
                     &prekey_job_tx,
@@ -10875,6 +10882,7 @@ async fn serve_account_stream(
                     tokio::time::sleep_until(at).await;
                 }
             }, if quick_at.is_some() => {
+                last_branch_at.set(Some(std::time::Instant::now()));
                 let now = prekey::now_ms();
                 if prekey::quick_check_due(quick_last_ms, now) {
                     // S2a 打点：快速巡检触发源计数（时间拍）。
@@ -10902,11 +10910,13 @@ async fn serve_account_stream(
                     tokio::time::sleep_until(at).await;
                 }
             }, if receipts.due_at().is_some() => {
+                last_branch_at.set(Some(std::time::Instant::now()));
                 if let Some(batch) = receipts.take_ready() {
                     delivery_receipt::spawn_delivery_receipt_flush(service, number, batch);
                 }
             }
             item = stream.next() => {
+                last_branch_at.set(Some(std::time::Instant::now()));
                 // S2a 打点：信封级到达起点（ack 前逐臂落 RECEIVE_ENVELOPE）。
                 let envelope_started = std::time::Instant::now();
                 // 只读延迟探针：帧进入传输栈的本地时刻 → 本处理点的差值。
