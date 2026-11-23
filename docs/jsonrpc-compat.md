@@ -6,7 +6,18 @@
 自带 fake 服务直驱引擎，不经该夹具）
 
 本文件逐方法列出引擎对外暴露的 signal-cli JSON-RPC 兼容子集的参数/返回/错误码
-与对齐状态。**兼容层封顶**：只覆盖 connector 实际驱动的白名单方法；上游新增
+与对齐状态。
+
+## 15. 文件支持的附件上行（Contract 1.299）
+
+普通 `send` 的 `attachments[]` 仍接受既有 `data:` Base64 URI；connector 的
+分块出站扩展另产生内部 `file:` URI。该 URI 只由 connector 创建，Engine 不接受
+任意公开文件路径 API：解析时要求绝对路径、无 `ParentDir`、regular file、
+`sizeBytes` 与实际大小一致且不超过 100 MiB，随后才进入既有上传预算与 CDN
+上传。`filename`、`contentType`、`caption`、voice/GIF/width/height 参数与 data URI
+同义；读取失败或大小漂移 fail-closed。此扩展不改变 Engine 方法名或消息
+DataMessage 形状。
+**兼容层封顶**：只覆盖 connector 实际驱动的白名单方法；上游新增
 方法不跟进；KT 新能力走独立扩展命名空间，不伪装成上游方法。
 
 ## 1. 启动契约

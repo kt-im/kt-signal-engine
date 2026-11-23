@@ -812,12 +812,15 @@ struct AttachmentMeta {
     dimensions: Option<(u32, u32)>,
     payload_offset: usize,
     payload_len: usize,
+    /// connector-owned file-backed payload; never a renderer-supplied path.
+    file_path: Option<PathBuf>,
+    declared_size: Option<u64>,
 }
 
 impl AttachmentMeta {
     /// 全局字节预算预留口径：payload 长度（解码字节上界）。
     fn decoded_upper_bound(&self) -> u64 {
-        self.payload_len as u64
+        self.declared_size.unwrap_or(self.payload_len as u64)
     }
 }
 
@@ -829,6 +832,9 @@ fn payload_exceeds_decoded_cap(payload_len: usize, max_bytes: usize) -> bool {
 }
 
 fn parse_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
+    if uri.starts_with("file:") {
+        return parse_file_attachment_meta(uri);
+    }
     let rest = uri.strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
     let payload_offset = uri.len().checked_sub(payload.len())?;
@@ -904,6 +910,86 @@ fn parse_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
         dimensions,
         payload_offset,
         payload_len: payload.len(),
+        file_path: None,
+        declared_size: None,
+    })
+}
+
+/// Internal connector-owned file URI:
+/// `file:<percent-path>;contentType=<mime>;sizeBytes=<n>[;filename=...]`.
+/// It is intentionally not a public path input: the connector emits only its
+/// deterministic outgoing staging files. The engine still verifies the regular
+/// file and exact size before reserving upload memory or reading bytes.
+fn parse_file_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
+    let rest = uri.strip_prefix("file:")?;
+    let mut parts = rest.split(';');
+    let path = percent_decode(parts.next()?)?;
+    let path_ref = Path::new(&path);
+    if !path_ref.is_absolute()
+        || path_ref
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let mut content_type = "application/octet-stream".to_owned();
+    let mut filename = None;
+    let mut caption = None;
+    let mut is_voice = false;
+    let mut is_gif = false;
+    let mut width = None;
+    let mut height = None;
+    let mut declared_size = None;
+    for param in parts {
+        if let Some(value) = param.strip_prefix("contentType=") {
+            content_type = percent_decode(value)?;
+        } else if let Some(value) = param.strip_prefix("filename=") {
+            filename = Some(percent_decode(value)?);
+        } else if let Some(value) = param.strip_prefix("caption=") {
+            let decoded = percent_decode(value)?;
+            if decoded.is_empty() || decoded.len() > 65_536 {
+                return None;
+            }
+            caption = Some(decoded);
+        } else if param.eq_ignore_ascii_case("voice") || param == "voice=true" {
+            is_voice = true;
+        } else if param.eq_ignore_ascii_case("gif") || param == "gif=true" {
+            is_gif = true;
+        } else if let Some(value) = param.strip_prefix("width=") {
+            width = Some(parse_outgoing_dimension(value)?);
+        } else if let Some(value) = param.strip_prefix("height=") {
+            height = Some(parse_outgoing_dimension(value)?);
+        } else if let Some(value) = param.strip_prefix("sizeBytes=") {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            declared_size = Some(value.parse::<u64>().ok()?);
+        }
+    }
+    let size = declared_size?;
+    if size == 0 || size > ATTACHMENT_MAX_BYTES as u64 {
+        return None;
+    }
+    let metadata = std::fs::metadata(path_ref).ok()?;
+    if !metadata.is_file() || metadata.len() != size {
+        return None;
+    }
+    let dimensions = match (width, height) {
+        (None, None) => None,
+        (Some(width), Some(height)) => Some((width, height)),
+        _ => return None,
+    };
+    Some(AttachmentMeta {
+        content_type,
+        filename,
+        caption,
+        is_voice,
+        is_gif,
+        dimensions,
+        payload_offset: 0,
+        payload_len: size as usize,
+        file_path: Some(path_ref.to_path_buf()),
+        declared_size: Some(size),
     })
 }
 
@@ -923,13 +1009,21 @@ fn parse_outgoing_dimension(value: &str) -> Option<u32> {
 /// 第二段：真正 base64 decode（调用方已持有全局闸租约并在 decode 前按
 /// payload 上界预留）。坏 base64 / 解码后超单条上限一律 None（fail-closed）。
 fn decode_attachment(uri: &str, meta: &AttachmentMeta) -> Option<ParsedAttachment> {
-    let end = meta.payload_offset.checked_add(meta.payload_len)?;
-    let payload = uri.get(meta.payload_offset..end)?;
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(payload)
-        .ok()?;
-    if bytes.len() > ATTACHMENT_MAX_BYTES {
+    let bytes = if let Some(path) = meta.file_path.as_ref() {
+        std::fs::read(path).ok()?
+    } else {
+        let end = meta.payload_offset.checked_add(meta.payload_len)?;
+        let payload = uri.get(meta.payload_offset..end)?;
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .ok()?
+    };
+    if bytes.len() > ATTACHMENT_MAX_BYTES
+        || meta
+            .declared_size
+            .is_some_and(|size| size != bytes.len() as u64)
+    {
         return None;
     }
     Some(ParsedAttachment {
@@ -18368,6 +18462,26 @@ mod tests {
         none("data:text/plain,aGVsbG8=");
         none("data:text/plain;filename=%zz;base64,aGVsbG8=");
         none("data:text/plain;base64,not@base64!");
+    }
+
+    #[test]
+    fn attachment_file_uri_reads_only_the_declared_regular_file() {
+        let root = sweep_sandbox("file-uri");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.bin");
+        std::fs::write(&path, b"hello").unwrap();
+        let uri = format!(
+            "file:{};contentType=text%2Fplain;sizeBytes=5;filename=large.bin",
+            path.display()
+        );
+        let parsed = parse_attachment_data_uri(&uri).expect("file URI parses");
+        assert_eq!(parsed.bytes, b"hello");
+        assert_eq!(parsed.spec.content_type, "text/plain");
+        assert_eq!(parsed.spec.file_name.as_deref(), Some("large.bin"));
+        assert_eq!(parsed.spec.length, 5);
+        assert!(parse_attachment_data_uri(&uri.replace("sizeBytes=5", "sizeBytes=4")).is_none());
+        assert!(parse_attachment_data_uri("file:relative.bin;sizeBytes=5").is_none());
+        assert!(parse_attachment_data_uri(&uri.replace("large.bin", "missing.bin")).is_none());
     }
 
     #[test]
