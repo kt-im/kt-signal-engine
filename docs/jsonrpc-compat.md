@@ -6642,6 +6642,22 @@ hasMember 缺席=对方 GSE 缓存陈旧、access key 缺席=profile 面）。
 wire 面：零变化（纯探针 + 测试 + 文档；vendored cipher.rs 探针补丁行为
 同构——Err 臂先打点后按原 `?` 传播）。
 
+### 群发送逐收件人并发批（2026-11-23，官方对齐【engine-compat】）
+
+官方 MRM 主路径是单次 `sendMulti`，服务端扇出；只有 SKDM 与 legacy
+fallback 需要逐收件人发送。官方 `sendMessageProto` 为每个 serviceId 独立
+排队并发，旧引擎这两处均为串行 await。收敛契约：
+
+- MRM 主请求、加密与 GSE 语义不变；SKDM 的 `aci_store` 准备仍串行，
+  网络发送按 recipient 并发；legacy fallback 以 `MessageSender::clone`
+  共享 websocket 与带同步语义的 protocol store 并发执行。
+- 并发上限 8（`SEND_FANOUT_CONCURRENCY`），防止大群同时制造无界请求；
+  结果按原 recipient 顺序恢复，错误独立结算，self transcript 仍仅生成一次。
+- 不新增自动重试，不改变 `SendMessageResult`、unknown-outcome 或 connector
+  wire；mismatched/stale/challenge 修复仍在各 recipient 自己的 sender 内完成。
+- 测试钉定：同批实际并发 >1、活动任务 ≤8、结果保序、单成员失败不影响
+  其他成员；既有 MRM/fallback/转录全套回归。
+
 ### admin 写面批 B-24（2026-10-18，官方对齐 Signal-Desktop abe80d3，wire additive【engine-compat】）
 
 施工单 B-24（CONSTRUCTION-ADDENDUM-20261017 行 262：引擎管理员写面 +

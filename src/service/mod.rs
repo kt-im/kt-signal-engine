@@ -10452,7 +10452,7 @@ async fn serve_account_stream(
                     ReceivePrekeyJob::Maintenance => {
                         if tokio::time::timeout(
                             RECEIVE_SIDE_TIMEOUT,
-                            prekey::maintenance_tick(&mut *manager),
+                            prekey::maintenance_tick(&mut manager),
                         )
                         .await
                         .is_err()
@@ -10479,7 +10479,7 @@ async fn serve_account_stream(
                         };
                         if tokio::time::timeout(
                             RECEIVE_SIDE_TIMEOUT,
-                            prekey::quick_check(&mut *manager),
+                            prekey::quick_check(&mut manager),
                         )
                         .await
                         .is_err()
@@ -10533,7 +10533,7 @@ async fn serve_account_stream(
         // arm only retries a failed early send.
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut manager = manager.lock().await;
-            send_initial_sync_requests(&mut *manager).await
+            send_initial_sync_requests(&mut manager).await
         })
         .await
         .unwrap_or(false)
@@ -10642,7 +10642,7 @@ async fn serve_account_stream(
                     if !early_sync_sent {
                         let _ = tokio::time::timeout(
                             Duration::from_secs(5),
-                            send_initial_sync_requests(&mut *manager),
+                            send_initial_sync_requests(&mut manager),
                         )
                         .await;
                     }
@@ -10660,7 +10660,7 @@ async fn serve_account_stream(
                     // 未落、下轮臂即重试。
                     if tokio::time::timeout(
                         RECEIVE_JOB_TIMEOUT,
-                        aep::ensure_aep(&mut *manager, number),
+                        aep::ensure_aep(&mut manager, number),
                     )
                     .await
                     .is_err()
@@ -11103,7 +11103,7 @@ async fn serve_account_stream(
                     if let Some(failure) = failure {
                         if tokio::time::timeout(RECEIVE_CONNECT_TIMEOUT, async {
                             let mut manager = manager.lock().await;
-                            derm_handle(&mut *manager, sender, failure, derm_guard).await
+                            derm_handle(&mut manager, sender, failure, derm_guard).await
                         })
                         .await
                         .is_err()
