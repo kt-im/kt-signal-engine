@@ -10203,6 +10203,74 @@ where
 /// 65s）。它已在独立任务里运行，不阻塞收流；120s 只用于防止任务永久悬挂。
 const RECEIVE_JOB_TIMEOUT: Duration = Duration::from_secs(120);
 
+const RECEIVE_PREKEY_MAINTENANCE_BIT: u8 = 1 << 0;
+const RECEIVE_PREKEY_QUICK_BIT: u8 = 1 << 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceivePrekeyJob {
+    Maintenance,
+    QuickTime,
+    QuickVolume,
+}
+
+impl ReceivePrekeyJob {
+    const fn pending_bit(self) -> u8 {
+        match self {
+            Self::Maintenance => RECEIVE_PREKEY_MAINTENANCE_BIT,
+            Self::QuickTime | Self::QuickVolume => RECEIVE_PREKEY_QUICK_BIT,
+        }
+    }
+}
+
+/// 流级 worker 生命周期：任何 StreamOutcome 返回路径都在 Drop 时同步 abort，
+/// 旧 Manager/store 不得随 detached 维护任务跨重连存活。
+struct ReceivePrekeyWorkerGuard {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ReceivePrekeyWorkerGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn receive_prekey_worker_exit_reason(result: &Result<(), tokio::task::JoinError>) -> &'static str {
+    match result {
+        Ok(()) => "exited",
+        Err(error) if error.is_panic() => "panicked",
+        Err(error) if error.is_cancelled() => "cancelled",
+        Err(_) => "failed",
+    }
+}
+
+/// 同类维护/快检在排队或执行中合并；发送失败（worker 已停）必须清位，
+/// 否则后续计时簿会永远以为仍有活作业。
+fn schedule_receive_prekey_job(
+    sender: &tokio::sync::mpsc::UnboundedSender<ReceivePrekeyJob>,
+    pending: &std::sync::atomic::AtomicU8,
+    job: ReceivePrekeyJob,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let bit = job.pending_bit();
+    if pending.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+        return false;
+    }
+    if sender.send(job).is_err() {
+        pending.fetch_and(!bit, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+/// 只有达到量阈值才清账；旧实现每封都 replace(..., 0)，200 阈值不可达。
+fn take_receive_prekey_volume_due(seen: &mut u64) -> bool {
+    if !prekey::quick_check_volume_due(*seen) {
+        return false;
+    }
+    *seen = 0;
+    true
+}
+
 /// 建流失败返回 Recoverable（退避步进）；流建立后结束（对端断/关停/流
 /// 排空）返回 Connected（连接成功 → 退避 reset，官方 BackOff.reset 同
 /// 语义）；建流遇服务端 401 凭据拒绝（vendored
@@ -10364,6 +10432,72 @@ async fn serve_account_stream(
                 return StreamOutcome::Recoverable;
             }
         };
+    // receive_messages 返回的 stream 独立于 Manager。SqliteStore clone 共享
+    // 同一 sqlx pool/identity-change 账，普通投影无需等待 Manager 维护锁。
+    let receive_store = manager.store().clone();
+    // 后续 sync/prekey 共用一把本线程异步锁；worker 持久跨信封存活。
+    let manager = Arc::new(tokio::sync::Mutex::new(manager));
+    let (prekey_job_tx, mut prekey_job_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ReceivePrekeyJob>();
+    let prekey_pending = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let worker_manager = Arc::clone(&manager);
+    let worker_pending = Arc::clone(&prekey_pending);
+    let worker_account_hash = account_hash.clone();
+    let worker_task = tokio::task::spawn_local(async move {
+        while let Some(job) = prekey_job_rx.recv().await {
+            let pending_bit = job.pending_bit();
+            {
+                let mut manager = worker_manager.lock().await;
+                match job {
+                    ReceivePrekeyJob::Maintenance => {
+                        if tokio::time::timeout(
+                            RECEIVE_SIDE_TIMEOUT,
+                            prekey::maintenance_tick(&mut *manager),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!(
+                                target: "engine.receive",
+                                stage = "prekey_maintenance_timeout",
+                                account = %worker_account_hash,
+                                "prekey maintenance timed out; receive loop remains live"
+                            );
+                        }
+                    }
+                    ReceivePrekeyJob::QuickTime | ReceivePrekeyJob::QuickVolume => {
+                        let (stage, message) = if job == ReceivePrekeyJob::QuickTime {
+                            (
+                                "prekey_quick_check_timeout",
+                                "prekey quick check timed out; receive loop remains live",
+                            )
+                        } else {
+                            (
+                                "prekey_quick_check_volume_timeout",
+                                "prekey quick check timed out; receive loop remains live",
+                            )
+                        };
+                        if tokio::time::timeout(
+                            RECEIVE_SIDE_TIMEOUT,
+                            prekey::quick_check(&mut *manager),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!(
+                                target: "engine.receive",
+                                stage = stage,
+                                account = %worker_account_hash,
+                                "{message}"
+                            );
+                        }
+                    }
+                }
+            }
+            worker_pending.fetch_and(!pending_bit, std::sync::atomic::Ordering::AcqRel);
+        }
+    });
+    let mut _prekey_worker_guard = ReceivePrekeyWorkerGuard { task: worker_task };
     // 建流成功证据行：旧实现成功路径零日志，排障只能靠 profile refresh
     // 等间接信号推测接收是否起来。每条新流恰一行（重连风暴由退避限速）。
     tracing::warn!(
@@ -10397,10 +10531,10 @@ async fn serve_account_stream(
         // Never hold the receive loop on a slow sync-request send. Official
         // sends the three requests exactly once per auth socket; the deferred
         // arm only retries a failed early send.
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            send_initial_sync_requests(&mut manager),
-        )
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut manager = manager.lock().await;
+            send_initial_sync_requests(&mut *manager).await
+        })
         .await
         .unwrap_or(false)
     } else {
@@ -10478,9 +10612,24 @@ async fn serve_account_stream(
         last_iter_at = std::time::Instant::now();
         tokio::select! {
             _ = shutdown.changed() => return StreamOutcome::Connected,
+            worker_result = &mut _prekey_worker_guard.task => {
+                // sender 存活期间 worker 不应自然退出；panic/异常一律回监督重连，
+                // 不保留带陈旧 pending bit 的半活接收管线。
+                let reason = receive_prekey_worker_exit_reason(&worker_result);
+                tracing::warn!(
+                    target: "engine.receive",
+                    stage = "prekey_worker_exit",
+                    account = %account_hash,
+                    reason,
+                    "prekey worker exited unexpectedly; restarting receive stream"
+                );
+                return StreamOutcome::Recoverable;
+            }
             _ = async {
                 if let Some(at) = sync_pending {
                     tokio::time::sleep_until(at).await;
+                    // 与 prekey worker 共用 Manager；锁等待不阻塞 stream.next()。
+                    let mut manager = manager.lock().await;
                     // 链接完成 sync 上行三请求（P15c 项4）：官方
                     // sendSyncRequests 同位——成功/失败都不重试（一次性
                     // 纪律，下次链路建立再补）。
@@ -10488,7 +10637,7 @@ async fn serve_account_stream(
                     if !early_sync_sent {
                         let _ = tokio::time::timeout(
                             Duration::from_secs(5),
-                            send_initial_sync_requests(&mut manager),
+                            send_initial_sync_requests(&mut *manager),
                         )
                         .await;
                     }
@@ -10506,7 +10655,7 @@ async fn serve_account_stream(
                     // 未落、下轮臂即重试。
                     if tokio::time::timeout(
                         RECEIVE_JOB_TIMEOUT,
-                        aep::ensure_aep(&mut manager, number),
+                        aep::ensure_aep(&mut *manager, number),
                     )
                     .await
                     .is_err()
@@ -10708,23 +10857,12 @@ async fn serve_account_stream(
                     tokio::time::sleep_until(at).await;
                 }
             }, if maint_at.is_some() => {
-                // 下一拍固定 +2 天（tick 内书签判到期，短拍只做本地判定）。
-                // manager 调用放臂体：select 其他 future 已弃，借用不冲突。
-                // 30s 硬上限：网络维护不许挂死收流。
-                if tokio::time::timeout(
-                    RECEIVE_SIDE_TIMEOUT,
-                    prekey::maintenance_tick(&mut manager),
-                )
-                .await
-                .is_err()
-                {
-                    tracing::warn!(
-                        target: "engine.receive",
-                        stage = "prekey_maintenance_timeout",
-                        account = %account_hash,
-                        "prekey maintenance timed out; returning to receive loop"
-                    );
-                }
+                // 只投递，网络维护由流级 worker 执行；同类在飞作业自动合并。
+                let _ = schedule_receive_prekey_job(
+                    &prekey_job_tx,
+                    &prekey_pending,
+                    ReceivePrekeyJob::Maintenance,
+                );
                 maint_at = Some(
                     tokio::time::Instant::now()
                         + Duration::from_millis(prekey::MAINTENANCE_INTERVAL_MS),
@@ -10741,23 +10879,16 @@ async fn serve_account_stream(
                 if prekey::quick_check_due(quick_last_ms, now) {
                     // S2a 打点：快速巡检触发源计数（时间拍）。
                     perf_metrics::add(perf_metrics::keys::PREKEY_QUICK_TIME_TRIGGER, 1);
-                    if tokio::time::timeout(
-                        RECEIVE_SIDE_TIMEOUT,
-                        prekey::quick_check(&mut manager),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        tracing::warn!(
-                            target: "engine.receive",
-                            stage = "prekey_quick_check_timeout",
-                            account = %account_hash,
-                            "prekey quick check timed out; returning to receive loop"
-                        );
+                    if schedule_receive_prekey_job(
+                        &prekey_job_tx,
+                        &prekey_pending,
+                        ReceivePrekeyJob::QuickTime,
+                    ) {
+                        // 新快检窗口从投递后开始；作业期间的信封归下一窗。
+                        quick_seen = 0;
                     }
                 }
                 quick_last_ms = Some(now);
-                quick_seen = 0;
                 quick_at = Some(
                     tokio::time::Instant::now()
                         + Duration::from_millis(prekey::PREKEY_QUICK_CHECK_INTERVAL_MS),
@@ -10960,10 +11091,10 @@ async fn serve_account_stream(
                         return StreamOutcome::StdioDead;
                     }
                     if let Some(failure) = failure {
-                        if tokio::time::timeout(
-                            RECEIVE_CONNECT_TIMEOUT,
-                            derm_handle(&mut manager, sender, failure, derm_guard),
-                        )
+                        if tokio::time::timeout(RECEIVE_CONNECT_TIMEOUT, async {
+                            let mut manager = manager.lock().await;
+                            derm_handle(&mut *manager, sender, failure, derm_guard).await
+                        })
                         .await
                         .is_err()
                         {
@@ -11110,7 +11241,7 @@ async fn serve_account_stream(
                     {
                         let notifications = project_content(
                             number,
-                            manager.store(),
+                            &receive_store,
                             &content,
                             &service.terminated_groups,
                             Some(service),
@@ -11208,7 +11339,7 @@ async fn serve_account_stream(
                     // ——sidecar 权威突变 + receive 事件投影，先于普通投影
                     // 面（该体在 project_content 恒空投影，零冲突）。
                     if let Some(notification) =
-                        project_verified_sync(number, manager.store(), &content, dir).await
+                        project_verified_sync(number, &receive_store, &content, dir).await
                     {
                         service.notify(number, notification).await;
                     }
@@ -11228,7 +11359,7 @@ async fn serve_account_stream(
                     for notification in
                         project_content(
                             number,
-                            manager.store(),
+                            &receive_store,
                             &content,
                             &service.terminated_groups,
                             Some(service),
@@ -11278,7 +11409,12 @@ async fn serve_account_stream(
                         // 不得重拨抢回已被新连接接管的槽。其余关闭/传输
                         // 失败回到 Fibonacci 重连。旧实现把 4409 当
                         // Connected 立即重连，会与被夺走的客户端互踢振荡。
-                        let close_code = manager.identified_websocket_close_code().await;
+                        // 先停旧 worker，避免 close 分类排在最长 30s prekey 网络调用后。
+                        _prekey_worker_guard.task.abort();
+                        let close_code = {
+                            let manager = manager.lock().await;
+                            manager.identified_websocket_close_code().await
+                        };
                         match classify_connection_close(close_code) {
                             ConnectionClose::Normal
                             | ConnectionClose::ConnectedElsewhere
@@ -11328,31 +11464,22 @@ async fn serve_account_stream(
                         }
                     }
                 }
-                // prekey 快速巡检量臂（P12/R4）：窗内 ≥200 信封即快速巡检
-                // 一次，计数与时间臂计时器同复位（含解密失败/重复投递——
-                // 服务器侧取信封同样消耗一次性 prekey）。
-                if prekey::quick_check_volume_due(std::mem::replace(&mut quick_seen, 0)) {
+                // prekey 快速巡检量臂（P12/R4）：累计 ≥200 信封才清账并
+                // 投递一次；含解密失败/重复投递，服务器取信封同样消耗 prekey。
+                if take_receive_prekey_volume_due(&mut quick_seen) {
                     // S2a 打点：快速巡检触发源计数（量拍）。
                     perf_metrics::add(perf_metrics::keys::PREKEY_QUICK_VOLUME_TRIGGER, 1);
-                    if tokio::time::timeout(
-                        RECEIVE_SIDE_TIMEOUT,
-                        prekey::quick_check(&mut manager),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        tracing::warn!(
-                            target: "engine.receive",
-                            stage = "prekey_quick_check_volume_timeout",
-                            account = %account_hash,
-                            "prekey quick check timed out; returning to receive loop"
+                    if schedule_receive_prekey_job(
+                        &prekey_job_tx,
+                        &prekey_pending,
+                        ReceivePrekeyJob::QuickVolume,
+                    ) {
+                        quick_last_ms = Some(prekey::now_ms());
+                        quick_at = Some(
+                            tokio::time::Instant::now()
+                                + Duration::from_millis(prekey::PREKEY_QUICK_CHECK_INTERVAL_MS),
                         );
                     }
-                    quick_last_ms = Some(prekey::now_ms());
-                    quick_at = Some(
-                        tokio::time::Instant::now()
-                            + Duration::from_millis(prekey::PREKEY_QUICK_CHECK_INTERVAL_MS),
-                    );
                 }
             }
         }
@@ -17541,6 +17668,110 @@ mod tests {
 
         let empty = typing_outcome_group(async { Err(SendError::NoRecipients) }).await;
         assert!(matches!(empty, Err(SendError::NoRecipients)));
+    }
+
+    #[test]
+    fn receive_prekey_volume_gate_accumulates_until_two_hundred() {
+        let mut seen = 0_u64;
+        for _ in 0..199 {
+            seen += 1;
+            assert!(!take_receive_prekey_volume_due(&mut seen));
+        }
+        assert_eq!(seen, 199);
+        seen += 1;
+        assert!(take_receive_prekey_volume_due(&mut seen));
+        assert_eq!(seen, 0);
+        assert!(!take_receive_prekey_volume_due(&mut seen));
+    }
+
+    #[test]
+    fn receive_prekey_jobs_coalesce_by_kind_and_clear_failed_send() {
+        use std::sync::atomic::Ordering;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pending = std::sync::atomic::AtomicU8::new(0);
+        assert!(schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::Maintenance
+        ));
+        assert!(!schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::Maintenance
+        ));
+        assert!(schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::QuickTime
+        ));
+        assert!(!schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::QuickVolume
+        ));
+        assert_eq!(rx.try_recv(), Ok(ReceivePrekeyJob::Maintenance));
+        assert_eq!(rx.try_recv(), Ok(ReceivePrekeyJob::QuickTime));
+
+        // 维护完成只清维护位，不清仍在飞的快检位。
+        pending.fetch_and(!RECEIVE_PREKEY_MAINTENANCE_BIT, Ordering::AcqRel);
+        assert!(schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::Maintenance
+        ));
+        assert!(!schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::QuickVolume
+        ));
+
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(dead_rx);
+        let dead_pending = std::sync::atomic::AtomicU8::new(0);
+        assert!(!schedule_receive_prekey_job(
+            &dead_tx,
+            &dead_pending,
+            ReceivePrekeyJob::QuickTime
+        ));
+        assert_eq!(dead_pending.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_prekey_worker_guard_aborts_detached_work() {
+        struct CancelProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let probe = CancelProbe(std::sync::Arc::clone(&cancelled));
+                let task = tokio::task::spawn_local(async move {
+                    let _probe = probe;
+                    std::future::pending::<()>().await;
+                });
+                drop(ReceivePrekeyWorkerGuard { task });
+                tokio::task::yield_now().await;
+                assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_prekey_worker_panic_is_classified_for_reconnect() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let task = tokio::task::spawn_local(async {
+                    panic!("receive worker panic probe");
+                });
+                let result = task.await;
+                assert_eq!(receive_prekey_worker_exit_reason(&result), "panicked");
+            })
+            .await;
     }
 
     /// lookupOutgoingDispatch 纯函数核（compat §5 unknown 出站行引擎真相
