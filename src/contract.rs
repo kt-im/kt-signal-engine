@@ -27,6 +27,10 @@
 /// 契约 1.285 落地。
 pub(crate) const CONTRACT_REVISION: &str = "1.285";
 
+/// Desktop host API required by the release catalog. Read by release.yml.
+#[allow(dead_code)]
+pub(crate) const DESKTOP_API_VERSION: &str = "1.0";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,8 +54,19 @@ mod tests {
     #[test]
     fn contract_revision_is_the_pinned_shared_number() {
         assert_eq!(CONTRACT_REVISION, "1.285");
+        assert_eq!(DESKTOP_API_VERSION, "1.0");
         let parsed = parse(CONTRACT_REVISION);
         assert_eq!(parsed, (1, 285, 0));
+    }
+
+    #[test]
+    fn release_catalog_derives_contract_metadata_from_these_constants() {
+        let workflow = include_str!("../.github/workflows/release.yml");
+        assert!(!workflow.contains("\"min\": \"1.92\""));
+        assert!(workflow.contains("rust_constant('src/contract.rs', 'CONTRACT_REVISION')"));
+        assert!(workflow.contains("rust_constant('src/contract.rs', 'DESKTOP_API_VERSION')"));
+        assert!(workflow.contains("engine['engineContractRevision'] ="));
+        assert!(workflow.contains("engine['desktopApiVersion'] ="));
     }
 
     /// 与 connector 当前支持区间对齐（connector
