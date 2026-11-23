@@ -7371,3 +7371,17 @@ KT 独立扩展：桌面把 PNI 键会话归并到 ACI 需要该映射，connect
   空串折缺席）；既有 contacts sync 投影测试改空 map 臂，语义零变化。
 - **门禁**：`cargo fmt` / `cargo clippy --all-targets -- -D warnings` /
   `cargo test` 全绿。
+
+### 普通附件逐条 caption（2026-11-22，wire additive，engine-compat）
+
+普通附件 data URI 在既有 filename/voice/gif/width/height 参数之外增
+`;caption=<percent-encoded>`。caption 是附件级事实，与 DataMessage.body 及
+story 的 sendStory.caption 参数分离；解析后写入同位置 AttachmentSpec.caption，
+经既有 presage 上传原语落到 AttachmentPointer.caption=11。编码逆运算复用
+filename 的 percent_decode；空串、坏 percent、非 UTF-8、超 65536 UTF-8 字节均
+整条形状拒绝。无参数的既有普通请求形状不变。Story 与头像只接受各自专属参数：Story
+缺省 caption 时清除 URI 值，显式 caption 覆盖首条媒体附件；头像/预览图统一
+清除 URI caption。viewOnce 在上传前及指针构造面双重拒绝任何附件 caption。
+
+验收：单条/多条按位置往返，CJK 与分隔符安全，坏编码/空串/超帽 fail-closed，
+既有解析/上传测试零回归。
