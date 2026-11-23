@@ -5922,16 +5922,16 @@ mod tests {
     }
 
     /// typing 让路批（2026-11-23）：TypingDropped 错误面 = -32603 + 固定
-    /// 原文（锚词 `(TypingDroppedException)` 全词在）；结局类 = 确定
-    /// 未送达（is_definite_failure=true，预算 cancel 时请求未发出 wire）。
+    /// 原文（锚词 `(TypingDroppedException)` 全词在）；cancel 可能发生在
+    /// 已写出等响应期，结局保守记未知，绝不进入自动快速重试。
     #[test]
-    fn typing_dropped_face_shape_and_definite_outcome() {
+    fn typing_dropped_face_shape_and_unknown_outcome() {
         let (code, message) = send_error_face(&crate::service::SendError::TypingDropped);
         assert_eq!(code, -32603);
         assert_eq!(message, TYPING_DROPPED_MESSAGE);
         assert!(message.contains("(TypingDroppedException)"));
         assert!(message.starts_with("Failed to send message: "));
-        assert!(crate::service::SendError::TypingDropped.is_definite_failure());
+        assert!(!crate::service::SendError::TypingDropped.is_definite_failure());
     }
 
     /// 群腿零收件人防御面（2026-10-16 批）：`NoRecipients` 错误面 =

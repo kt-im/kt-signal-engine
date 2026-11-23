@@ -1364,11 +1364,13 @@ pub(crate) enum SendError {
     /// 无感知），不应与真实发送争抢每账号发送管理器锁——预算内未完成
     /// 即整帧放弃。锁被真实发送/self 转录腿占用期间（含 ws 等响应期）
     /// typing 直接让路，真实消息不再被 best-effort 帧拖进 15-30s 锁等待。
-    /// 请求未发出 wire（超时发生在取锁/探测/发送任一段，future 已被
-    /// cancel——预算内已完成发送的臂不会走到这里），结局按未送达记；
-    /// 错误面 -32603 + 固定原文（锚词 TypingDroppedException，connector
-    /// 未认领 → 折叠通用 upstream，桌面 typing 面本来就是 best-effort
-    /// catch 吞掉，UI 零感知）。
+    /// 超时可能发生在取锁前，也可能发生在任一收件人的请求已写出、等
+    /// 响应阶段；多收件人串行发送还允许前者已成功、后者在途。cancel
+    /// 只停止本地等待，绝不构成未上 wire 的证明——结局统一保守记
+    /// unknown，绝不自动重试（typing 无转录、无消息行，宿主本来也不
+    /// 重试）。错误面 -32603 + 固定原文（锚词 TypingDroppedException，
+    /// connector 未认领 → 折叠通用 upstream，桌面 typing 面本来就是
+    /// best-effort catch 吞掉，UI 零感知）。
     TypingDropped,
     /// 群态取回解码类失败重试耗尽（接收完整性批②：群 update/sync 信封
     /// 触发的群 fetch/decrypt 在 vendored 重试环内重试 1 次后仍败，结构化
@@ -1412,7 +1414,6 @@ impl SendError {
                 | SendError::AttachmentUpload
                 | SendError::AttachmentBusy
                 | SendError::NoRecipients
-                | SendError::TypingDropped
         )
     }
 }
@@ -1877,42 +1878,51 @@ const WHITELIST_CACHE_TTL: Duration = Duration::from_millis(whitelist_store::FRE
 
 /// typing 群腿让路包装（2026-11-23 typing 让路批单点）：群腿 outcome 是
 /// TypingGroupSendOutcome（三态显形面）而非 Result<(), _>，独立单点；
-/// 预算耗尽 cancel 整个发送 future 并落 TypingDropped（折叠 Err 臂由
-/// methods.rs dispatch 的 Err(error) => send_error 单点承接，wire 形状
-/// 与直聊腿 TypingDropped 面逐字一致）。
+/// 预算耗尽 cancel 整个发送 future 并落 TypingDropped（结局未知；折叠
+/// Err 臂由 methods.rs dispatch 的 Err(error) => send_error 单点承接，
+/// wire 形状与直聊腿 TypingDropped 面逐字一致）。
 async fn typing_outcome_group<F>(send: F) -> Result<TypingGroupSendOutcome, SendError>
 where
     F: std::future::Future<Output = Result<TypingGroupSendOutcome, SendError>>,
 {
-    match tokio::time::timeout(TYPING_SEND_BUDGET, send).await {
+    match tokio::time::timeout(TYPING_GROUP_SEND_BUDGET, send).await {
         Ok(outcome) => outcome,
         Err(_) => Err(SendError::TypingDropped),
     }
 }
 
-/// typing 让路包装（2026-11-23 typing 让路批单点）：预算内正常返回
-/// outcome；预算耗尽 cancel 整个发送 future 并落 TypingDropped。抽成
-/// 泛型单点便于单测钉定「超时确实取消 future」与「正常路径零变化」
-/// （respond_with_budget 同款纪律）。两条 typing 腿共用。
-async fn typing_send_with_budget<F>(send: F) -> Result<(), SendError>
+/// typing 直聊腿让路包装（2026-11-23 typing 让路批单点）：预算内正常
+/// 返回 outcome；预算耗尽 cancel 整个发送 future 并落 TypingDropped。
+/// 抽成泛型单点便于单测钉定「超时确实取消 future」与「正常路径零
+/// 变化」（respond_with_budget 同款纪律）。预算由收件人数有界计算。
+async fn typing_send_with_budget<F>(send: F, budget: Duration) -> Result<(), SendError>
 where
     F: std::future::Future<Output = Result<(), SendError>>,
 {
-    match tokio::time::timeout(TYPING_SEND_BUDGET, send).await {
+    match tokio::time::timeout(budget, send).await {
         Ok(outcome) => outcome,
         Err(_) => Err(SendError::TypingDropped),
     }
 }
 
-/// typing 发送整体预算（2026-11-23 typing 让路批）：直聊/群两条 typing
-/// 腿的完整发送路径（store 打开 + 发送管理器锁等待 + 群腿 terminated
-/// 探测 + ws 往返）统一上限。typing 是 best-effort 帧（TypingMessage 无
-/// Sent 转录槽位，官方语义丢一帧无感知），锁被真实消息/self 转录腿
-/// 占用期间（含 ws 等响应期，实测一帧可占满 30s WsTimeout）超预算
-/// 即让路（TypingDropped）。取值依据：健康 ws RTT 实测 230-450ms
-/// （engine.ws 探针），500ms 覆盖正常路径并把让路窗压在用户无感
-/// 档；对端显示端 6s 容忍度而言一帧 typing 的丢弃完全不可见。
-const TYPING_SEND_BUDGET: Duration = Duration::from_millis(500);
+/// typing 每收件人预算（2026-11-23 typing 让路批）：健康单收件人 ws RTT
+/// 实测 230-450ms（engine.ws 探针），500ms 覆盖正常单腿并把让路窗压
+/// 在用户无感档。直聊多收件人逐串行发送，按人数放大、最多四人份；
+/// 超过四人仍让路是明确的 best-effort 取舍，绝不退回 30s 锁占用。
+const TYPING_RECIPIENT_SEND_BUDGET: Duration = Duration::from_millis(500);
+const TYPING_DIRECT_MAX_RECIPIENT_BUDGETS: usize = 4;
+
+/// 群 typing 总预算（复审修订）：vendored 群发送逐成员串行，不能拿
+/// 1:1 的 500ms 推广到整个群批。2s 覆盖小群健康路径；大群/慢网下
+/// typing 可能让路（官方 typing 本来 fire-and-forget），以最差 2s
+/// 锁占用替换旧 30s 饿死。群腿三态显形面只在预算内返回，超时不
+/// 把部分成功伪报全批失败。
+const TYPING_GROUP_SEND_BUDGET: Duration = Duration::from_millis(2_000);
+
+fn typing_direct_send_budget(recipient_count: usize) -> Duration {
+    let budgets = recipient_count.clamp(1, TYPING_DIRECT_MAX_RECIPIENT_BUDGETS) as u32;
+    TYPING_RECIPIENT_SEND_BUDGET.saturating_mul(budgets)
+}
 
 /// whitelist 读面来源（探针 `engine.whitelist` 段 cache= 固定词表）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5882,11 +5892,11 @@ impl Service {
         // typing 让路批（2026-11-23）：typing 是 best-effort 帧（TypingMessage
         // 无 Sent 转录槽位，官方语义丢一帧无感知），绝不应与真实发送争抢
         // 每账号发送管理器锁。整个发送路径（store 打开 + 锁等待 + ws 往返）
-        // 套 TYPING_SEND_BUDGET：锁被真实消息/self 转录腿占用（含 ws 等
-        // 响应期，实测一帧可占满 30s WsTimeout）期间 typing 直接让路
-        // （TypingDropped），真实消息不再被拖进 15-30s 锁排队。超时臂
-        // cancel 整个 future——已完成的发送臂不会走到这里，结局按未
-        // 送达记（is_definite_failure=true）。预算内的正常路径零变化。
+        // 套按收件人数有界放大的直聊预算：锁被真实消息/self 转录腿占用
+        // （含 ws 等响应期，实测一帧可占满 30s WsTimeout）期间 typing 让路
+        // （TypingDropped），真实消息不再被拖进 15-30s 锁排队。超时臂 cancel
+        // 只停止本地等待；请求或前序收件人可能已发出，结局保守记未知，
+        // 绝不自动重试。预算内的正常路径零变化。
         let send = async {
             let shared = open_registered(self, account)
                 .await
@@ -5921,7 +5931,7 @@ impl Service {
             }
             Ok(())
         };
-        typing_send_with_budget(send).await
+        typing_send_with_budget(send, typing_direct_send_budget(recipients.len())).await
     }
 
     /// sendDeliveryReceipt/sendReadReceipt/sendViewedReceipt 公共面：官方
@@ -17451,19 +17461,23 @@ mod tests {
     use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage, Preview};
     use prost::Message as _;
 
-    /// typing 让路批（2026-11-23）：预算恒量钉定——500ms 覆盖健康
-    /// ws RTT（实测 230-450ms）同时把让路窗压在用户无感档；不为 0
-    /// （= 禁用 typing）也不放大到秒级（= 回归让路失效）。
+    /// typing 让路批（2026-11-23，复审修订）：单收件人 500ms；直聊
+    /// 多收件人按串行人数放大且四人份封顶；群腿独立 2s，不把 1:1
+    /// RTT 错当整个群批预算。
     #[test]
-    fn typing_send_budget_covers_rt_and_stays_imperceptible() {
-        assert_eq!(TYPING_SEND_BUDGET, Duration::from_millis(500));
+    fn typing_send_budget_scales_bounded_by_recipient_shape() {
+        assert_eq!(TYPING_RECIPIENT_SEND_BUDGET, Duration::from_millis(500));
+        assert_eq!(typing_direct_send_budget(0), Duration::from_millis(500));
+        assert_eq!(typing_direct_send_budget(1), Duration::from_millis(500));
+        assert_eq!(typing_direct_send_budget(2), Duration::from_millis(1_000));
+        assert_eq!(typing_direct_send_budget(4), Duration::from_millis(2_000));
+        assert_eq!(typing_direct_send_budget(99), Duration::from_millis(2_000));
+        assert_eq!(TYPING_GROUP_SEND_BUDGET, Duration::from_millis(2_000));
     }
 
-    /// typing 让路批（2026-11-23）：超时确实 cancel 发送 future 并落
-    /// TypingDropped（respond_with_budget 取消测试同款纪律——Drop 探针
-    /// 钉死 future 被 drop，不是等它自然完成）；预算内正常 outcome 原样
-    /// 返回零变化。
-    #[tokio::test]
+    /// typing 让路批：超时确实 cancel 发送 future 并落 TypingDropped
+    /// （Drop 探针只证明取消，不证明未上 wire；结局由变体保守记未知）。
+    #[tokio::test(start_paused = true)]
     async fn typing_send_budget_cancels_and_drops_on_deadline() {
         struct CancelProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
         impl Drop for CancelProbe {
@@ -17474,25 +17488,29 @@ mod tests {
 
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let probe = CancelProbe(std::sync::Arc::clone(&cancelled));
-        let outcome = typing_send_with_budget(async move {
-            let _probe = probe;
-            std::future::pending::<Result<(), SendError>>().await
-        })
+        let outcome = typing_send_with_budget(
+            async move {
+                let _probe = probe;
+                std::future::pending::<Result<(), SendError>>().await
+            },
+            typing_direct_send_budget(1),
+        )
         .await;
         assert!(matches!(outcome, Err(SendError::TypingDropped)));
+        assert!(!SendError::TypingDropped.is_definite_failure());
         assert!(
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
             "budget must drop (cancel) the typing send future"
         );
 
-        let ok = typing_send_with_budget(async { Ok(()) }).await;
+        let ok = typing_send_with_budget(async { Ok(()) }, typing_direct_send_budget(1)).await;
         assert!(ok.is_ok());
     }
 
-    /// typing 让路批（2026-11-23）：群腿 outcome 包装同纪律——超时落
-    /// TypingDropped（折叠 Err 由 dispatch 的 send_error 单点承接），
-    /// 预算内三态 outcome 原样返回。
-    #[tokio::test]
+    /// 群腿 outcome 包装：超时落 TypingDropped；预算内 Ok/AllFailed/
+    /// NoRecipients 原样保留。600ms 两成员量级延迟在 2s 内正常完成，
+    /// 防止回归把群批重新压进 500ms。
+    #[tokio::test(start_paused = true)]
     async fn typing_group_budget_drops_and_preserves_outcome() {
         let dropped = typing_outcome_group(async {
             std::future::pending::<Result<TypingGroupSendOutcome, SendError>>().await
@@ -17500,8 +17518,29 @@ mod tests {
         .await;
         assert!(matches!(dropped, Err(SendError::TypingDropped)));
 
-        let ok = typing_outcome_group(async { Ok(TypingGroupSendOutcome::Ok) }).await;
-        assert!(matches!(ok, Ok(TypingGroupSendOutcome::Ok)));
+        let delayed = typing_outcome_group(async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            Ok(TypingGroupSendOutcome::Ok)
+        })
+        .await;
+        assert!(matches!(delayed, Ok(TypingGroupSendOutcome::Ok)));
+
+        let all_failed = typing_outcome_group(async {
+            Ok(TypingGroupSendOutcome::AllFailed(vec![(
+                "NetworkFailure",
+                2,
+            )]))
+        })
+        .await;
+        match all_failed {
+            Ok(TypingGroupSendOutcome::AllFailed(words)) => {
+                assert_eq!(words, vec![("NetworkFailure", 2)]);
+            }
+            other => panic!("group all-failed outcome changed: {other:?}"),
+        }
+
+        let empty = typing_outcome_group(async { Err(SendError::NoRecipients) }).await;
+        assert!(matches!(empty, Err(SendError::NoRecipients)));
     }
 
     /// lookupOutgoingDispatch 纯函数核（compat §5 unknown 出站行引擎真相
@@ -17949,7 +17988,6 @@ mod tests {
             SendError::PreKey,
             SendError::SessionBuild,
             SendError::AttachmentUpload,
-            SendError::TypingDropped,
         ];
         for error in definite {
             assert!(error.is_definite_failure(), "{error:?} 应可快速重试");
@@ -17969,6 +18007,7 @@ mod tests {
             SendError::ServerUnavailable,
             SendError::IdentityUnverified,
             SendError::WsTimeout,
+            SendError::TypingDropped,
             SendError::Internal,
         ];
         for error in never {
