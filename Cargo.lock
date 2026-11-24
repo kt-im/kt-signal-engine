@@ -2090,6 +2090,7 @@ dependencies = [
  "url",
  "usernames",
  "uuid",
+ "windows-sys 0.61.2",
  "zkgroup",
 ]
 

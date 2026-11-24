@@ -165,6 +165,10 @@ jobs:
       - name: provider roundtrip (SQLCipher crypto really works)
         run: cargo test --release --test provider_roundtrip -- --nocapture
 
+      # 真实 Windows API 验证：不接受 macOS 上的路径/命令行夹具代替。
+      - name: Windows native disk free
+        run: cargo test --release windows_platform_disk_free_returns_positive -- --nocapture
+
       # M6 能力门回归（Windows）：同一门、同一判据（exit != 0）。依赖图与上一步
       # 完全一致——sqlcipher 是空 feature，不转发任何依赖特性，所以这一步的唯一
       # 失败点就是 crate 自身的 compile_error!。

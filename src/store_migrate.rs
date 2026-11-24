@@ -2188,32 +2188,22 @@ fn parse_df_available_kib(text: &str) -> Option<u64> {
 
 #[cfg(windows)]
 fn platform_disk_free(dir: &Path) -> io::Result<u64> {
-    let root = dir
-        .components()
-        .next()
-        .map(|component| component.as_os_str().to_owned());
-    let Some(root) = root else {
-        return Err(io::Error::other("no drive letter"));
-    };
-    let output = std::process::Command::new("fsutil")
-        .arg("volume")
-        .arg("diskfree")
-        .arg(root)
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other("fsutil exited unsuccessfully"));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_fsutil_free_bytes(&text)
-        .ok_or_else(|| io::Error::other("fsutil output has no free bytes"))
-}
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
-#[cfg(windows)]
-fn parse_fsutil_free_bytes(text: &str) -> Option<u64> {
-    text.lines()
-        .find(|line| line.contains("Total free bytes"))
-        .and_then(|line| line.split(':').nth(1))
-        .and_then(|value| value.trim().parse().ok())
+    // 不解析 fsutil：其实际输出含 `Total # of ...`、千分位且随系统语言变化，
+    // 旧实现会把正常 Windows 机器误判为预检失败。API 直接返回调用者可用字节，
+    // 同时正确计入配额限制，与 Connector 的磁盘余量口径一致。
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0_u64;
+    let mut total = 0_u64;
+    let mut available = 0_u64;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut available) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(free)
+    }
 }
 
 fn sidecar_path(store: &Path, suffix: &str) -> PathBuf {
@@ -3611,6 +3601,14 @@ mod tests {
         assert_eq!(parse_df_available_kib(sample), Some(12345678));
         assert_eq!(parse_df_available_kib(""), None);
         assert_eq!(parse_df_available_kib("Filesystem\n"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_platform_disk_free_returns_positive() {
+        let dir = std::env::temp_dir();
+        let free = platform_disk_free(&dir).expect("Windows 原生磁盘余量查询必须成功");
+        assert!(free > 0, "可用磁盘空间必须大于零");
     }
 
     /// VACUUM 之后的备份可用性闸：空文件 / 非明文头一律不算「备份成功」。
