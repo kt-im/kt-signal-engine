@@ -3978,6 +3978,7 @@ impl Service {
                 .accounts()
                 .iter()
                 .filter_map(|entry| entry.dir.clone())
+                .map(|dir| registered_store_dir_key(&dir))
                 .collect()
         };
         let sweep = sweep_orphan_store_dirs(&self.data_dir, &referenced);
@@ -4501,7 +4502,7 @@ impl Service {
             .strip_prefix(&self.data_dir)
             .unwrap_or(&record.store_dir)
             .to_string_lossy()
-            .to_string();
+            .replace('\\', "/");
         // P0 重链孤儿批（2026-10-23）：注册表按号码唯一，写入新 dir 的同时
         // 旧条目从表里消失。旧 store 目录随即成为「未登记目录」——启动清扫
         // 会把它移进 `_quarantine`，隔离区非空又让引擎 fail-closed，桌面看到
@@ -16967,6 +16968,12 @@ fn random_attempt_id() -> String {
     )
 }
 
+/// 注册表与启动清扫共享的相对路径键。Windows PathBuf 落盘为反斜杠，
+/// 必须统一成 `/` 再比较；同时用于新写入，避免继续制造混合形态。
+fn registered_store_dir_key(dir: &str) -> String {
+    dir.replace('\\', "/")
+}
+
 /// 启动清扫：未登记 `accounts/lk-*` 目录的处置（P0-B，2026-10-21）。
 ///
 /// 旧语义（ADR 0004）把未登记目录当垃圾直接 `remove_dir_all`；但
@@ -18401,6 +18408,22 @@ mod tests {
             crate::state::EngineState::load(&root).is_ok(),
             "隔离区非空 → 待决区 warn（QuarantinePending），不再拒启"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn windows_backslash_registered_store_dir_is_not_quarantined() {
+        let root = sweep_sandbox("windows-registered-store");
+        let accounts = root.join(ACCOUNTS_DIR);
+        write_store_file(&accounts, "lk-windows");
+        let referenced: HashSet<String> = [registered_store_dir_key("accounts\\lk-windows")]
+            .into_iter()
+            .collect();
+
+        let report = sweep_orphan_store_dirs_at(&root, &referenced, 1_700_000_001_000);
+
+        assert_eq!(report.quarantined, 0, "Windows 注册路径不得被当成孤儿");
+        assert!(accounts.join("lk-windows").join("store.db").is_file());
         let _ = std::fs::remove_dir_all(&root);
     }
 
