@@ -98,6 +98,12 @@ const ATTACHMENT_BUDGET_MESSAGE: &str =
 /// `(NoRecipientsException)`；群发送系与群 typing 共用，compat §3/§5）。
 const NO_RECIPIENTS_MESSAGE: &str =
     "Failed to send message: No recipients in group. (NoRecipientsException)";
+/// typing 发送预算耗尽让路面（2026-11-23 typing 让路批，wire 字面量
+/// 与锚词 `(TypingDroppedException)` 配套；connector 未认领该锚词 →
+/// 折叠通用 upstream，宿主 typing 面本来 best-effort 吞错，compat
+/// §3/§5）。
+const TYPING_DROPPED_MESSAGE: &str =
+    "Failed to send message: Typing indicator dropped for send priority. (TypingDroppedException)";
 
 pub(crate) enum Inbound {
     /// 原始帧字节（不先转 String：160MiB 帧帽下大附件帧的 UTF-8 副本
@@ -4141,6 +4147,47 @@ async fn dispatch(
                 .and_then(Value::as_u64)
                 .and_then(|seconds| u32::try_from(seconds).ok());
             let title = params.get("title").and_then(Value::as_str);
+            // §4.287 五写臂参数提取（description/promote/demote/ban/unban）。
+            let description = match params.get("description") {
+                None => None,
+                Some(Value::String(text)) => Some(text.clone()),
+                Some(_) => return internal_error(id),
+            };
+            let parse_string_array = |key: &str| -> Option<Vec<String>> {
+                match params.get(key) {
+                    None => Some(Vec::new()),
+                    Some(Value::Array(entries)) => {
+                        if entries.is_empty() {
+                            return None;
+                        }
+                        let mut parsed = Vec::with_capacity(entries.len());
+                        for entry in entries {
+                            match entry.as_str() {
+                                Some(text) => parsed.push(text.to_owned()),
+                                None => return None,
+                            }
+                        }
+                        Some(parsed)
+                    }
+                    Some(_) => None,
+                }
+            };
+            let promote_admins = match parse_string_array("promoteAdmins") {
+                Some(v) => v,
+                None => return internal_error(id),
+            };
+            let demote_admins = match parse_string_array("demoteAdmins") {
+                Some(v) => v,
+                None => return internal_error(id),
+            };
+            let ban_members = match parse_string_array("banMembers") {
+                Some(v) => v,
+                None => return internal_error(id),
+            };
+            let unban_members = match parse_string_array("unbanMembers") {
+                Some(v) => v,
+                None => return internal_error(id),
+            };
             let add_members = match params.get("addMembers") {
                 None => Vec::new(),
                 Some(Value::Array(entries)) => {
@@ -4286,6 +4333,11 @@ async fn dispatch(
                 && avatar.is_none()
                 && add_members.is_empty()
                 && remove_members.is_empty()
+                && description.is_none()
+                && promote_admins.is_empty()
+                && demote_admins.is_empty()
+                && ban_members.is_empty()
+                && unban_members.is_empty()
                 && add_from_invite_link_access.is_none()
                 && invite_link_password.is_none()
                 && announcements_only.is_none()
@@ -4305,6 +4357,11 @@ async fn dispatch(
                 avatar,
                 add_members,
                 remove_members,
+                description,
+                promote_admins,
+                demote_admins,
+                ban_members,
+                unban_members,
                 add_from_invite_link_access,
                 invite_link_password,
                 announcements_only,
@@ -5634,6 +5691,7 @@ pub(crate) fn send_error_face(error: &crate::service::SendError) -> (i64, &'stat
         SendError::AttachmentBusy => (-32603, ATTACHMENT_BUSY_MESSAGE),
         SendError::AttachmentBudgetExceeded => (-32603, ATTACHMENT_BUDGET_MESSAGE),
         SendError::NoRecipients => (-32603, NO_RECIPIENTS_MESSAGE),
+        SendError::TypingDropped => (-32603, TYPING_DROPPED_MESSAGE),
         // 群取回分型降级（接收完整性批②，compat §3）：-1 同目标终止族
         // （目标群态不可用即不应再发），data.count 由 send_error 单点附加。
         SendError::GroupSyncFailed { .. } => (-1, "GROUP_SYNC_FAILED"),
@@ -5819,6 +5877,7 @@ mod tests {
             SendError::AttachmentBusy,
             SendError::AttachmentBudgetExceeded,
             SendError::NoRecipients,
+            SendError::TypingDropped,
             SendError::GroupSyncFailed { count: 2 },
             SendError::Internal,
         ];
@@ -5860,6 +5919,19 @@ mod tests {
                 .map(|o| o.map_or(0, |o| o.len())),
             Some(1)
         );
+    }
+
+    /// typing 让路批（2026-11-23）：TypingDropped 错误面 = -32603 + 固定
+    /// 原文（锚词 `(TypingDroppedException)` 全词在）；cancel 可能发生在
+    /// 已写出等响应期，结局保守记未知，绝不进入自动快速重试。
+    #[test]
+    fn typing_dropped_face_shape_and_unknown_outcome() {
+        let (code, message) = send_error_face(&crate::service::SendError::TypingDropped);
+        assert_eq!(code, -32603);
+        assert_eq!(message, TYPING_DROPPED_MESSAGE);
+        assert!(message.contains("(TypingDroppedException)"));
+        assert!(message.starts_with("Failed to send message: "));
+        assert!(!crate::service::SendError::TypingDropped.is_definite_failure());
     }
 
     /// 群腿零收件人防御面（2026-10-16 批）：`NoRecipients` 错误面 =

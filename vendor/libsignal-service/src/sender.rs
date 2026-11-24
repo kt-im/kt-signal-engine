@@ -1,6 +1,7 @@
 use std::{collections::HashSet, time::SystemTime};
 
 use base64::prelude::*;
+use futures::StreamExt as _;
 use chrono::prelude::*;
 use libsignal_core::{curve::CurveError, InvalidDeviceId};
 use libsignal_protocol::{
@@ -65,6 +66,34 @@ pub struct SendMessageResponse {
 }
 
 pub type SendMessageResult = Result<SentMessage, MessageSenderError>;
+
+/// Maximum concurrent per-recipient sends. MRM remains a single server request;
+/// this bound applies only to SKDM and legacy fallback fan-out.
+pub const SEND_FANOUT_CONCURRENCY: usize = 8;
+
+/// Map recipients with bounded concurrency and restore input order. Each item
+/// returns its own result, so one recipient's failure does not cancel the others.
+pub async fn map_bounded_ordered<T, F, Fut>(items: Vec<T>, mut map: F) -> Vec<Fut::Output>
+where
+    F: FnMut(usize, T) -> Fut,
+    Fut: std::future::Future,
+{
+    let mut results = futures::stream::iter(
+        items
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let future = map(index, item);
+                async move { (index, future.await) }
+            }),
+    )
+    .buffer_unordered(SEND_FANOUT_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, output)| output).collect()
+}
+
 
 #[derive(Debug, Clone)]
 pub struct SentMessage {
@@ -727,34 +756,32 @@ where
         online: bool,
     ) -> (Vec<SendMessageResult>, Option<ContentBody>) {
         let content_body: ContentBody = message.into();
-        let mut results = vec![];
+        // Each clone owns its mutable per-recipient send state while websocket and
+        // protocol-store handles keep their synchronization semantics. Results stay
+        // in recipient order even though the network round trips overlap.
+        let results = map_bounded_ordered(recipients.as_ref().to_vec(), |_, item| {
+            let (recipient, unidentified_access, include_pni_signature) = item;
+            let mut sender = self.clone();
+            let content_body = content_body.clone();
+            async move {
+                sender
+                    .try_send_message(
+                        recipient,
+                        unidentified_access.as_ref(),
+                        None,
+                        &content_body,
+                        timestamp,
+                        include_pni_signature,
+                        online,
+                    )
+                    .await
+            }
+        })
+        .await;
 
-        let mut needs_sync_in_results = false;
-
-        for (recipient, unidentified_access, include_pni_signature) in
-            recipients.as_ref()
-        {
-            let result = self
-                .try_send_message(
-                    *recipient,
-                    unidentified_access.as_ref(),
-                    None,
-                    &content_body,
-                    timestamp,
-                    *include_pni_signature,
-                    online,
-                )
-                .await;
-
-            match result {
-                Ok(SentMessage { needs_sync, .. }) if needs_sync => {
-                    needs_sync_in_results = true;
-                },
-                _ => (),
-            };
-
-            results.push(result);
-        }
+        let needs_sync_in_results = results
+            .iter()
+            .any(|result| matches!(result, Ok(SentMessage { needs_sync: true, .. })));
 
         // we only need to send a synchronization message once
         let sync_body = if needs_sync_in_results || self.is_multi_device().await
@@ -1810,5 +1837,49 @@ mod sent_transcript_body_tests {
                 "expected None for {body:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_fanout_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fanout_is_bounded_ordered_and_failure_isolated() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let results = map_bounded_ordered((0_u64..24).collect::<Vec<_>>(), |index, item| {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(1 + index as u64 % 3))
+                    .await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                if item == 7 {
+                    Err("single recipient failed")
+                } else {
+                    Ok(item * 2)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(results.len(), 24);
+        for (index, result) in results.into_iter().enumerate() {
+            if index == 7 {
+                assert_eq!(result, Err("single recipient failed"));
+            } else {
+                assert_eq!(result, Ok(index as u64 * 2));
+            }
+        }
+        let maximum = maximum.load(Ordering::SeqCst);
+        assert!(maximum > 1, "expected overlapping recipient sends");
+        assert!(maximum <= SEND_FANOUT_CONCURRENCY);
     }
 }

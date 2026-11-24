@@ -88,7 +88,7 @@ use serde_json::{json, Value};
 
 use super::{
     lock_registered_for_send, open_registered, resolve_recipient, send_error_of,
-    upload_attachments_for_send, SendError, SendTextStyle, Service,
+    upload_attachments_for_send, OutgoingCaption, SendError, SendTextStyle, Service,
 };
 
 /// 官方 MY_STORY_ID（`ts/types/Stories.std.ts:114-115`）：distributionListId
@@ -339,7 +339,7 @@ pub(crate) async fn send_story(
                 &manager,
                 &[uri.to_owned()],
                 None,
-                caption,
+                OutgoingCaption::Story(caption),
             )
             .await?;
             let file_pointer = pointers.into_iter().next().ok_or(SendError::Internal)?;
@@ -355,7 +355,7 @@ pub(crate) async fn send_story(
                         &manager,
                         &[],
                         Some(uri),
-                        None,
+                        OutgoingCaption::Strip,
                     )
                     .await?
                 }
@@ -568,7 +568,7 @@ pub(crate) async fn send_story_group(
                 &manager,
                 &[uri.to_owned()],
                 None,
-                caption,
+                OutgoingCaption::Story(caption),
             )
             .await?;
             let file_pointer = pointers.into_iter().next().ok_or(SendError::Internal)?;
@@ -588,7 +588,7 @@ pub(crate) async fn send_story_group(
                         &manager,
                         &[],
                         Some(uri),
-                        None,
+                        OutgoingCaption::Strip,
                     )
                     .await?
                 }

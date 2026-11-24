@@ -768,10 +768,15 @@ fn apply_outgoing_dimensions(
 /// `upload_attachment` 原样落返回指针 `AttachmentPointer.caption`
 ///（vendored sender.rs spec.caption 直通；官方 uploadAttachment
 /// `caption || null` 进指针同构，uploadAttachment.preload.ts:99/:134），
-/// 零 vendor/fork 改动。仅 story 媒体腿传 Some（entries 恒单条，置位
-/// 首条正文附件），send/preview 面传 None 零变化；空 parsed 批 = 编排面
+/// 零 vendor/fork 改动。仅 story 媒体腿传 Some（entries 恒单条，覆盖首条
+/// 正文附件的 data URI caption）；普通 send 由逐条 data URI 直接供数；空 parsed 批 = 编排面
 /// 不会发生（媒体腿恒单条先行置位前已非空闸）。
 fn apply_outgoing_caption(parsed: &mut [ParsedAttachment], caption: Option<&str>) {
+    // Story/头像与 ordinary send 共用 URI 解析器：先清除普通附件 URI 自带的
+    // caption，再仅应用 Story 参数；None 也必须是确定的“无 caption”。
+    for item in parsed.iter_mut() {
+        item.spec.caption = None;
+    }
     if let Some(text) = caption {
         if let Some(first) = parsed.first_mut() {
             first.spec.caption = Some(text.to_owned());
@@ -785,7 +790,7 @@ fn apply_outgoing_caption(parsed: &mut [ParsedAttachment], caption: Option<&str>
 /// 预留——32×100MB 的整批请求在解码前就被拒，而不是先吃满内存。
 ///
 /// data URI 唯一形状 = connector 上游形状
-/// `data:<mediatype>[;filename=<percent-encoded>][;voice=true][;gif=true][;width=<px>;height=<px>];base64,<payload>`
+/// `data:<mediatype>[;filename=<percent-encoded>][;caption=<percent-encoded>][;voice=true][;gif=true][;width=<px>;height=<px>];base64,<payload>`
 /// （RFC 2397 扩展 filename 参数同款；voice 参数映射官方 VOICE_MESSAGE
 /// flags，presage voice_note→AttachmentPointer.flags 官方同构；gif 参数映射
 /// 官方 Flags.GIF=8 位，参数面无 mediatype 闸——官方 Tenor GIF 即
@@ -794,10 +799,12 @@ fn apply_outgoing_caption(parsed: &mut [ParsedAttachment], caption: Option<&str>
 /// 返回后置位指针同名字段，双参同进退——半边在场即整条形状坏，半对尺寸
 /// 对渲染面零信息量且会让收端拿到不可用的声明）。
 /// mediatype 缺省 application/octet-stream；非 base64 / 坏 percent /
-/// 坏 voice/gif/width/height 值一律 None（fail-closed）。
+/// 坏 voice/gif/width/height 值、空/坏 percent/超 64 KiB caption 一律 None（fail-closed）。
 struct AttachmentMeta {
     content_type: String,
     filename: Option<String>,
+    /// 普通附件逐条 caption（AttachmentPointer.caption=11），与消息 body 分离。
+    caption: Option<String>,
     is_voice: bool,
     is_gif: bool,
     /// 出向声明尺寸（`;width=`/`;height=` 双参）：None = 未声明（普通
@@ -805,12 +812,15 @@ struct AttachmentMeta {
     dimensions: Option<(u32, u32)>,
     payload_offset: usize,
     payload_len: usize,
+    /// connector-owned file-backed payload; never a renderer-supplied path.
+    file_path: Option<PathBuf>,
+    declared_size: Option<u64>,
 }
 
 impl AttachmentMeta {
     /// 全局字节预算预留口径：payload 长度（解码字节上界）。
     fn decoded_upper_bound(&self) -> u64 {
-        self.payload_len as u64
+        self.declared_size.unwrap_or(self.payload_len as u64)
     }
 }
 
@@ -822,6 +832,9 @@ fn payload_exceeds_decoded_cap(payload_len: usize, max_bytes: usize) -> bool {
 }
 
 fn parse_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
+    if uri.starts_with("file:") {
+        return parse_file_attachment_meta(uri);
+    }
     let rest = uri.strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;
     let payload_offset = uri.len().checked_sub(payload.len())?;
@@ -833,6 +846,7 @@ fn parse_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
         declared
     };
     let mut filename = None;
+    let mut caption = None;
     let mut is_base64 = false;
     let mut is_voice = false;
     let mut is_gif = false;
@@ -843,6 +857,12 @@ fn parse_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
             is_base64 = true;
         } else if let Some(value) = param.strip_prefix("filename=") {
             filename = Some(percent_decode(value)?);
+        } else if let Some(value) = param.strip_prefix("caption=") {
+            let decoded = percent_decode(value)?;
+            if decoded.is_empty() || decoded.len() > 65_536 {
+                return None;
+            }
+            caption = Some(decoded);
         } else if param.eq_ignore_ascii_case("voice") {
             is_voice = true;
         } else if let Some(value) = param.strip_prefix("voice=") {
@@ -884,11 +904,92 @@ fn parse_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
     Some(AttachmentMeta {
         content_type: content_type.to_owned(),
         filename,
+        caption,
         is_voice,
         is_gif,
         dimensions,
         payload_offset,
         payload_len: payload.len(),
+        file_path: None,
+        declared_size: None,
+    })
+}
+
+/// Internal connector-owned file URI:
+/// `file:<percent-path>;contentType=<mime>;sizeBytes=<n>[;filename=...]`.
+/// It is intentionally not a public path input: the connector emits only its
+/// deterministic outgoing staging files. The engine still verifies the regular
+/// file and exact size before reserving upload memory or reading bytes.
+fn parse_file_attachment_meta(uri: &str) -> Option<AttachmentMeta> {
+    let rest = uri.strip_prefix("file:")?;
+    let mut parts = rest.split(';');
+    let path = percent_decode(parts.next()?)?;
+    let path_ref = Path::new(&path);
+    if !path_ref.is_absolute()
+        || path_ref
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let mut content_type = "application/octet-stream".to_owned();
+    let mut filename = None;
+    let mut caption = None;
+    let mut is_voice = false;
+    let mut is_gif = false;
+    let mut width = None;
+    let mut height = None;
+    let mut declared_size = None;
+    for param in parts {
+        if let Some(value) = param.strip_prefix("contentType=") {
+            content_type = percent_decode(value)?;
+        } else if let Some(value) = param.strip_prefix("filename=") {
+            filename = Some(percent_decode(value)?);
+        } else if let Some(value) = param.strip_prefix("caption=") {
+            let decoded = percent_decode(value)?;
+            if decoded.is_empty() || decoded.len() > 65_536 {
+                return None;
+            }
+            caption = Some(decoded);
+        } else if param.eq_ignore_ascii_case("voice") || param == "voice=true" {
+            is_voice = true;
+        } else if param.eq_ignore_ascii_case("gif") || param == "gif=true" {
+            is_gif = true;
+        } else if let Some(value) = param.strip_prefix("width=") {
+            width = Some(parse_outgoing_dimension(value)?);
+        } else if let Some(value) = param.strip_prefix("height=") {
+            height = Some(parse_outgoing_dimension(value)?);
+        } else if let Some(value) = param.strip_prefix("sizeBytes=") {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            declared_size = Some(value.parse::<u64>().ok()?);
+        }
+    }
+    let size = declared_size?;
+    if size == 0 || size > ATTACHMENT_MAX_BYTES as u64 {
+        return None;
+    }
+    let metadata = std::fs::metadata(path_ref).ok()?;
+    if !metadata.is_file() || metadata.len() != size {
+        return None;
+    }
+    let dimensions = match (width, height) {
+        (None, None) => None,
+        (Some(width), Some(height)) => Some((width, height)),
+        _ => return None,
+    };
+    Some(AttachmentMeta {
+        content_type,
+        filename,
+        caption,
+        is_voice,
+        is_gif,
+        dimensions,
+        payload_offset: 0,
+        payload_len: size as usize,
+        file_path: Some(path_ref.to_path_buf()),
+        declared_size: Some(size),
     })
 }
 
@@ -908,13 +1009,21 @@ fn parse_outgoing_dimension(value: &str) -> Option<u32> {
 /// 第二段：真正 base64 decode（调用方已持有全局闸租约并在 decode 前按
 /// payload 上界预留）。坏 base64 / 解码后超单条上限一律 None（fail-closed）。
 fn decode_attachment(uri: &str, meta: &AttachmentMeta) -> Option<ParsedAttachment> {
-    let end = meta.payload_offset.checked_add(meta.payload_len)?;
-    let payload = uri.get(meta.payload_offset..end)?;
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(payload)
-        .ok()?;
-    if bytes.len() > ATTACHMENT_MAX_BYTES {
+    let bytes = if let Some(path) = meta.file_path.as_ref() {
+        std::fs::read(path).ok()?
+    } else {
+        let end = meta.payload_offset.checked_add(meta.payload_len)?;
+        let payload = uri.get(meta.payload_offset..end)?;
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .ok()?
+    };
+    if bytes.len() > ATTACHMENT_MAX_BYTES
+        || meta
+            .declared_size
+            .is_some_and(|size| size != bytes.len() as u64)
+    {
         return None;
     }
     Some(ParsedAttachment {
@@ -922,6 +1031,7 @@ fn decode_attachment(uri: &str, meta: &AttachmentMeta) -> Option<ParsedAttachmen
             content_type: meta.content_type.clone(),
             length: bytes.len(),
             file_name: meta.filename.clone(),
+            caption: meta.caption.clone(),
             voice_note: if meta.is_voice { Some(true) } else { None },
             ..presage::libsignal_service::sender::AttachmentSpec::default()
         },
@@ -1249,6 +1359,19 @@ pub(crate) enum SendError {
     /// 群腿无整体自动重试（既有裁定），is_definite_failure=true 只补结局
     /// 类完备性（语义 = 确定未送达）。
     NoRecipients,
+    /// typing 发送预算耗尽被让路（2026-11-23 typing 让路批）：typing 是
+    /// best-effort 帧且 TypingMessage 无 Sent 转录槽位（官方语义丢一帧
+    /// 无感知），不应与真实发送争抢每账号发送管理器锁——预算内未完成
+    /// 即整帧放弃。锁被真实发送/self 转录腿占用期间（含 ws 等响应期）
+    /// typing 直接让路，真实消息不再被 best-effort 帧拖进 15-30s 锁等待。
+    /// 超时可能发生在取锁前，也可能发生在任一收件人的请求已写出、等
+    /// 响应阶段；多收件人串行发送还允许前者已成功、后者在途。cancel
+    /// 只停止本地等待，绝不构成未上 wire 的证明——结局统一保守记
+    /// unknown，绝不自动重试（typing 无转录、无消息行，宿主本来也不
+    /// 重试）。错误面 -32603 + 固定原文（锚词 TypingDroppedException，
+    /// connector 未认领 → 折叠通用 upstream，桌面 typing 面本来就是
+    /// best-effort catch 吞掉，UI 零感知）。
+    TypingDropped,
     /// 群态取回解码类失败重试耗尽（接收完整性批②：群 update/sync 信封
     /// 触发的群 fetch/decrypt 在 vendored 重试环内重试 1 次后仍败，结构化
     /// 上抛不再静默回退旧群态；发送链该面已 fail-open 兜底、此臂为
@@ -1655,6 +1778,7 @@ pub(crate) fn send_error_variant_face(error: &SendError) -> &'static str {
         SendError::AttachmentBusy => "SendError::AttachmentBusy",
         SendError::AttachmentBudgetExceeded => "SendError::AttachmentBudgetExceeded",
         SendError::NoRecipients => "SendError::NoRecipients",
+        SendError::TypingDropped => "SendError::TypingDropped",
         SendError::GroupSyncFailed { .. } => "SendError::GroupSyncFailed",
         SendError::Internal => "SendError::Internal",
     }
@@ -1751,6 +1875,54 @@ async fn profile_sharing_whitelist(service: &Arc<Service>, account: &str) -> Has
 /// 修4 起本值同时是磁盘 map 的新鲜度窗（[`whitelist_store::FRESH_WINDOW_MS`]
 /// 单源引用），两处永不同步漂移。
 const WHITELIST_CACHE_TTL: Duration = Duration::from_millis(whitelist_store::FRESH_WINDOW_MS);
+
+/// typing 群腿让路包装（2026-11-23 typing 让路批单点）：群腿 outcome 是
+/// TypingGroupSendOutcome（三态显形面）而非 Result<(), _>，独立单点；
+/// 预算耗尽 cancel 整个发送 future 并落 TypingDropped（结局未知；折叠
+/// Err 臂由 methods.rs dispatch 的 Err(error) => send_error 单点承接，
+/// wire 形状与直聊腿 TypingDropped 面逐字一致）。
+async fn typing_outcome_group<F>(send: F) -> Result<TypingGroupSendOutcome, SendError>
+where
+    F: std::future::Future<Output = Result<TypingGroupSendOutcome, SendError>>,
+{
+    match tokio::time::timeout(TYPING_GROUP_SEND_BUDGET, send).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(SendError::TypingDropped),
+    }
+}
+
+/// typing 直聊腿让路包装（2026-11-23 typing 让路批单点）：预算内正常
+/// 返回 outcome；预算耗尽 cancel 整个发送 future 并落 TypingDropped。
+/// 抽成泛型单点便于单测钉定「超时确实取消 future」与「正常路径零
+/// 变化」（respond_with_budget 同款纪律）。预算由收件人数有界计算。
+async fn typing_send_with_budget<F>(send: F, budget: Duration) -> Result<(), SendError>
+where
+    F: std::future::Future<Output = Result<(), SendError>>,
+{
+    match tokio::time::timeout(budget, send).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(SendError::TypingDropped),
+    }
+}
+
+/// typing 每收件人预算（2026-11-23 typing 让路批）：健康单收件人 ws RTT
+/// 实测 230-450ms（engine.ws 探针），500ms 覆盖正常单腿并把让路窗压
+/// 在用户无感档。直聊多收件人逐串行发送，按人数放大、最多四人份；
+/// 超过四人仍让路是明确的 best-effort 取舍，绝不退回 30s 锁占用。
+const TYPING_RECIPIENT_SEND_BUDGET: Duration = Duration::from_millis(500);
+const TYPING_DIRECT_MAX_RECIPIENT_BUDGETS: usize = 4;
+
+/// 群 typing 总预算（复审修订）：vendored 群发送逐成员串行，不能拿
+/// 1:1 的 500ms 推广到整个群批。2s 覆盖小群健康路径；大群/慢网下
+/// typing 可能让路（官方 typing 本来 fire-and-forget），以最差 2s
+/// 锁占用替换旧 30s 饿死。群腿三态显形面只在预算内返回，超时不
+/// 把部分成功伪报全批失败。
+const TYPING_GROUP_SEND_BUDGET: Duration = Duration::from_millis(2_000);
+
+fn typing_direct_send_budget(recipient_count: usize) -> Duration {
+    let budgets = recipient_count.clamp(1, TYPING_DIRECT_MAX_RECIPIENT_BUDGETS) as u32;
+    TYPING_RECIPIENT_SEND_BUDGET.saturating_mul(budgets)
+}
 
 /// whitelist 读面来源（探针 `engine.whitelist` 段 cache= 固定词表）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4872,9 +5044,12 @@ impl Service {
             cache = probe_whitelist_source.probe_word(),
             "send-latency-probe",
         );
+        if view_once {
+            validate_view_once_attachment_uris(attachments)?;
+        }
         // 附件/预览图一次上行（多收件人共享同一批指针）；贴纸图单条上行，
-        // 同样多收件人共享指针。caption 位 = story 媒体腿专属（send 面无
-        // caption 参数，None 零变化）。上传失败整批确定未投递（先于全部
+        // 同样多收件人共享指针。ordinary send 逐条保留 URI caption；Story
+        // 参数模式在 stories.rs 单独决定清除/覆盖。上传失败整批确定未投递（先于全部
         // 收件人），AttachmentUpload 族同调用内快速重试 1 次（§5）。
         let probe_upload_t0 = std::time::Instant::now();
         let (pointers, preview_image) = {
@@ -4885,7 +5060,7 @@ impl Service {
                     &manager,
                     attachments,
                     preview.and_then(|item| item.image.as_deref()),
-                    None,
+                    OutgoingCaption::PerAttachment,
                 )
                 .await
                 {
@@ -5714,38 +5889,49 @@ impl Service {
         if !self.real {
             return Ok(());
         }
-        let shared = open_registered(self, account)
-            .await
-            .ok_or(SendError::UnknownAccount)?;
-        let mut manager = lock_registered_for_send(&shared).await;
-        let timestamp = now_ms();
-        // KT (typing self gate): typing is never sent to our own other
-        // devices (official `isMe` early return in sendTypingMessage) — a
-        // TypingMessage has no sent-transcript form, so a self target would
-        // land in the vendored self-None path and fail this RPC (-32603).
-        let own = ServiceId::from(manager.registration_data().service_ids.aci());
-        for number in recipients {
-            let service_id = self
-                .resolve_recipient_for_send(&mut manager, number)
-                .await?;
-            if service_id == own {
-                continue;
-            }
-            let body = ContentBody::TypingMessage(presage::proto::TypingMessage {
-                timestamp: Some(timestamp),
-                action: Some(if stop {
-                    presage::proto::typing_message::Action::Stopped as i32
-                } else {
-                    presage::proto::typing_message::Action::Started as i32
-                }),
-                group_id: None,
-            });
-            manager
-                .send_message(service_id, body, timestamp)
+        // typing 让路批（2026-11-23）：typing 是 best-effort 帧（TypingMessage
+        // 无 Sent 转录槽位，官方语义丢一帧无感知），绝不应与真实发送争抢
+        // 每账号发送管理器锁。整个发送路径（store 打开 + 锁等待 + ws 往返）
+        // 套按收件人数有界放大的直聊预算：锁被真实消息/self 转录腿占用
+        // （含 ws 等响应期，实测一帧可占满 30s WsTimeout）期间 typing 让路
+        // （TypingDropped），真实消息不再被拖进 15-30s 锁排队。超时臂 cancel
+        // 只停止本地等待；请求或前序收件人可能已发出，结局保守记未知，
+        // 绝不自动重试。预算内的正常路径零变化。
+        let send = async {
+            let shared = open_registered(self, account)
                 .await
-                .map_err(send_error_of)?;
-        }
-        Ok(())
+                .ok_or(SendError::UnknownAccount)?;
+            let mut manager = lock_registered_for_send(&shared).await;
+            let timestamp = now_ms();
+            // KT (typing self gate): typing is never sent to our own other
+            // devices (official `isMe` early return in sendTypingMessage) — a
+            // TypingMessage has no sent-transcript form, so a self target would
+            // land in the vendored self-None path and fail this RPC (-32603).
+            let own = ServiceId::from(manager.registration_data().service_ids.aci());
+            for number in recipients {
+                let service_id = self
+                    .resolve_recipient_for_send(&mut manager, number)
+                    .await?;
+                if service_id == own {
+                    continue;
+                }
+                let body = ContentBody::TypingMessage(presage::proto::TypingMessage {
+                    timestamp: Some(timestamp),
+                    action: Some(if stop {
+                        presage::proto::typing_message::Action::Stopped as i32
+                    } else {
+                        presage::proto::typing_message::Action::Started as i32
+                    }),
+                    group_id: None,
+                });
+                manager
+                    .send_message(service_id, body, timestamp)
+                    .await
+                    .map_err(send_error_of)?;
+            }
+            Ok(())
+        };
+        typing_send_with_budget(send, typing_direct_send_budget(recipients.len())).await
     }
 
     /// sendDeliveryReceipt/sendReadReceipt/sendViewedReceipt 公共面：官方
@@ -6291,9 +6477,14 @@ impl Service {
     ) -> Result<DataMessage, SendError> {
         let avatar = match payload.avatar.as_deref() {
             Some(uri) => {
-                let (pointers, _) =
-                    upload_attachments_for_send(gate, manager, &[uri.to_owned()], None, None)
-                        .await?;
+                let (pointers, _) = upload_attachments_for_send(
+                    gate,
+                    manager,
+                    &[uri.to_owned()],
+                    None,
+                    OutgoingCaption::Strip,
+                )
+                .await?;
                 Some(pointers.into_iter().next().ok_or(SendError::Internal)?)
             }
             None => None,
@@ -6669,12 +6860,15 @@ impl Service {
             ts_id = timestamp,
             "send-latency-probe",
         );
+        if view_once {
+            validate_view_once_attachment_uris(attachments)?;
+        }
         let (pointers, preview_image) = upload_attachments_for_send(
             self.attachment_gate(),
             &manager,
             attachments,
             preview.and_then(|item| item.image.as_deref()),
-            None,
+            OutgoingCaption::PerAttachment,
         )
         .await?;
         let body = match sticker {
@@ -6814,23 +7008,31 @@ impl Service {
             // 面只在 real 生效）。
             return Ok(TypingGroupSendOutcome::Ok);
         }
-        let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
-        let mut manager = lock_registered_for_send(&shared).await;
-        let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
-        let body = ContentBody::TypingMessage(typing_group_body(&master_key, timestamp, stop));
-        // 失败显形批（2026-10-16，compat §3/§5）：不再丢弃逐收件人
-        // outcomes（此前 `.map(|_| ())` 整体丢弃——成员全失败也回 `{}` 静默
-        // 成功）；空 outcomes = 零收件人（群成员过滤自身后为空）同转
-        // NoRecipients 确定性失败；其余分类归 classify 单点（全败 =
-        // AllFailed 失败面；部分失败 warn 计数后按成功面应答）。
-        let outcomes = manager
-            .send_message_to_group(&master_key, body, timestamp)
-            .await
-            .map_err(send_error_of)?;
-        if outcomes.is_empty() {
-            return Err(SendError::NoRecipients);
-        }
-        Ok(classify_typing_group_outcomes(outcomes))
+        // typing 让路批（2026-11-23）：与直聊腿同款 TYPING_SEND_BUDGET——
+        // 群腿路径含 terminated 探测（缓存 miss 时一次群态网络读）+
+        // send_message_to_group ws 往返，锁被真实发送占用期间同样让路
+        // （TypingDropped），不再把 best-effort 帧排进 15-30s 锁等待。
+        // 预算内正常路径（含群腿全败/零收件人显形面）零变化。
+        let send = async {
+            let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
+            let mut manager = lock_registered_for_send(&shared).await;
+            let master_key = decode_group_id(group_id).ok_or(SendError::Internal)?;
+            let body = ContentBody::TypingMessage(typing_group_body(&master_key, timestamp, stop));
+            // 失败显形批（2026-10-16，compat §3/§5）：不再丢弃逐收件人
+            // outcomes（此前 `.map(|_| ())` 整体丢弃——成员全失败也回 `{}` 静默
+            // 成功）；空 outcomes = 零收件人（群成员过滤自身后为空）同转
+            // NoRecipients 确定性失败；其余分类归 classify 单点（全败 =
+            // AllFailed 失败面；部分失败 warn 计数后按成功面应答）。
+            let outcomes = manager
+                .send_message_to_group(&master_key, body, timestamp)
+                .await
+                .map_err(send_error_of)?;
+            if outcomes.is_empty() {
+                return Err(SendError::NoRecipients);
+            }
+            Ok(classify_typing_group_outcomes(outcomes))
+        };
+        typing_outcome_group(send).await
     }
 
     /// 群组发送公共头：账号/群可解校验 + 终止面硬拒（官方
@@ -10001,6 +10203,74 @@ where
 /// 65s）。它已在独立任务里运行，不阻塞收流；120s 只用于防止任务永久悬挂。
 const RECEIVE_JOB_TIMEOUT: Duration = Duration::from_secs(120);
 
+const RECEIVE_PREKEY_MAINTENANCE_BIT: u8 = 1 << 0;
+const RECEIVE_PREKEY_QUICK_BIT: u8 = 1 << 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceivePrekeyJob {
+    Maintenance,
+    QuickTime,
+    QuickVolume,
+}
+
+impl ReceivePrekeyJob {
+    const fn pending_bit(self) -> u8 {
+        match self {
+            Self::Maintenance => RECEIVE_PREKEY_MAINTENANCE_BIT,
+            Self::QuickTime | Self::QuickVolume => RECEIVE_PREKEY_QUICK_BIT,
+        }
+    }
+}
+
+/// 流级 worker 生命周期：任何 StreamOutcome 返回路径都在 Drop 时同步 abort，
+/// 旧 Manager/store 不得随 detached 维护任务跨重连存活。
+struct ReceivePrekeyWorkerGuard {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ReceivePrekeyWorkerGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn receive_prekey_worker_exit_reason(result: &Result<(), tokio::task::JoinError>) -> &'static str {
+    match result {
+        Ok(()) => "exited",
+        Err(error) if error.is_panic() => "panicked",
+        Err(error) if error.is_cancelled() => "cancelled",
+        Err(_) => "failed",
+    }
+}
+
+/// 同类维护/快检在排队或执行中合并；发送失败（worker 已停）必须清位，
+/// 否则后续计时簿会永远以为仍有活作业。
+fn schedule_receive_prekey_job(
+    sender: &tokio::sync::mpsc::UnboundedSender<ReceivePrekeyJob>,
+    pending: &std::sync::atomic::AtomicU8,
+    job: ReceivePrekeyJob,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let bit = job.pending_bit();
+    if pending.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+        return false;
+    }
+    if sender.send(job).is_err() {
+        pending.fetch_and(!bit, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+/// 只有达到量阈值才清账；旧实现每封都 replace(..., 0)，200 阈值不可达。
+fn take_receive_prekey_volume_due(seen: &mut u64) -> bool {
+    if !prekey::quick_check_volume_due(*seen) {
+        return false;
+    }
+    *seen = 0;
+    true
+}
+
 /// 建流失败返回 Recoverable（退避步进）；流建立后结束（对端断/关停/流
 /// 排空）返回 Connected（连接成功 → 退避 reset，官方 BackOff.reset 同
 /// 语义）；建流遇服务端 401 凭据拒绝（vendored
@@ -10162,6 +10432,72 @@ async fn serve_account_stream(
                 return StreamOutcome::Recoverable;
             }
         };
+    // receive_messages 返回的 stream 独立于 Manager。SqliteStore clone 共享
+    // 同一 sqlx pool/identity-change 账，普通投影无需等待 Manager 维护锁。
+    let receive_store = manager.store().clone();
+    // 后续 sync/prekey 共用一把本线程异步锁；worker 持久跨信封存活。
+    let manager = Arc::new(tokio::sync::Mutex::new(manager));
+    let (prekey_job_tx, mut prekey_job_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ReceivePrekeyJob>();
+    let prekey_pending = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let worker_manager = Arc::clone(&manager);
+    let worker_pending = Arc::clone(&prekey_pending);
+    let worker_account_hash = account_hash.clone();
+    let worker_task = tokio::task::spawn_local(async move {
+        while let Some(job) = prekey_job_rx.recv().await {
+            let pending_bit = job.pending_bit();
+            {
+                let mut manager = worker_manager.lock().await;
+                match job {
+                    ReceivePrekeyJob::Maintenance => {
+                        if tokio::time::timeout(
+                            RECEIVE_SIDE_TIMEOUT,
+                            prekey::maintenance_tick(&mut manager),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!(
+                                target: "engine.receive",
+                                stage = "prekey_maintenance_timeout",
+                                account = %worker_account_hash,
+                                "prekey maintenance timed out; receive loop remains live"
+                            );
+                        }
+                    }
+                    ReceivePrekeyJob::QuickTime | ReceivePrekeyJob::QuickVolume => {
+                        let (stage, message) = if job == ReceivePrekeyJob::QuickTime {
+                            (
+                                "prekey_quick_check_timeout",
+                                "prekey quick check timed out; receive loop remains live",
+                            )
+                        } else {
+                            (
+                                "prekey_quick_check_volume_timeout",
+                                "prekey quick check timed out; receive loop remains live",
+                            )
+                        };
+                        if tokio::time::timeout(
+                            RECEIVE_SIDE_TIMEOUT,
+                            prekey::quick_check(&mut manager),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!(
+                                target: "engine.receive",
+                                stage = stage,
+                                account = %worker_account_hash,
+                                "{message}"
+                            );
+                        }
+                    }
+                }
+            }
+            worker_pending.fetch_and(!pending_bit, std::sync::atomic::Ordering::AcqRel);
+        }
+    });
+    let mut _prekey_worker_guard = ReceivePrekeyWorkerGuard { task: worker_task };
     // 建流成功证据行：旧实现成功路径零日志，排障只能靠 profile refresh
     // 等间接信号推测接收是否起来。每条新流恰一行（重连风暴由退避限速）。
     tracing::warn!(
@@ -10195,10 +10531,10 @@ async fn serve_account_stream(
         // Never hold the receive loop on a slow sync-request send. Official
         // sends the three requests exactly once per auth socket; the deferred
         // arm only retries a failed early send.
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            send_initial_sync_requests(&mut manager),
-        )
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut manager = manager.lock().await;
+            send_initial_sync_requests(&mut manager).await
+        })
         .await
         .unwrap_or(false)
     } else {
@@ -10260,25 +10596,45 @@ async fn serve_account_stream(
     // （maintenance_tick 书签判到期同纪律），量触发刷新书签让时间窗重开。
     let mut quick_last_ms: Option<u64> = None;
     let mut quick_seen: u64 = 0;
-    // 诊断面（2026-11-12）：接收循环每轮入口记gap。gap 大 = 上一轮在循环内
-    // 忙别的（或没被唤醒）；配合 ws_frame_to_loop 可区分「没取」与「取了没处理」。
-    let mut last_iter_at = std::time::Instant::now();
+    // 诊断面：时间戳必须在分支处理器入口更新。旧口径在 select 前计时，
+    // 把正常空闲等待（例如 30min quick timer）也报成 receive_loop_gap。
+    // 新口径只测上一个分支的真实处理时长；帧等待延迟仍由 ws_frame_to_loop 承载。
+    let last_branch_at = std::cell::Cell::new(None::<std::time::Instant>);
     loop {
-        let iter_gap_ms = last_iter_at.elapsed().as_millis() as u64;
-        if iter_gap_ms >= 200 {
-            tracing::warn!(
-                target: "engine.latency",
-                stage = "receive_loop_gap",
-                gap_ms = iter_gap_ms,
-                "receive loop iteration gap"
-            );
+        if let Some(started) = last_branch_at.get() {
+            let iter_gap_ms = started.elapsed().as_millis() as u64;
+            if iter_gap_ms >= 200 {
+                tracing::warn!(
+                    target: "engine.latency",
+                    stage = "receive_loop_gap",
+                    gap_ms = iter_gap_ms,
+                    "receive branch processing gap"
+                );
+            }
         }
-        last_iter_at = std::time::Instant::now();
         tokio::select! {
             _ = shutdown.changed() => return StreamOutcome::Connected,
+            worker_result = &mut _prekey_worker_guard.task => {
+                // sender 存活期间 worker 不应自然退出；panic/异常一律回监督重连，
+                // 不保留带陈旧 pending bit 的半活接收管线。
+                let reason = receive_prekey_worker_exit_reason(&worker_result);
+                tracing::warn!(
+                    target: "engine.receive",
+                    stage = "prekey_worker_exit",
+                    account = %account_hash,
+                    reason,
+                    "prekey worker exited unexpectedly; restarting receive stream"
+                );
+                return StreamOutcome::Recoverable;
+            }
             _ = async {
                 if let Some(at) = sync_pending {
                     tokio::time::sleep_until(at).await;
+                    // sync 的实际工作在 future 内，起点必须在锁等待与网络调用之前；
+                    // 完成 handler 不再覆盖此起点。
+                    last_branch_at.set(Some(std::time::Instant::now()));
+                    // 与 prekey worker 共用 Manager；锁等待不阻塞 stream.next()。
+                    let mut manager = manager.lock().await;
                     // 链接完成 sync 上行三请求（P15c 项4）：官方
                     // sendSyncRequests 同位——成功/失败都不重试（一次性
                     // 纪律，下次链路建立再补）。
@@ -10474,6 +10830,7 @@ async fn serve_account_stream(
                     .await;
                 }
             }, if manifest_debounce.pending_deadline().is_some() => {
+                last_branch_at.set(Some(std::time::Instant::now()));
                 if manifest_debounce.take_due(now_ms()) {
                     // 同登录期腿：manifest 拉取转后台 + 30s 上限，收流循环
                     // 绝不在维护调用上无限等待。
@@ -10506,23 +10863,13 @@ async fn serve_account_stream(
                     tokio::time::sleep_until(at).await;
                 }
             }, if maint_at.is_some() => {
-                // 下一拍固定 +2 天（tick 内书签判到期，短拍只做本地判定）。
-                // manager 调用放臂体：select 其他 future 已弃，借用不冲突。
-                // 30s 硬上限：网络维护不许挂死收流。
-                if tokio::time::timeout(
-                    RECEIVE_SIDE_TIMEOUT,
-                    prekey::maintenance_tick(&mut manager),
-                )
-                .await
-                .is_err()
-                {
-                    tracing::warn!(
-                        target: "engine.receive",
-                        stage = "prekey_maintenance_timeout",
-                        account = %account_hash,
-                        "prekey maintenance timed out; returning to receive loop"
-                    );
-                }
+                last_branch_at.set(Some(std::time::Instant::now()));
+                // 只投递，网络维护由流级 worker 执行；同类在飞作业自动合并。
+                let _ = schedule_receive_prekey_job(
+                    &prekey_job_tx,
+                    &prekey_pending,
+                    ReceivePrekeyJob::Maintenance,
+                );
                 maint_at = Some(
                     tokio::time::Instant::now()
                         + Duration::from_millis(prekey::MAINTENANCE_INTERVAL_MS),
@@ -10535,27 +10882,21 @@ async fn serve_account_stream(
                     tokio::time::sleep_until(at).await;
                 }
             }, if quick_at.is_some() => {
+                last_branch_at.set(Some(std::time::Instant::now()));
                 let now = prekey::now_ms();
                 if prekey::quick_check_due(quick_last_ms, now) {
                     // S2a 打点：快速巡检触发源计数（时间拍）。
                     perf_metrics::add(perf_metrics::keys::PREKEY_QUICK_TIME_TRIGGER, 1);
-                    if tokio::time::timeout(
-                        RECEIVE_SIDE_TIMEOUT,
-                        prekey::quick_check(&mut manager),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        tracing::warn!(
-                            target: "engine.receive",
-                            stage = "prekey_quick_check_timeout",
-                            account = %account_hash,
-                            "prekey quick check timed out; returning to receive loop"
-                        );
+                    if schedule_receive_prekey_job(
+                        &prekey_job_tx,
+                        &prekey_pending,
+                        ReceivePrekeyJob::QuickTime,
+                    ) {
+                        // 新快检窗口从投递后开始；作业期间的信封归下一窗。
+                        quick_seen = 0;
                     }
                 }
                 quick_last_ms = Some(now);
-                quick_seen = 0;
                 quick_at = Some(
                     tokio::time::Instant::now()
                         + Duration::from_millis(prekey::PREKEY_QUICK_CHECK_INTERVAL_MS),
@@ -10569,11 +10910,13 @@ async fn serve_account_stream(
                     tokio::time::sleep_until(at).await;
                 }
             }, if receipts.due_at().is_some() => {
+                last_branch_at.set(Some(std::time::Instant::now()));
                 if let Some(batch) = receipts.take_ready() {
                     delivery_receipt::spawn_delivery_receipt_flush(service, number, batch);
                 }
             }
             item = stream.next() => {
+                last_branch_at.set(Some(std::time::Instant::now()));
                 // S2a 打点：信封级到达起点（ack 前逐臂落 RECEIVE_ENVELOPE）。
                 let envelope_started = std::time::Instant::now();
                 // 只读延迟探针：帧进入传输栈的本地时刻 → 本处理点的差值。
@@ -10677,7 +11020,29 @@ async fn serve_account_stream(
                     );
                     perf_metrics::add(perf_metrics::keys::RECEIVE_KIND_CONTACTS, 1);
                     quick_seen += 1;
-                    for notification in project_contacts_sync(number, &sync) {
+                    // pni enrichment（fix/sync-contact-pni 批）：PNI 归属
+                    // 真相源 = Storage Service ContactRecord（`contact_pni_map`）。
+                    // 读取失败/账号无 storage 态 → 空 map（pni 键缺席照投，
+                    // 宁缺勿错）；空记录批不读 Storage（complete 旗标即信号，
+                    // 官方空 blob 同构）。
+                    let pni_by_aci = if sync.contacts.is_empty() {
+                        HashMap::new()
+                    } else {
+                        match storage_context(service, number).await {
+                            Ok(context) => storage_sync::contact_pni_map(&context)
+                                .await
+                                .unwrap_or_else(|| {
+                                    tracing::warn!(
+                                        target: "engine.receive",
+                                        stage = "contact_sync_pni_unavailable",
+                                        "contact pni map unavailable; projecting without pni"
+                                    );
+                                    HashMap::new()
+                                }),
+                            Err(_) => HashMap::new(),
+                        }
+                    };
+                    for notification in project_contacts_sync(number, &sync, &pni_by_aci) {
                         service.notify(number, notification).await;
                     }
                     if !service.flush_barrier(number).await {
@@ -10736,10 +11101,10 @@ async fn serve_account_stream(
                         return StreamOutcome::StdioDead;
                     }
                     if let Some(failure) = failure {
-                        if tokio::time::timeout(
-                            RECEIVE_CONNECT_TIMEOUT,
-                            derm_handle(&mut manager, sender, failure, derm_guard),
-                        )
+                        if tokio::time::timeout(RECEIVE_CONNECT_TIMEOUT, async {
+                            let mut manager = manager.lock().await;
+                            derm_handle(&mut manager, sender, failure, derm_guard).await
+                        })
                         .await
                         .is_err()
                         {
@@ -10886,7 +11251,7 @@ async fn serve_account_stream(
                     {
                         let notifications = project_content(
                             number,
-                            manager.store(),
+                            &receive_store,
                             &content,
                             &service.terminated_groups,
                             Some(service),
@@ -10984,7 +11349,7 @@ async fn serve_account_stream(
                     // ——sidecar 权威突变 + receive 事件投影，先于普通投影
                     // 面（该体在 project_content 恒空投影，零冲突）。
                     if let Some(notification) =
-                        project_verified_sync(number, manager.store(), &content, dir).await
+                        project_verified_sync(number, &receive_store, &content, dir).await
                     {
                         service.notify(number, notification).await;
                     }
@@ -11004,7 +11369,7 @@ async fn serve_account_stream(
                     for notification in
                         project_content(
                             number,
-                            manager.store(),
+                            &receive_store,
                             &content,
                             &service.terminated_groups,
                             Some(service),
@@ -11054,7 +11419,12 @@ async fn serve_account_stream(
                         // 不得重拨抢回已被新连接接管的槽。其余关闭/传输
                         // 失败回到 Fibonacci 重连。旧实现把 4409 当
                         // Connected 立即重连，会与被夺走的客户端互踢振荡。
-                        let close_code = manager.identified_websocket_close_code().await;
+                        // 先停旧 worker，避免 close 分类排在最长 30s prekey 网络调用后。
+                        _prekey_worker_guard.task.abort();
+                        let close_code = {
+                            let manager = manager.lock().await;
+                            manager.identified_websocket_close_code().await
+                        };
                         match classify_connection_close(close_code) {
                             ConnectionClose::Normal
                             | ConnectionClose::ConnectedElsewhere
@@ -11104,31 +11474,22 @@ async fn serve_account_stream(
                         }
                     }
                 }
-                // prekey 快速巡检量臂（P12/R4）：窗内 ≥200 信封即快速巡检
-                // 一次，计数与时间臂计时器同复位（含解密失败/重复投递——
-                // 服务器侧取信封同样消耗一次性 prekey）。
-                if prekey::quick_check_volume_due(std::mem::replace(&mut quick_seen, 0)) {
+                // prekey 快速巡检量臂（P12/R4）：累计 ≥200 信封才清账并
+                // 投递一次；含解密失败/重复投递，服务器取信封同样消耗 prekey。
+                if take_receive_prekey_volume_due(&mut quick_seen) {
                     // S2a 打点：快速巡检触发源计数（量拍）。
                     perf_metrics::add(perf_metrics::keys::PREKEY_QUICK_VOLUME_TRIGGER, 1);
-                    if tokio::time::timeout(
-                        RECEIVE_SIDE_TIMEOUT,
-                        prekey::quick_check(&mut manager),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        tracing::warn!(
-                            target: "engine.receive",
-                            stage = "prekey_quick_check_volume_timeout",
-                            account = %account_hash,
-                            "prekey quick check timed out; returning to receive loop"
+                    if schedule_receive_prekey_job(
+                        &prekey_job_tx,
+                        &prekey_pending,
+                        ReceivePrekeyJob::QuickVolume,
+                    ) {
+                        quick_last_ms = Some(prekey::now_ms());
+                        quick_at = Some(
+                            tokio::time::Instant::now()
+                                + Duration::from_millis(prekey::PREKEY_QUICK_CHECK_INTERVAL_MS),
                         );
                     }
-                    quick_last_ms = Some(prekey::now_ms());
-                    quick_at = Some(
-                        tokio::time::Instant::now()
-                            + Duration::from_millis(prekey::PREKEY_QUICK_CHECK_INTERVAL_MS),
-                    );
                 }
             }
         }
@@ -13799,11 +14160,15 @@ fn project_attachment_backfill_response(
 /// （parse 失败上游 filter_map 丢、store save 失败 break 后不再投影——
 /// 如实登记）；avatar 字节不投影（gap 登记后续批）。expireTimer/
 /// expireTimerVersion/inboxPosition 0 与缺席不可分（presage u32 模型），
-/// 0 不投（§5 记档）。空记录照投事件（complete 旗标即信号，官方
+/// 0 不投（§5 记档）。pni = Storage Service ContactRecord 归一
+/// "PNI:<uuid>"（fix/sync-contact-pni 批，additive absent-key：blob 的
+/// ContactDetails 无 pni 位，按 aci join，缺席/空串键不在——§5 块）。
+/// 空记录照投事件（complete 旗标即信号，官方
 /// contactSync:complete 事件空 blob 照发同构）。
 fn project_contacts_sync(
     account: &str,
     sync: &presage::model::messages::ContactSync,
+    pni_by_aci: &HashMap<String, String>,
 ) -> Vec<Value> {
     let metadata = &sync.content.metadata;
     let mut records = Vec::new();
@@ -13815,6 +14180,17 @@ fn project_contacts_sync(
         }
         if !contact.name.is_empty() {
             entry.insert("name".into(), json!(contact.name));
+        }
+        // pni 补面（fix/sync-contact-pni 批，additive absent-key）：PNI 归属
+        // 真相源 = Storage Service ContactRecord（官方 pni/pniBinary 字段；
+        // blob 的 ContactDetails 无 pni 位），按 aci join（`contact_pni_map`），
+        // 值 = 引擎 PNI service-id 串（"PNI:<uuid>"，sourceUuid 同词表）。
+        // enrichment 缺席/空串 → 键不在（宁缺勿错，绝不发明）。
+        if let Some(pni) = pni_by_aci
+            .get(&contact.uuid.to_string())
+            .filter(|pni| !pni.is_empty())
+        {
+            entry.insert("pni".into(), json!(pni));
         }
         if contact.expire_timer != 0 {
             entry.insert("expireTimer".into(), json!(contact.expire_timer));
@@ -15316,17 +15692,36 @@ fn project_contact_entry(
 /// 单条面不经此处（官方贴纸指针无 GIF 位、无语音元数据；贴纸尺寸走
 /// spec 上行面）。
 ///
-/// `caption`（2026-10-15 媒体 story caption 批）：story 媒体腿 caption 走
-/// spec 上行面直通（apply_outgoing_caption 置位首条正文附件 spec，vendored
-/// `upload_attachment` 原样落返回指针 `AttachmentPointer.caption`，官方
-/// uploadAttachment `caption || null` 进指针同构）——仅 story 媒体腿传
-/// Some（entries 恒单条），send/preview 调用面传 None 零变化。
+/// caption 来源显式分流：ordinary send 保留每条 URI caption；Story 只接受
+/// sendStory.caption（None 也清除 URI 值）；头像等无 caption 载体统一清除。
+enum OutgoingCaption<'a> {
+    PerAttachment,
+    Story(Option<&'a str>),
+    Strip,
+}
+
+fn apply_outgoing_caption_mode(
+    parsed: &mut [ParsedAttachment],
+    image_index: Option<usize>,
+    mode: OutgoingCaption<'_>,
+) {
+    match mode {
+        OutgoingCaption::PerAttachment => {
+            if let Some(index) = image_index {
+                parsed[index].spec.caption = None;
+            }
+        }
+        OutgoingCaption::Story(value) => apply_outgoing_caption(parsed, value),
+        OutgoingCaption::Strip => apply_outgoing_caption(parsed, None),
+    }
+}
+
 async fn upload_attachments_for_send(
     gate: &Arc<attachment_gate::AttachmentGate>,
     manager: &Manager<SqliteStore, Registered>,
     entries: &[String],
     preview_image: Option<&str>,
-    caption: Option<&str>,
+    caption: OutgoingCaption<'_>,
 ) -> Result<
     (
         Vec<presage::proto::AttachmentPointer>,
@@ -15355,7 +15750,7 @@ async fn upload_attachments_for_send(
         .map(|(uri, meta)| decode_attachment(uri, &meta))
         .collect::<Option<Vec<_>>>()
         .ok_or(SendError::Internal)?;
-    apply_outgoing_caption(&mut parsed, caption);
+    apply_outgoing_caption_mode(&mut parsed, image_index, caption);
     let mut outgoing_faces: Vec<OutgoingAttachmentFace> = Vec::with_capacity(parsed.len());
     let mut batch = Vec::with_capacity(parsed.len());
     for item in parsed {
@@ -15751,6 +16146,18 @@ pub(crate) fn is_view_once_media(content_type: &str) -> bool {
     lowered.starts_with("image/") || lowered.starts_with("video/")
 }
 
+/// Engine 自有 JSON-RPC 边界：viewOnce 附件 caption 在上传前即拒绝，
+/// 避免产生一个最终构造闸必然丢弃的 CDN 指针。
+fn validate_view_once_attachment_uris(entries: &[String]) -> Result<(), SendError> {
+    for uri in entries {
+        let meta = parse_attachment_meta(uri).ok_or(SendError::Internal)?;
+        if meta.caption.is_some() {
+            return Err(SendError::Internal);
+        }
+    }
+    Ok(())
+}
+
 /// 阅后即焚 dataMessage 构造（E1，官方发送面同构）：body 无、单附件、
 /// is_view_once=Some(true)（线上 DataMessage.isViewOnce=14 bool；官方发送侧
 /// 不 bump requiredProtocolVersion——构造面不设该字段，presage send 面注入
@@ -15768,7 +16175,7 @@ fn build_view_once_data_message(
         .content_type
         .as_deref()
         .ok_or(SendError::Internal)?;
-    if !is_view_once_media(content_type) {
+    if !is_view_once_media(content_type) || attachment_pointers[0].caption.is_some() {
         return Err(SendError::Internal);
     }
     Ok(DataMessage {
@@ -17191,6 +17598,192 @@ mod tests {
     use presage::proto::{data_message, AttachmentPointer, BodyRange, DataMessage, Preview};
     use prost::Message as _;
 
+    /// typing 让路批（2026-11-23，复审修订）：单收件人 500ms；直聊
+    /// 多收件人按串行人数放大且四人份封顶；群腿独立 2s，不把 1:1
+    /// RTT 错当整个群批预算。
+    #[test]
+    fn typing_send_budget_scales_bounded_by_recipient_shape() {
+        assert_eq!(TYPING_RECIPIENT_SEND_BUDGET, Duration::from_millis(500));
+        assert_eq!(typing_direct_send_budget(0), Duration::from_millis(500));
+        assert_eq!(typing_direct_send_budget(1), Duration::from_millis(500));
+        assert_eq!(typing_direct_send_budget(2), Duration::from_millis(1_000));
+        assert_eq!(typing_direct_send_budget(4), Duration::from_millis(2_000));
+        assert_eq!(typing_direct_send_budget(99), Duration::from_millis(2_000));
+        assert_eq!(TYPING_GROUP_SEND_BUDGET, Duration::from_millis(2_000));
+    }
+
+    /// typing 让路批：超时确实 cancel 发送 future 并落 TypingDropped
+    /// （Drop 探针只证明取消，不证明未上 wire；结局由变体保守记未知）。
+    #[tokio::test(start_paused = true)]
+    async fn typing_send_budget_cancels_and_drops_on_deadline() {
+        struct CancelProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = CancelProbe(std::sync::Arc::clone(&cancelled));
+        let outcome = typing_send_with_budget(
+            async move {
+                let _probe = probe;
+                std::future::pending::<Result<(), SendError>>().await
+            },
+            typing_direct_send_budget(1),
+        )
+        .await;
+        assert!(matches!(outcome, Err(SendError::TypingDropped)));
+        assert!(!SendError::TypingDropped.is_definite_failure());
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "budget must drop (cancel) the typing send future"
+        );
+
+        let ok = typing_send_with_budget(async { Ok(()) }, typing_direct_send_budget(1)).await;
+        assert!(ok.is_ok());
+    }
+
+    /// 群腿 outcome 包装：超时落 TypingDropped；预算内 Ok/AllFailed/
+    /// NoRecipients 原样保留。600ms 两成员量级延迟在 2s 内正常完成，
+    /// 防止回归把群批重新压进 500ms。
+    #[tokio::test(start_paused = true)]
+    async fn typing_group_budget_drops_and_preserves_outcome() {
+        let dropped = typing_outcome_group(async {
+            std::future::pending::<Result<TypingGroupSendOutcome, SendError>>().await
+        })
+        .await;
+        assert!(matches!(dropped, Err(SendError::TypingDropped)));
+
+        let delayed = typing_outcome_group(async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            Ok(TypingGroupSendOutcome::Ok)
+        })
+        .await;
+        assert!(matches!(delayed, Ok(TypingGroupSendOutcome::Ok)));
+
+        let all_failed = typing_outcome_group(async {
+            Ok(TypingGroupSendOutcome::AllFailed(vec![(
+                "NetworkFailure",
+                2,
+            )]))
+        })
+        .await;
+        match all_failed {
+            Ok(TypingGroupSendOutcome::AllFailed(words)) => {
+                assert_eq!(words, vec![("NetworkFailure", 2)]);
+            }
+            other => panic!("group all-failed outcome changed: {other:?}"),
+        }
+
+        let empty = typing_outcome_group(async { Err(SendError::NoRecipients) }).await;
+        assert!(matches!(empty, Err(SendError::NoRecipients)));
+    }
+
+    #[test]
+    fn receive_prekey_volume_gate_accumulates_until_two_hundred() {
+        let mut seen = 0_u64;
+        for _ in 0..199 {
+            seen += 1;
+            assert!(!take_receive_prekey_volume_due(&mut seen));
+        }
+        assert_eq!(seen, 199);
+        seen += 1;
+        assert!(take_receive_prekey_volume_due(&mut seen));
+        assert_eq!(seen, 0);
+        assert!(!take_receive_prekey_volume_due(&mut seen));
+    }
+
+    #[test]
+    fn receive_prekey_jobs_coalesce_by_kind_and_clear_failed_send() {
+        use std::sync::atomic::Ordering;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let pending = std::sync::atomic::AtomicU8::new(0);
+        assert!(schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::Maintenance
+        ));
+        assert!(!schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::Maintenance
+        ));
+        assert!(schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::QuickTime
+        ));
+        assert!(!schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::QuickVolume
+        ));
+        assert_eq!(rx.try_recv(), Ok(ReceivePrekeyJob::Maintenance));
+        assert_eq!(rx.try_recv(), Ok(ReceivePrekeyJob::QuickTime));
+
+        // 维护完成只清维护位，不清仍在飞的快检位。
+        pending.fetch_and(!RECEIVE_PREKEY_MAINTENANCE_BIT, Ordering::AcqRel);
+        assert!(schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::Maintenance
+        ));
+        assert!(!schedule_receive_prekey_job(
+            &tx,
+            &pending,
+            ReceivePrekeyJob::QuickVolume
+        ));
+
+        let (dead_tx, dead_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(dead_rx);
+        let dead_pending = std::sync::atomic::AtomicU8::new(0);
+        assert!(!schedule_receive_prekey_job(
+            &dead_tx,
+            &dead_pending,
+            ReceivePrekeyJob::QuickTime
+        ));
+        assert_eq!(dead_pending.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_prekey_worker_guard_aborts_detached_work() {
+        struct CancelProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let probe = CancelProbe(std::sync::Arc::clone(&cancelled));
+                let task = tokio::task::spawn_local(async move {
+                    let _probe = probe;
+                    std::future::pending::<()>().await;
+                });
+                drop(ReceivePrekeyWorkerGuard { task });
+                tokio::task::yield_now().await;
+                assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_prekey_worker_panic_is_classified_for_reconnect() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let task = tokio::task::spawn_local(async {
+                    panic!("receive worker panic probe");
+                });
+                let result = task.await;
+                assert_eq!(receive_prekey_worker_exit_reason(&result), "panicked");
+            })
+            .await;
+    }
+
     /// lookupOutgoingDispatch 纯函数核（compat §5 unknown 出站行引擎真相
     /// 对账批）：容差窗由调用方 SQL 界承担（messages(thread, lo..=hi)），
     /// 此处钉定行级判别——sender=本机过滤（他人行/入站行不命中）、多条
@@ -17655,6 +18248,7 @@ mod tests {
             SendError::ServerUnavailable,
             SendError::IdentityUnverified,
             SendError::WsTimeout,
+            SendError::TypingDropped,
             SendError::Internal,
         ];
         for error in never {
@@ -18276,6 +18870,26 @@ mod tests {
     }
 
     #[test]
+    fn attachment_file_uri_reads_only_the_declared_regular_file() {
+        let root = sweep_sandbox("file-uri");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.bin");
+        std::fs::write(&path, b"hello").unwrap();
+        let uri = format!(
+            "file:{};contentType=text%2Fplain;sizeBytes=5;filename=large.bin",
+            path.display()
+        );
+        let parsed = parse_attachment_data_uri(&uri).expect("file URI parses");
+        assert_eq!(parsed.bytes, b"hello");
+        assert_eq!(parsed.spec.content_type, "text/plain");
+        assert_eq!(parsed.spec.file_name.as_deref(), Some("large.bin"));
+        assert_eq!(parsed.spec.length, 5);
+        assert!(parse_attachment_data_uri(&uri.replace("sizeBytes=5", "sizeBytes=4")).is_none());
+        assert!(parse_attachment_data_uri("file:relative.bin;sizeBytes=5").is_none());
+        assert!(parse_attachment_data_uri(&uri.replace("large.bin", "missing.bin")).is_none());
+    }
+
+    #[test]
     fn attachment_data_uri_parses_gif_param() {
         let parsed = |uri| parse_attachment_data_uri(uri).expect("parses");
         let none = |uri| assert!(parse_attachment_data_uri(uri).is_none());
@@ -18327,21 +18941,70 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_attachment_caption_rides_per_entry_spec() {
+        let first = parse_attachment_data_uri(
+            "data:image/jpeg;caption=A%3BB%2C%25%20%E4%B8%AD;base64,aGVsbG8=",
+        )
+        .expect("percent-encoded caption parses");
+        let second = parse_attachment_data_uri("data:image/png;base64,aGVsbG8=")
+            .expect("caption-less entry parses");
+        assert_eq!(first.spec.caption.as_deref(), Some("A;B,% 中"));
+        assert_eq!(second.spec.caption, None, "无参数 = 旧形状零变化");
+
+        for invalid in [
+            "data:image/jpeg;caption=;base64,aGVsbG8=",
+            "data:image/jpeg;caption=%zz;base64,aGVsbG8=",
+        ] {
+            assert!(parse_attachment_data_uri(invalid).is_none());
+        }
+        let over = format!(
+            "data:image/jpeg;caption={};base64,aGVsbG8=",
+            "a".repeat(65_537)
+        );
+        assert!(
+            parse_attachment_data_uri(&over).is_none(),
+            "64 KiB 超帽拒绝"
+        );
+    }
+
+    #[test]
+    fn ordinary_caption_mode_preserves_body_entries_and_strips_preview() {
+        let mut parsed = vec![
+            parse_attachment_data_uri("data:image/jpeg;caption=first;base64,aGVsbG8=")
+                .expect("first"),
+            parse_attachment_data_uri("data:image/png;caption=second;base64,aGVsbG8=")
+                .expect("second"),
+            parse_attachment_data_uri("data:image/webp;caption=preview;base64,aGVsbG8=")
+                .expect("preview"),
+        ];
+        apply_outgoing_caption_mode(&mut parsed, Some(2), OutgoingCaption::PerAttachment);
+        assert_eq!(parsed[0].spec.caption.as_deref(), Some("first"));
+        assert_eq!(parsed[1].spec.caption.as_deref(), Some("second"));
+        assert_eq!(
+            parsed[2].spec.caption, None,
+            "previewImage 不继承 URI caption"
+        );
+    }
+
+    #[test]
     fn apply_outgoing_caption_spec_face() {
         // 媒体 story caption 置位单点（2026-10-15 批）：Some = 首条正文附件
         // spec 载 caption（vendored upload_attachment spec.caption 直通返回
         // 指针 AttachmentPointer.caption，官方 uploadAttachment caption 进
-        // 指针同构）；None = 零变化不覆盖；空 parsed 批（preview 单条面）
+        // 指针同构）；None = 清除 URI caption；空 parsed 批（preview 单条面）
         // 不 panic 不置位。
-        let uri = "data:image/jpeg;base64,aGVsbG8=";
+        let uri = "data:image/jpeg;caption=unexpected;base64,aGVsbG8=";
         let mut parsed = vec![parse_attachment_data_uri(uri).expect("parses")];
-        assert_eq!(parsed[0].spec.caption, None, "解析面 caption 恒缺席");
+        assert_eq!(parsed[0].spec.caption.as_deref(), Some("unexpected"));
         apply_outgoing_caption(&mut parsed, Some("story caption"));
         assert_eq!(parsed[0].spec.caption.as_deref(), Some("story caption"));
 
         let mut parsed = vec![parse_attachment_data_uri(uri).expect("parses")];
         apply_outgoing_caption(&mut parsed, None);
-        assert_eq!(parsed[0].spec.caption, None, "None = 零变化");
+        assert_eq!(
+            parsed[0].spec.caption, None,
+            "Story 参数缺席也清除 URI caption"
+        );
 
         // 正文附件 + 预览图同批形态：置位首条（正文），预览图不受染。
         let mut batch = vec![
@@ -20713,6 +21376,19 @@ mod tests {
             1
         )
         .is_err());
+        let captioned = presage::proto::AttachmentPointer {
+            content_type: Some("image/jpeg".into()),
+            caption: Some("not allowed".into()),
+            ..Default::default()
+        };
+        assert!(build_view_once_data_message(vec![captioned], 1).is_err());
+        assert!(validate_view_once_attachment_uris(&[
+            "data:image/jpeg;caption=x;base64,aGVsbG8=".into()
+        ])
+        .is_err());
+        assert!(
+            validate_view_once_attachment_uris(&["data:image/jpeg;base64,aGVsbG8=".into()]).is_ok()
+        );
     }
 
     /// textStyle 发送构造面（connector 契约 1.69 §4.62 透传批）：
@@ -24440,7 +25116,7 @@ mod tests {
             contacts,
         };
         let notification = pop_unwrap(
-            project_contacts_sync("acct", &sync),
+            project_contacts_sync("acct", &sync, &HashMap::new()),
             "contacts sync projects",
         );
         assert_eq!(notification["method"], json!("receive"));
@@ -24476,10 +25152,103 @@ mod tests {
             complete: false,
             contacts: Vec::new(),
         };
-        let face = &pop_unwrap(project_contacts_sync("acct", &sync), "empty projects")["params"]
-            ["envelope"]["syncMessage"]["contacts"];
+        let face = &pop_unwrap(
+            project_contacts_sync("acct", &sync, &HashMap::new()),
+            "empty projects",
+        )["params"]["envelope"]["syncMessage"]["contacts"];
         assert_eq!(face["complete"], json!(false));
         assert_eq!(face["records"], json!([]));
+    }
+
+    /// contacts sync 投影 pni 补面（fix/sync-contact-pni 批，additive
+    /// absent-key）：enrichment 命中 → "pni" 键逐字（"PNI:<uuid>"）；aci
+    /// 不在 map → 键不在；空串值 → 折缺席（键不在）。
+    #[test]
+    fn contacts_sync_projects_pni_additively() {
+        use presage::libsignal_service::content::{Content, ContentBody, Metadata};
+        use presage::model::contacts::Contact;
+        use presage::model::messages::ContactSync;
+        use presage::proto::DataMessage;
+
+        let sender =
+            ServiceId::parse_from_service_id_string("11111111-2222-4333-8444-555555555555")
+                .expect("sender aci");
+        let metadata = Metadata {
+            sender,
+            destination: sender,
+            sender_device: presage::libsignal_service::protocol::DeviceId::new(1)
+                .expect("device id"),
+            pni_verified: None,
+            client_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("timestamp"),
+            server_timestamp: chrono::DateTime::from_timestamp_millis(1_700_000_000_001)
+                .expect("timestamp"),
+            needs_receipt: false,
+            unidentified_sender: false,
+            was_plaintext: false,
+            server_guid: None,
+            story: None,
+            ephemeral: None,
+            urgent: None,
+            report_spam_token: None,
+        };
+        let contact = |uuid: &str| Contact {
+            uuid: presage::libsignal_service::prelude::Uuid::parse_str(uuid).expect("uuid"),
+            phone_number: None,
+            name: String::new(),
+            verified: Default::default(),
+            profile_key: Vec::new(),
+            expire_timer: 0,
+            expire_timer_version: 0,
+            inbox_position: 0,
+            avatar: None,
+        };
+        let sync = ContactSync {
+            content: Box::new(Content::from_body(
+                ContentBody::DataMessage(DataMessage::default()),
+                metadata,
+            )),
+            complete: false,
+            contacts: vec![
+                contact("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae"),
+                contact("0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283"),
+                contact("1c2d3e4f-5061-4a2b-9d3e-4f5061728394"),
+            ],
+        };
+        let mut pni_by_aci = HashMap::new();
+        pni_by_aci.insert(
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae".to_owned(),
+            "PNI:22222222-2222-4333-8444-555555555555".to_owned(),
+        );
+        // 空串值：折缺席（键不在）。
+        pni_by_aci.insert(
+            "1c2d3e4f-5061-4a2b-9d3e-4f5061728394".to_owned(),
+            String::new(),
+        );
+        let face = &pop_unwrap(
+            project_contacts_sync("acct", &sync, &pni_by_aci),
+            "contacts sync projects",
+        )["params"]["envelope"]["syncMessage"]["contacts"];
+        let records = face["records"].as_array().expect("records");
+        assert_eq!(records.len(), 3);
+        // 命中：逐字（"PNI:<uuid>"，其余键零变化）。
+        assert_eq!(
+            records[0],
+            json!({
+                "aci": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                "pni": "PNI:22222222-2222-4333-8444-555555555555",
+            })
+        );
+        // aci 不在 map：键不在。
+        assert_eq!(
+            records[1],
+            json!({ "aci": "0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283" })
+        );
+        // 空串值：折缺席。
+        assert_eq!(
+            records[2],
+            json!({ "aci": "1c2d3e4f-5061-4a2b-9d3e-4f5061728394" })
+        );
     }
 
     /// P15a 项4 Blocked 同步收投影：modern/legacy 家族选择（官方

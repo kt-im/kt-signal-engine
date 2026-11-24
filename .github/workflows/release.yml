@@ -192,12 +192,23 @@ jobs:
           python3 -m pip install --quiet --disable-pip-version-check --break-system-packages oss2
           export SRC="$src" PLATFORM="$platform" ARTIFACT="$artifact" COMPONENT_VERSION="$version"
           python3 - <<'PYEOF'
-          import os, json, hashlib, time, oss2
+          import os, json, hashlib, time, re, oss2
+          from pathlib import Path
           auth = oss2.StsAuth(os.environ['OSS_ACCESS_KEY_ID'], os.environ['OSS_ACCESS_KEY_SECRET'], os.environ['OSS_STS_TOKEN'])
           bucket = oss2.Bucket(auth, 'https://' + os.environ['OSS_ENDPOINT'], os.environ['OSS_BUCKET'])
           CATALOG_KEY = 'kt/signal-runtime/catalog.json'
           BASE = 'https://download.ktai.im/kt/signal-runtime/engine'
           version, platform, artifact, src = (os.environ[k] for k in ('COMPONENT_VERSION','PLATFORM','ARTIFACT','SRC'))
+
+          def rust_constant(path, name):
+              text = Path(path).read_text(encoding='utf-8')
+              match = re.search(rf'^\s*pub(?:\([^)]*\))?\s+const\s+{re.escape(name)}:\s*&str\s*=\s*"([^"]+)"', text, re.M)
+              if not match:
+                  raise SystemExit(f'FATAL: missing Rust string constant {name} in {path}')
+              return match.group(1)
+
+          contract_revision = rust_constant('src/contract.rs', 'CONTRACT_REVISION')
+          desktop_api_version = rust_constant('src/contract.rs', 'DESKTOP_API_VERSION')
 
           with open(src, 'rb') as f:
               sha = hashlib.sha256(f.read()).hexdigest()
@@ -217,10 +228,12 @@ jobs:
               engine = next((r for r in catalog.get('releases', []) if r.get('component') == 'engine'), None)
               if engine is None:
                   engine = {"component": "engine", "version": version, "artifacts": {},
-                            "engineContractRevision": {"min": "1.92", "max": "1.92"},
-                            "desktopApiVersion": {"min": "1.0", "max": "1.0"}}
+                            "engineContractRevision": {"min": contract_revision, "max": contract_revision},
+                            "desktopApiVersion": {"min": desktop_api_version, "max": desktop_api_version}}
                   catalog.setdefault('releases', []).append(engine)
               engine['version'] = version
+              engine['engineContractRevision'] = {'min': contract_revision, 'max': contract_revision}
+              engine['desktopApiVersion'] = {'min': desktop_api_version, 'max': desktop_api_version}
               engine.setdefault('artifacts', {})[platform] = {
                   "platform": platform,
                   "sizeBytes": size,
