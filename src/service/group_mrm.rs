@@ -541,16 +541,22 @@ pub(crate) async fn dispatch_group_message(
     };
 
     let mut aci_store = manager.store().aci_protocol_store();
-    let mut outcomes: GroupSendOutcomes = Vec::with_capacity(targets.len());
-    let mut mrm_targets: Vec<Uuid> = Vec::with_capacity(targets.len());
-    for target in &targets {
+    let mut outcome_slots = targets
+        .iter()
+        .map(|_| None::<(ServiceId, Option<MessageSenderError>)>)
+        .collect::<Vec<_>>();
+    let mut mrm_target_slots = targets.iter().map(|_| None).collect::<Vec<_>>();
+    let mut prepared = Vec::new();
+    // Sender-key material creation mutates aci_store, so preparation stays serial.
+    // Only the independent per-recipient network sends overlap.
+    for (index, target) in targets.iter().copied().enumerate() {
         let key = target.to_string();
-        let devices = session_device_ids::<SqliteStore>(&aci_store, *target).await;
+        let devices = session_device_ids::<SqliteStore>(&aci_store, target).await;
         if info.covered.get(&key).map(Vec::as_slice) == Some(devices.as_slice()) {
-            mrm_targets.push(*target);
+            mrm_target_slots[index] = Some(target);
             continue;
         }
-        let skdm = match create_sender_key_distribution_message(
+        match create_sender_key_distribution_message(
             &own_address,
             info.distribution_id,
             &mut aci_store,
@@ -558,35 +564,48 @@ pub(crate) async fn dispatch_group_message(
         )
         .await
         {
-            Ok(skdm) => skdm,
+            Ok(skdm) => prepared.push((index, target, devices, skdm)),
             Err(error) => {
-                outcomes.push((
-                    ServiceId::from(Aci::from(*target)),
+                outcome_slots[index] = Some((
+                    ServiceId::from(Aci::from(target)),
                     Some(MessageSenderError::ProtocolError(error)),
                 ));
-                continue;
             }
-        };
-        match manager
-            .send_message(
-                ServiceId::from(Aci::from(*target)),
-                ContentBody::SenderKeyDistributionMessage(skdm),
-                timestamp,
-            )
-            .await
-        {
+        }
+    }
+    let sent = presage::libsignal_service::sender::map_bounded_ordered(
+        prepared,
+        |_, (index, target, devices, skdm)| {
+            let mut manager = (*manager).clone();
+            async move {
+                let result = manager
+                    .send_message(
+                        ServiceId::from(Aci::from(target)),
+                        ContentBody::SenderKeyDistributionMessage(skdm),
+                        timestamp,
+                    )
+                    .await;
+                (index, target, devices, result)
+            }
+        },
+    )
+    .await;
+    for (index, target, devices, result) in sent {
+        match result {
             Ok(()) => {
-                info.covered.insert(key, devices);
-                mrm_targets.push(*target);
+                info.covered.insert(target.to_string(), devices);
+                mrm_target_slots[index] = Some(target);
             }
             Err(error) => {
-                outcomes.push((
-                    ServiceId::from(Aci::from(*target)),
+                outcome_slots[index] = Some((
+                    ServiceId::from(Aci::from(target)),
                     Some(outcome_failure_of(error)),
                 ));
             }
         }
     }
+    let mrm_targets: Vec<Uuid> = mrm_target_slots.into_iter().flatten().collect();
+    let mut outcomes: GroupSendOutcomes = outcome_slots.into_iter().flatten().collect();
     save_sender_key_info(manager.store(), group_id, &info).await;
 
     if mrm_targets.len() < 2 {

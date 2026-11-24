@@ -6,7 +6,18 @@
 自带 fake 服务直驱引擎，不经该夹具）
 
 本文件逐方法列出引擎对外暴露的 signal-cli JSON-RPC 兼容子集的参数/返回/错误码
-与对齐状态。**兼容层封顶**：只覆盖 connector 实际驱动的白名单方法；上游新增
+与对齐状态。
+
+## 15. 文件支持的附件上行（Contract 1.299）
+
+普通 `send` 的 `attachments[]` 仍接受既有 `data:` Base64 URI；connector 的
+分块出站扩展另产生内部 `file:` URI。该 URI 只由 connector 创建，Engine 不接受
+任意公开文件路径 API：解析时要求绝对路径、无 `ParentDir`、regular file、
+`sizeBytes` 与实际大小一致且不超过 100 MiB，随后才进入既有上传预算与 CDN
+上传。`filename`、`contentType`、`caption`、voice/GIF/width/height 参数与 data URI
+同义；读取失败或大小漂移 fail-closed。此扩展不改变 Engine 方法名或消息
+DataMessage 形状。
+**兼容层封顶**：只覆盖 connector 实际驱动的白名单方法；上游新增
 方法不跟进；KT 新能力走独立扩展命名空间，不伪装成上游方法。
 
 ## 1. 启动契约
@@ -216,7 +227,7 @@ profile/群头像走 cdn_upload 自有字节帽，不在本闸。
 | `remoteDelete` | `{account, targetTimestamp, recipient/groupId}` | `{}` | 同 send | **P2 real**：直聊 + 群组 |
 | `sendReaction` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, emoji, remove}` | `{}` | 同 send | **P2 real**：targetAuthor 号码↔ACI 解析（本机号走注册数据，contacts 命中 E.164，UUID 形状直通） |
 | `updateContact` | `{account, recipient(单字符串), name}` | `{}` | 未命中号码：`-32603` | **P1b real**：本地 store 命中即改名；服务器面 P2 |
-| `sendTyping` | `{account, recipient[]/groupId, stop(显式布尔)}` | `{}`（群腿全败面见错误列） | 同 send；**群腿失败显形批（2026-10-16，wire additive，engine-compat，§5 块）**：群腿零收件人（群成员过滤自身后为空）`-32603` + `Failed to send message: No recipients in group. (NoRecipientsException)`（确定未送达）；群腿逐收件人**全部失败** `-1` + `SEND_TYPING_GROUP_FAILED` + data.failures 词条计数（`{"UnregisteredFailure": 2}` 形，词表 = 群发送 per-recipient 失败词表同一单点 `group_send_failure_word`——只计词条与次数，无收件人身份）；部分失败 = `{}` 照常成功应答 + 引擎日志 warn 失败计数（固定字面量，无身份） | **P2 real**：TypingMessage Started/Stopped 直聊 + 群组；**群腿失败显形批（2026-10-16，§5 块）**：群腿不再丢弃逐收件人 outcomes（此前 `.map(|_ | ())` 整体丢弃——成员全失败也回 `{}` 静默成功） |
+| `sendTyping` | `{account, recipient[]/groupId, stop(显式布尔)}` | `{}`（群腿全败面见错误列） | 同 send；**群腿失败显形批（2026-10-16，wire additive，engine-compat，§5 块）**：群腿零收件人（群成员过滤自身后为空）`-32603` + `Failed to send message: No recipients in group. (NoRecipientsException)`（确定未送达）；群腿逐收件人**全部失败** `-1` + `SEND_TYPING_GROUP_FAILED` + data.failures 词条计数（`{"UnregisteredFailure": 2}` 形，词表 = 群发送 per-recipient 失败词表同一单点 `group_send_failure_word`——只计词条与次数，无收件人身份）；部分失败 = `{}` 照常成功应答 + 引擎日志 warn 失败计数（固定字面量，无身份）；**typing 让路批（2026-11-23，wire additive，engine-compat，§5 块）**：两条 typing 腿采用有界让路预算：直聊每收件人 500ms、按串行人数放大且四人份（2s）封顶，群腿独立 2s 总预算；预算耗尽 `-32603` + `Failed to send message: Typing indicator dropped for send priority. (TypingDroppedException)`（超时 cancel 整个发送 future，只停止本地等待——请求或前序收件人可能已经发出，结局保守记 unknown，绝不自动重试；锚词 TypingDroppedException，connector 未认领 → 折叠通用 upstream，宿主 typing 面本来 best-effort 吞错） | **P2 real**：TypingMessage Started/Stopped 直聊 + 群组；**群腿失败显形批（2026-10-16，§5 块）**：群腿不再丢弃逐收件人 outcomes（此前 `.map(|_ | ())` 整体丢弃——成员全失败也回 `{}` 静默成功）；**typing 让路批（2026-11-23，§5 块）**：typing 是 best-effort 帧（TypingMessage 无 Sent 转录槽位，官方语义丢一帧无感知），发送管理器锁被真实消息/self 转录腿占用期间（含 ws 等响应期，实测一帧 typing 可占满 30s WsTimeout 拖真实消息进 15-30s 锁等待）直接让路——根因修复「发送慢/发送失败」，官方桌面 typing 同为 fire-and-forget 低优先级 |
 | `sendPinMessage` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp, pinDurationSeconds?}` | `{}` | 同 send；pinDurationSeconds 超 u32 `-32603` | **P2 real**：官方 pinMessage=27；字段缺席/null=pinDurationForever |
 | `sendUnpinMessage` | `{account, recipient[]/groupId, targetAuthor, targetTimestamp}` | `{}` | 同 send | **P2 real**：官方 unpinMessage=28 |
 | `sendAdminDelete` | `{account, groupId, targetAuthor, targetTimestamp}` | `{}` | 无 groupId `-32603`（直聊无 admin 概念） | **P2 real**：官方 adminDelete=29，仅群组 |
@@ -529,7 +540,7 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   臂），引擎投影 additive 上抛供 connector 删自有库行（conversationDeletes/
   attachmentDeletes 的引擎 store 行不删——vendored TODO 面，§5 如实
   登记）。
-- `syncMessage.contacts {complete, records: [{aci, number?, name?,
+- `syncMessage.contacts {complete, records: [{aci, number?, name?, pni?,
   expireTimer?, expireTimerVersion?, inboxPosition?}]}`（P15a 项3，官方
   SyncMessage.contacts blob 消费面投影——handleContacts
   MessageReceiver.preload.ts:3934 → doContactSync services/
@@ -538,7 +549,10 @@ P2-A 起投影覆盖 connector 1.15/1.24/1.25 的全部消费面（钉定 signal
   落库成功记录（parse 失败上游 filter_map 丢、store save 失败 break 后
   剩余不投影，§5 如实登记）；aci = ContactDetails aciBinary/aci 解析
   UUID 串；number = E.164（缺席键不在）；name 空串不投（官方 dropNull
-  同构）；expireTimer/expireTimerVersion/inboxPosition = 0 不投（presage
+  同构）；pni = Storage Service ContactRecord 归一 "PNI:<uuid>"（2026-11-21
+  fix/sync-contact-pni 批，additive——blob 的 ContactDetails 无 pni 位，
+  按 aci join，缺席/空串/读失败键不在，偏差登记见文末附录同族段）；
+  expireTimer/expireTimerVersion/inboxPosition = 0 不投（presage
   u32 模型 0 与缺席不可分，§5 记档）；avatar 字节不投影（gap 登记后续
   批）；complete = blob complete 旗标（官方 isFullSync 同位，connector
   据此决定全量重置语义）；空 records 照投事件（complete 旗标即信号，
@@ -6628,6 +6642,22 @@ hasMember 缺席=对方 GSE 缓存陈旧、access key 缺席=profile 面）。
 wire 面：零变化（纯探针 + 测试 + 文档；vendored cipher.rs 探针补丁行为
 同构——Err 臂先打点后按原 `?` 传播）。
 
+### 群发送逐收件人并发批（2026-11-23，官方对齐【engine-compat】）
+
+官方 MRM 主路径是单次 `sendMulti`，服务端扇出；只有 SKDM 与 legacy
+fallback 需要逐收件人发送。官方 `sendMessageProto` 为每个 serviceId 独立
+排队并发，旧引擎这两处均为串行 await。收敛契约：
+
+- MRM 主请求、加密与 GSE 语义不变；SKDM 的 `aci_store` 准备仍串行，
+  网络发送按 recipient 并发；legacy fallback 以 `MessageSender::clone`
+  共享 websocket 与带同步语义的 protocol store 并发执行。
+- 并发上限 8（`SEND_FANOUT_CONCURRENCY`），防止大群同时制造无界请求；
+  结果按原 recipient 顺序恢复，错误独立结算，self transcript 仍仅生成一次。
+- 不新增自动重试，不改变 `SendMessageResult`、unknown-outcome 或 connector
+  wire；mismatched/stale/challenge 修复仍在各 recipient 自己的 sender 内完成。
+- 测试钉定：同批实际并发 >1、活动任务 ≤8、结果保序、单成员失败不影响
+  其他成员；既有 MRM/fallback/转录全套回归。
+
 ### admin 写面批 B-24（2026-10-18，官方对齐 Signal-Desktop abe80d3，wire additive【engine-compat】）
 
 施工单 B-24（CONSTRUCTION-ADDENDUM-20261017 行 262：引擎管理员写面 +
@@ -7332,3 +7362,53 @@ release build；connector 侧 `cargo fmt` / `cargo clippy --all-targets -- -D wa
   `profileSharing` / `inSystemContacts`。
 - 测试：`project_contact_entry_shapes`（新签名、两键在场/缺席、非通讯录行
   hidden=true）；wire 形状逐键钉定。
+
+### contacts 同步投影 pni 补面（2026-11-21，wire additive【engine-compat】）
+
+官方锚（AGPL 只读零抄码）：PNI↔ACI 归属的官方真相源是 Storage Service
+`ContactRecord.pni`/`pniBinary`（桌面 storage 通道消费面）；contacts 同步
+blob 的 `ContactDetails` 无 pni 位（上游 SignalService.proto NEXT ID 14 无
+此字段），官方 blob 消费面（contactSync.preload.ts）也不读 pni——本批是
+KT 独立扩展：桌面把 PNI 键会话归并到 ACI 需要该映射，connector 契约
+1.136 §4.122 的 `SyncContactRecord` 增设 `pni` 消费位（connector 侧另行
+落批，跨仓改动不进本仓）。
+
+- **wire 面**：`syncMessage.contacts.records[]` 每条 additive `pni`
+  （string，`"PNI:<uuid>"`——引擎 PNI service-id 串，`sourceUuid`/
+  `destinationUuid` 同词表）。absent-key 纪律：join 缺席/空串/不可解析 →
+  键不在，绝不发明。
+- **数据源**：Storage Service ContactRecord（`storage_sync::contact_pni_map`，
+  镜像 `contact_whitelist_map` 两义读面：`Some` = 读完成含真实空面、
+  `None` = 失败 → 空 map 投影，pni 键缺席照投，宁缺勿错）。aci 半边 =
+  aciBinary 16B 优先 / aci 字符串仅收 ACI 形态；pni 半边 = pniBinary 16B
+  优先 / pni 字段裸 UUID（untagged PNI 官方语义）/ "PNI:" 标签形宽容
+  （`storage_merge::service_id_of` 同阶梯）。按 aci 与 blob 记录 join；
+  pni-only 记录（无 aci）无 join 键不参与本面。
+- **触发面**：仅非空 records 的 contacts 信封在读一次 manifest+items
+  （`contact_whitelist_map` 同网络形状，2-3 往返）；空记录批不读
+  （complete 旗标即信号）。TTL 缓存未做（信封低频、初始同步节奏），gap
+  登记后续批。
+- **偏差如实登记**：enrichment 读取失败（网络/auth/master key 缺失/无
+  storage 态）→ 该批 records 无 pni 键（G1 投影照投）；fake 账号 storage
+  上下文不可得（UnknownAccount）→ 同缺席面；blob 先到、manifest 后拉
+  （登录窗时序）→ 首批可能无 pni，后续批/重放收敛。
+- **测试**：`contact_pni_of_faces`（storage_sync：解码三臂 + 空串折缺席
+  + 畸形/非 Contact/pni-only/"PNI:" 形 aci 整拒）；
+  `contacts_sync_projects_pni_additively`（mod：命中逐字 / 键缺席 /
+  空串折缺席）；既有 contacts sync 投影测试改空 map 臂，语义零变化。
+- **门禁**：`cargo fmt` / `cargo clippy --all-targets -- -D warnings` /
+  `cargo test` 全绿。
+
+### 普通附件逐条 caption（2026-11-22，wire additive，engine-compat）
+
+普通附件 data URI 在既有 filename/voice/gif/width/height 参数之外增
+`;caption=<percent-encoded>`。caption 是附件级事实，与 DataMessage.body 及
+story 的 sendStory.caption 参数分离；解析后写入同位置 AttachmentSpec.caption，
+经既有 presage 上传原语落到 AttachmentPointer.caption=11。编码逆运算复用
+filename 的 percent_decode；空串、坏 percent、非 UTF-8、超 65536 UTF-8 字节均
+整条形状拒绝。无参数的既有普通请求形状不变。Story 与头像只接受各自专属参数：Story
+缺省 caption 时清除 URI 值，显式 caption 覆盖首条媒体附件；头像/预览图统一
+清除 URI caption。viewOnce 在上传前及指针构造面双重拒绝任何附件 caption。
+
+验收：单条/多条按位置往返，CJK 与分隔符安全，坏编码/空串/超帽 fail-closed，
+既有解析/上传测试零回归。
