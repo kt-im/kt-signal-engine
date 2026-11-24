@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "kt-signal-engine"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
