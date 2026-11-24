@@ -178,6 +178,8 @@ libsqlite3-sys = { version = "0.36", features = ["bundled", "bundled-sqlcipher",
 # 「Windows 依赖报备（AGENTS.md：依赖最小化）」。
 [target.'cfg(windows)'.dependencies]
 libsqlite3-sys = { version = "0.36", features = ["bundled", "bundled-sqlcipher", "bundled-sqlcipher-custom"] }
+# 原生磁盘余量查询；与 Connector 同版，MIT/Apache-2.0，不新增版本入图。
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 # 接收重连/维护超时单测用 paused 时钟（tokio test-util；仅测试编译面合并，
