@@ -1,0 +1,62 @@
+# Engine：Rust 验证与组件 artifacts。任何 job 不上传 OSS、不改 catalog。
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "manual"'
+    - if: '$CI_PIPELINE_SOURCE == "tag"'
+
+stages: [verify, build]
+
+verify:
+  stage: verify
+  image: rust:1.99-bookworm
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "manual"'
+    - if: '$CI_PIPELINE_SOURCE == "tag"'
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq protobuf-compiler cmake ninja-build pkg-config python3 perl
+  script:
+    - cargo fmt --check
+    - cargo clippy --all-targets -- -D warnings
+    - cargo test --all-targets -- --test-threads=1
+  cache:
+    key: cargo-$CI_COMMIT_REF_SLUG
+    paths: [target/, .cargo/]
+
+build-windows-x64:
+  stage: build
+  needs: [verify]
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "manual"'
+  tags: [windows10-runner]
+  script:
+    - rustup target add x86_64-pc-windows-msvc
+    - cargo build --release --target x86_64-pc-windows-msvc
+    - cargo test --release --test provider_roundtrip -- --nocapture
+    - cargo test --release windows_platform_disk_free_returns_positive -- --nocapture
+    - New-Item -ItemType Directory -Force dist | Out-Null
+    - Copy-Item target/x86_64-pc-windows-msvc/release/kt-signal-engine.exe dist/kt-signal-engine-windows-x64.exe
+    - Get-FileHash dist/kt-signal-engine-windows-x64.exe -Algorithm SHA256 | Format-List
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
+
+build-macos-arm64:
+  stage: build
+  needs: [verify]
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "manual"'
+  tags: [macos-arm64]
+  script:
+    - cargo build --release
+    - mkdir -p dist
+    - cp target/release/kt-signal-engine dist/kt-signal-engine-macos-arm64
+    - shasum -a 256 dist/kt-signal-engine-macos-arm64
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
