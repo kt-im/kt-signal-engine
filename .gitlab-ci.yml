@@ -10,6 +10,7 @@ stages: [verify, build]
 
 verify:
   stage: verify
+  tags: [ecs-docker]
   image: rust:1.99-bookworm
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
