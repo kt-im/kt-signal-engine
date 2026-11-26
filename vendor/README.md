@@ -682,6 +682,11 @@
   official_chat_ws_config_*` / `finish_reason_label_*` 与
   `websocket::official_ws_tests::*`。
 
+- `src/storage_service.rs`（2026-11-26 storage auth 缓存批）— `StorageService`
+  新增 additive 构造器 `pub fn with_credentials(service, credentials, storage_key)`，
+  允许宿主复用按账号缓存的 `/v1/storage/auth` 短生命期凭据构造句柄而不必每次读
+  再打一次 `GET /v1/storage/auth`；原 `StorageService::new` 行为零变化。
+
 ## 更新纪律
 
 后续再动 `vendor/`：先 `diff -rq` 对照上表 rev 的 cargo checkout 确认

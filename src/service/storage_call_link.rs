@@ -25,17 +25,16 @@
 //! 不复制 RingRTC HKDF 派生面。
 
 use presage::libsignal_service::master_key::{MasterKey, StorageServiceKey};
-use presage::libsignal_service::prelude::ServiceError;
 use presage::libsignal_service::proto::{ManifestRecord, StorageItem};
-use presage::libsignal_service::{StorageService, StorageServiceError};
+use presage::libsignal_service::StorageService;
 use presage::store::StateStore as _;
 use prost::Message as _;
 
 use super::storage_sync::{
-    account_item_key_of, conflict_decision, decrypt_raw_item, minimal_account_record, new_item_key,
-    open_storage_service, plan_record_writes, put_write_operation, read_raw_items,
-    save_manifest_state, storage_auth, ConflictDecision, ManifestState, PutOutcome, RecordPayload,
-    RecordUpsert, StorageRecordKind, StorageSyncError,
+    account_item_key_of, conflict_decision, decrypt_raw_item, fetch_manifest,
+    minimal_account_record, new_item_key, plan_record_writes, put_write_operation_cached,
+    read_raw_items_cached, save_manifest_state, ConflictDecision, ManifestState, PutOutcome,
+    RecordPayload, RecordUpsert, StorageRecordKind, StorageSyncError,
 };
 use super::StorageContext;
 use crate::proto::storage as storage_proto;
@@ -145,7 +144,7 @@ fn cloud_link_of(
 /// manifest 全部 CALL_LINK identifier → 批量原样读 → 解密/解析/投影
 /// （存储序 = manifest identifiers 首现序；单条坏 item 跳过不炸面）。
 async fn read_cloud_links(
-    push: &presage::libsignal_service::prelude::PushService,
+    context: &StorageContext,
     storage_key: &StorageServiceKey,
     manifest: Option<&ManifestRecord>,
 ) -> Result<Vec<CloudLink>, StorageSyncError> {
@@ -169,8 +168,7 @@ async fn read_cloud_links(
     } else {
         Some(manifest.record_ikm.as_slice())
     };
-    let auth = storage_auth(push).await?;
-    let items = read_raw_items(push, auth, keys.clone()).await?;
+    let items = read_raw_items_cached(context, keys.clone()).await?;
     let mut out = Vec::new();
     for key in keys {
         let Some(item) = items.iter().find(|item| item.key == key) else {
@@ -198,23 +196,12 @@ pub(crate) async fn read_call_links(
         return Ok(Vec::new());
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
-    let manifest = match storage.manifest().await {
-        Ok(manifest) => Some(manifest),
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => None,
-        Err(_) => return Err(StorageSyncError::Unavailable),
-    };
-    Ok(
-        read_cloud_links(&context.push, &storage_key, manifest.as_ref())
-            .await?
-            .into_iter()
-            .map(|link| link.sync)
-            .collect(),
-    )
+    let manifest = fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await?;
+    Ok(read_cloud_links(context, &storage_key, manifest.as_ref())
+        .await?
+        .into_iter()
+        .map(|link| link.sync)
+        .collect())
 }
 
 /// 写面编排（官方 upload 语义 + 贴纸包面同构）：读 manifest + 全部
@@ -244,27 +231,22 @@ pub(crate) async fn write_call_link(
         }
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
-    let mut manifest: Option<ManifestRecord> = match storage.manifest().await {
-        Ok(manifest) => {
-            // 有 manifest 无 Account 标识 = 非法状态（置顶面口径）。
-            if account_item_key_of(&manifest).is_none() {
-                return Err(StorageSyncError::WriteFailed);
+    let mut manifest: Option<ManifestRecord> =
+        match fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await? {
+            Some(manifest) => {
+                // 有 manifest 无 Account 标识 = 非法状态（置顶面口径）。
+                if account_item_key_of(&manifest).is_none() {
+                    return Err(StorageSyncError::WriteFailed);
+                }
+                Some(manifest)
             }
-            Some(manifest)
-        }
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => None,
-        Err(_) => return Err(StorageSyncError::Unavailable),
-    };
+            None => None,
+        };
 
     // 冲突重放循环：每轮从「当前服务器状态 + 本地意图」重建 WriteOperation。
     let mut retries: u32 = 0;
     loop {
-        let current = read_cloud_links(&context.push, &storage_key, manifest.as_ref()).await?;
+        let current = read_cloud_links(context, &storage_key, manifest.as_ref()).await?;
         let target = current
             .iter()
             .find(|link| link.sync.root_key == intent.root_key);
@@ -300,8 +282,7 @@ pub(crate) async fn write_call_link(
         });
         let planned = plan_record_writes(previous, &upserts, context.device_id, &storage_key);
 
-        let auth = storage_auth(&context.push).await?;
-        match put_write_operation(&context.push, auth, &planned.write_operation).await? {
+        match put_write_operation_cached(context, &planned.write_operation).await? {
             PutOutcome {
                 conflict_manifest: None,
             } => {

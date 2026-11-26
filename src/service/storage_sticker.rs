@@ -28,16 +28,15 @@
 
 use base64::Engine as _;
 use presage::libsignal_service::master_key::{MasterKey, StorageServiceKey};
-use presage::libsignal_service::prelude::{PushService, ServiceError};
 use presage::libsignal_service::proto::{ManifestRecord, StorageItem};
-use presage::libsignal_service::{StorageService, StorageServiceError};
+use presage::libsignal_service::StorageService;
 use presage::store::StateStore;
 
 use crate::service::storage_sync::{
-    account_item_key_of, conflict_decision, decrypt_raw_item, minimal_account_record, new_item_key,
-    open_storage_service, plan_record_writes, put_write_operation, read_raw_items,
-    save_manifest_state, storage_auth, ConflictDecision, ManifestState, PutOutcome, RecordPayload,
-    RecordUpsert, StorageRecordKind, StorageSyncError,
+    account_item_key_of, conflict_decision, decrypt_raw_item, fetch_manifest,
+    minimal_account_record, new_item_key, plan_record_writes, put_write_operation_cached,
+    read_raw_items_cached, save_manifest_state, ConflictDecision, ManifestState, PutOutcome,
+    RecordPayload, RecordUpsert, StorageRecordKind, StorageSyncError,
 };
 use crate::service::StorageContext;
 
@@ -231,7 +230,7 @@ fn cloud_pack_of(
 /// manifest 全部 STICKER_PACK=6 identifier → 批量原样读 → 解密/解析/投影
 /// （存储序 = manifest identifiers 首现序；单条坏 item 跳过不炸面）。
 async fn read_cloud_packs(
-    push: &PushService,
+    context: &StorageContext,
     storage_key: &StorageServiceKey,
     manifest: Option<&ManifestRecord>,
 ) -> Result<Vec<CloudPack>, StorageSyncError> {
@@ -252,8 +251,7 @@ async fn read_cloud_packs(
     } else {
         Some(manifest.record_ikm.as_slice())
     };
-    let auth = storage_auth(push).await?;
-    let items = read_raw_items(push, auth, keys.clone()).await?;
+    let items = read_raw_items_cached(context, keys.clone()).await?;
     let mut out = Vec::new();
     for key in keys {
         let Some(item) = items.iter().find(|item| item.key == key) else {
@@ -280,25 +278,15 @@ pub(crate) async fn read_sticker_packs(
         return Ok(Vec::new());
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
-    let manifest = match storage.manifest().await {
-        Ok(manifest) => manifest,
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
-            return Ok(Vec::new());
-        }
-        Err(_) => return Err(StorageSyncError::Unavailable),
+    let Some(manifest) = fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await?
+    else {
+        return Ok(Vec::new());
     };
-    Ok(
-        read_cloud_packs(&context.push, &storage_key, Some(&manifest))
-            .await?
-            .into_iter()
-            .map(|pack| pack.sync)
-            .collect(),
-    )
+    Ok(read_cloud_packs(context, &storage_key, Some(&manifest))
+        .await?
+        .into_iter()
+        .map(|pack| pack.sync)
+        .collect())
 }
 
 /// 写面编排（官方 upload 语义）：读 manifest + 全部贴纸 item → 定位
@@ -311,6 +299,7 @@ pub(crate) async fn write_sticker_pack(
     intent: &StickerPackWrite,
     now_ms: u64,
 ) -> Result<Vec<StickerPackSync>, StorageSyncError> {
+    context.records.clear_sticker_packs_negative();
     let master_key = match context
         .store
         .fetch_master_key()
@@ -329,27 +318,22 @@ pub(crate) async fn write_sticker_pack(
         }
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
-    let mut manifest: Option<ManifestRecord> = match storage.manifest().await {
-        Ok(manifest) => {
-            // 有 manifest 无 Account 标识 = 非法状态（同置顶面口径）。
-            if account_item_key_of(&manifest).is_none() {
-                return Err(StorageSyncError::WriteFailed);
+    let mut manifest: Option<ManifestRecord> =
+        match fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await? {
+            Some(manifest) => {
+                // 有 manifest 无 Account 标识 = 非法状态（同置顶面口径）。
+                if account_item_key_of(&manifest).is_none() {
+                    return Err(StorageSyncError::WriteFailed);
+                }
+                Some(manifest)
             }
-            Some(manifest)
-        }
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => None,
-        Err(_) => return Err(StorageSyncError::Unavailable),
-    };
+            None => None,
+        };
 
     // 冲突重放循环：每轮从「当前服务器状态 + 本地意图」重建 WriteOperation。
     let mut retries: u32 = 0;
     loop {
-        let current = read_cloud_packs(&context.push, &storage_key, manifest.as_ref()).await?;
+        let current = read_cloud_packs(context, &storage_key, manifest.as_ref()).await?;
         let target = current
             .iter()
             .find(|pack| pack.sync.pack_id == intent.pack_id());
@@ -391,8 +375,7 @@ pub(crate) async fn write_sticker_pack(
         });
         let planned = plan_record_writes(previous, &upserts, context.device_id, &storage_key);
 
-        let auth = storage_auth(&context.push).await?;
-        match put_write_operation(&context.push, auth, &planned.write_operation).await? {
+        match put_write_operation_cached(context, &planned.write_operation).await? {
             PutOutcome {
                 conflict_manifest: None,
             } => {

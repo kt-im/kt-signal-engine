@@ -8828,6 +8828,9 @@ pub(crate) struct StorageContext {
     /// BUG-6 收尾：storage 记录按账号缓存（sticker/folders/pinned 读面），
     /// 与上下文同生命周期——解绑/换号/删库即随条目丢弃。
     pub(crate) records: Arc<storage_records_cache::StorageRecordsCache>,
+    /// 按账号缓存 `/v1/storage/auth` 短生命期凭据（TTL + 401 自动失效刷新），
+    /// 随上下文同生命周期（解绑/删号/重链自动清理）。
+    pub(crate) storage_auth: Arc<storage_sync::StorageAuthCache>,
     /// 群凭据双族缓存句柄（Service 共享，进程内存不落盘；P4c 切一）。
     pub(crate) group_credentials: Arc<call_links::GroupCredentialCache>,
     /// 所属 Service 弱句柄 + 账号名（群态成员 profileKey 新落 → profile
@@ -8985,6 +8988,7 @@ async fn build_storage_context(
         device_id: data.device_id.unwrap_or(1),
         account_dir,
         records,
+        storage_auth: Arc::new(storage_sync::StorageAuthCache::new()),
         aci_uuid: data.service_ids.aci,
         pni_uuid: data.service_ids.pni,
         group_credentials: service.group_credentials.clone(),
@@ -33380,6 +33384,88 @@ mod tests {
         // 失效入口只作用于新上下文（旧 Arc 已不可达）。
         service.storage_contexts.invalidate_records(account).await;
         assert_eq!(new.records.cached_slots(), 0);
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Storage auth 缓存随账号生命周期隔离与清理：同账号上下文共享缓存，
+    /// 重链（目录变化）与删除账号均清空旧账号的 `/v1/storage/auth` 缓存。
+    #[tokio::test]
+    async fn storage_auth_cache_is_scoped_per_account_and_cleared_on_relink_and_delete() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-storage-auth-lifecycle-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), Arc::clone(&state), outbound);
+        let account = "+15550006071";
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/auth-old",
+            "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/auth-old".to_owned()))
+            .expect("add account");
+
+        let ctx1 = storage_context(&service, account).await.expect("ctx1");
+        let auth = ctx1
+            .storage_auth
+            .get_or_fetch(|| async {
+                Ok(presage::libsignal_service::push_service::HttpAuth {
+                    username: "u-old".to_owned(),
+                    password: "p-old".to_owned(),
+                })
+            })
+            .await
+            .expect("seed auth");
+        assert_eq!(auth.username, "u-old");
+        assert!(ctx1.storage_auth.has_cached());
+
+        // 同账号再次取上下文共享同一 auth 缓存句柄。
+        let ctx2 = storage_context(&service, account).await.expect("ctx2");
+        assert!(ctx2.storage_auth.has_cached());
+
+        // 同号重链（目录变化）→ 新上下文无旧 auth 缓存。
+        seed_store_with_aci(
+            &data_dir,
+            "accounts/auth-new",
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .await;
+        state
+            .lock()
+            .await
+            .add_account(account.to_owned(), Some("accounts/auth-new".to_owned()))
+            .expect("relink account");
+        let relinked = storage_context(&service, account).await.expect("relinked");
+        assert!(
+            !relinked.storage_auth.has_cached(),
+            "重链后不得复用旧账号的 storage auth 缓存"
+        );
+        let _ = relinked
+            .storage_auth
+            .get_or_fetch(|| async {
+                Ok(presage::libsignal_service::push_service::HttpAuth {
+                    username: "u-new".to_owned(),
+                    password: "p-new".to_owned(),
+                })
+            })
+            .await
+            .expect("seed relinked auth");
+        assert!(relinked.storage_auth.has_cached());
+
+        // 删除账号 → storage_contexts.invalidate 清空缓存条目。
+        assert!(service.delete_account(account).await.expect("delete"));
+        assert_eq!(service.storage_contexts.cached_len().await, 0);
 
         drop(service);
         let _ = std::fs::remove_dir_all(&data_dir);

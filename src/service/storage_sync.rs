@@ -82,7 +82,7 @@ pub(crate) const CONFLICT_BACKOFF_STEPS_MS: &[u64] = &[1_000, 5_000, 30_000];
 /// ReadFailed → `STORAGE_READ_FAILED`（读解密/item 读取失败），
 /// WriteFailed → `STORAGE_WRITE_FAILED`（PUT 失败 / 409 连满 3 次放弃 /
 /// 写面冲突重放中的任何失败——写意图未落地）。
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageSyncError {
     /// 账号不在注册表 / store 不可开 / 注册数据不可读。
     UnknownAccount,
@@ -376,22 +376,12 @@ pub(crate) async fn manifest_version_probe(context: &StorageContext) -> Manifest
     let Some(master_key) = master_key else {
         return ManifestVersionProbe::NoServerState;
     };
-    let Ok(storage) = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
+    fetch_manifest_if_changed(
+        context,
+        &StorageServiceKey::from_master_key(&master_key),
+        local.unwrap_or(0),
     )
     .await
-    else {
-        return ManifestVersionProbe::Unavailable;
-    };
-    match storage.manifest_if_changed(local.unwrap_or(0)).await {
-        Ok(None) => ManifestVersionProbe::Same,
-        Ok(Some(manifest)) => ManifestVersionProbe::Newer(manifest.version),
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
-            ManifestVersionProbe::NoServerState
-        }
-        Err(_) => ManifestVersionProbe::Unavailable,
-    }
 }
 
 /// 新 Account item id（官方 generateStorageID 同构：16 随机字节）。
@@ -761,43 +751,97 @@ pub(crate) struct PutOutcome {
     pub(crate) conflict_manifest: Option<StorageManifest>,
 }
 
-pub(crate) async fn put_write_operation(
+enum RawStorageOpError {
+    Unauthorized,
+    Failed(StorageSyncError),
+}
+
+async fn put_write_operation_once(
     push: &PushService,
     auth: presage::libsignal_service::push_service::HttpAuth,
     write_operation: &WriteOperation,
-) -> Result<PutOutcome, StorageSyncError> {
+) -> Result<PutOutcome, RawStorageOpError> {
     use presage::libsignal_service::push_service::HttpAuthOverride;
     use prost::Message;
+    let started = std::time::Instant::now();
     let body = write_operation.encode_to_vec();
-    let response = push
+    let request = push
         .request(
             reqwest::Method::PUT,
             Endpoint::storage("v1/storage/"),
             HttpAuthOverride::Identified(auth),
         )
-        .map_err(|_| StorageSyncError::WriteFailed)?
+        .map_err(|err| {
+            let (class, status) = classify_service_error(&err);
+            warn_storage_failure("put_write_operation", class, status, started);
+            RawStorageOpError::Failed(StorageSyncError::WriteFailed)
+        })?;
+    let response = request
         .header("Content-Type", "application/x-protobuf")
         .body(body)
         .send()
         .await
-        .map_err(|_| StorageSyncError::WriteFailed)?;
-    match response.status().as_u16() {
+        .map_err(|err| {
+            let (class, status) = classify_reqwest_error(&err);
+            warn_storage_failure("put_write_operation", class, status, started);
+            RawStorageOpError::Failed(StorageSyncError::WriteFailed)
+        })?;
+    let status = response.status().as_u16();
+    match status {
         200 | 204 => Ok(PutOutcome {
             conflict_manifest: None,
         }),
+        401 => Err(RawStorageOpError::Unauthorized),
         409 => {
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|_| StorageSyncError::WriteFailed)?;
-            let manifest = StorageManifest::decode(bytes.as_ref())
-                .map_err(|_| StorageSyncError::WriteFailed)?;
+            let bytes = response.bytes().await.map_err(|err| {
+                let (class, http_status) = classify_reqwest_error(&err);
+                warn_storage_failure("put_write_operation", class, http_status, started);
+                RawStorageOpError::Failed(StorageSyncError::WriteFailed)
+            })?;
+            let manifest = StorageManifest::decode(bytes.as_ref()).map_err(|_| {
+                warn_storage_failure("put_write_operation", "decode", Some(409), started);
+                RawStorageOpError::Failed(StorageSyncError::WriteFailed)
+            })?;
             Ok(PutOutcome {
                 conflict_manifest: Some(manifest),
             })
         }
-        _ => Err(StorageSyncError::WriteFailed),
+        _ => {
+            warn_storage_failure(
+                "put_write_operation",
+                classify_http_status(status),
+                Some(status),
+                started,
+            );
+            Err(RawStorageOpError::Failed(StorageSyncError::WriteFailed))
+        }
     }
+}
+
+/// 复用账号缓存的 `/v1/storage/auth` 执行 `PUT v1/storage/`；若遇到 401
+/// 自动失效旧凭据并刷新重试一次。
+pub(crate) async fn put_write_operation_cached(
+    context: &StorageContext,
+    write_operation: &WriteOperation,
+) -> Result<PutOutcome, StorageSyncError> {
+    let started = std::time::Instant::now();
+    context
+        .storage_auth
+        .run_with_auth(
+            "put_write_operation",
+            || storage_auth(&context.push),
+            |auth| put_write_operation_once(&context.push, auth, write_operation),
+            |err| matches!(err, RawStorageOpError::Unauthorized),
+            RawStorageOpError::Failed,
+        )
+        .await
+        .map_err(|err| match err {
+            RawStorageOpError::Unauthorized => {
+                warn_storage_failure("put_write_operation", "unauthorized", Some(401), started);
+                StorageSyncError::WriteFailed
+            }
+            RawStorageOpError::Failed(sync_err) => sync_err,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -883,62 +927,230 @@ pub(crate) fn decrypt_raw_item(
 /// 批量原样读（上游 read_items 同端点同请求体，但不解密不投影——钉定
 /// presage rev 的 StorageRecord 缺 sticker arm，解出即丢内容；`PUT
 /// /v1/storage/read`，items 按服务器返回序，调用方按 key 定位）。
-pub(crate) async fn read_raw_items(
+async fn read_raw_items_once(
     push: &PushService,
     auth: presage::libsignal_service::push_service::HttpAuth,
     keys: Vec<Vec<u8>>,
-) -> Result<Vec<presage::libsignal_service::proto::StorageItem>, StorageSyncError> {
+) -> Result<Vec<presage::libsignal_service::proto::StorageItem>, RawStorageOpError> {
     use presage::libsignal_service::proto::{ReadOperation, StorageItems};
     use presage::libsignal_service::push_service::HttpAuthOverride;
     use prost::Message as _;
+    let started = std::time::Instant::now();
     let body = ReadOperation { read_key: keys };
     let mut buf = Vec::with_capacity(body.encoded_len());
     body.encode(&mut buf).expect("infallible encode into Vec");
-    let response = push
+    let request = push
         .request(
             reqwest::Method::PUT,
             Endpoint::storage("/v1/storage/read"),
             HttpAuthOverride::Identified(auth),
         )
-        .map_err(|_| StorageSyncError::ReadFailed)?
+        .map_err(|err| {
+            let (class, status) = classify_service_error(&err);
+            warn_storage_failure("read_raw_items", class, status, started);
+            RawStorageOpError::Failed(StorageSyncError::ReadFailed)
+        })?;
+    let response = request
         .header("Content-Type", "application/x-protobuf")
         .body(buf)
         .send()
         .await
-        .map_err(|_| StorageSyncError::ReadFailed)?;
-    if !response.status().is_success() {
-        return Err(StorageSyncError::ReadFailed);
+        .map_err(|err| {
+            let (class, status) = classify_reqwest_error(&err);
+            warn_storage_failure("read_raw_items", class, status, started);
+            RawStorageOpError::Failed(StorageSyncError::ReadFailed)
+        })?;
+    let status = response.status().as_u16();
+    if status == 401 {
+        return Err(RawStorageOpError::Unauthorized);
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| StorageSyncError::ReadFailed)?;
-    let items = StorageItems::decode(bytes.as_ref()).map_err(|_| StorageSyncError::ReadFailed)?;
+    if !response.status().is_success() {
+        warn_storage_failure(
+            "read_raw_items",
+            classify_http_status(status),
+            Some(status),
+            started,
+        );
+        return Err(RawStorageOpError::Failed(StorageSyncError::ReadFailed));
+    }
+    let bytes = response.bytes().await.map_err(|err| {
+        let (class, http_status) = classify_reqwest_error(&err);
+        warn_storage_failure("read_raw_items", class, http_status, started);
+        RawStorageOpError::Failed(StorageSyncError::ReadFailed)
+    })?;
+    let items = StorageItems::decode(bytes.as_ref()).map_err(|_| {
+        warn_storage_failure("read_raw_items", "decode", Some(status), started);
+        RawStorageOpError::Failed(StorageSyncError::ReadFailed)
+    })?;
     Ok(items.items)
+}
+
+/// 复用账号缓存的 `/v1/storage/auth` 执行 `PUT /v1/storage/read`；若遇到 401
+/// 自动失效旧凭据并刷新重试一次，消除同次读取重复认证。
+pub(crate) async fn read_raw_items_cached(
+    context: &StorageContext,
+    keys: Vec<Vec<u8>>,
+) -> Result<Vec<presage::libsignal_service::proto::StorageItem>, StorageSyncError> {
+    let started = std::time::Instant::now();
+    context
+        .storage_auth
+        .run_with_auth(
+            "read_raw_items",
+            || storage_auth(&context.push),
+            |auth| read_raw_items_once(&context.push, auth, keys.clone()),
+            |err| matches!(err, RawStorageOpError::Unauthorized),
+            RawStorageOpError::Failed,
+        )
+        .await
+        .map_err(|err| match err {
+            RawStorageOpError::Unauthorized => {
+                warn_storage_failure("read_raw_items", "unauthorized", Some(401), started);
+                StorageSyncError::ReadFailed
+            }
+            RawStorageOpError::Failed(sync_err) => sync_err,
+        })
 }
 
 // ---------------------------------------------------------------------------
 // 读/写面编排（Service 调用入口；网络面，不做网络测试）
 // ---------------------------------------------------------------------------
 
-/// Storage Service 句柄（上游 pub API；auth 换取在 `StorageService::new`
-/// 内部完成，与上游 storage_service.rs:103-128 同一模式）。
+fn clone_storage_key(key: &StorageServiceKey) -> StorageServiceKey {
+    StorageServiceKey { inner: key.inner }
+}
+
+/// 复用账号缓存的 `/v1/storage/auth` 拉取当前 manifest（404 → `Ok(None)`）；
+/// 若遇到 Storage 401 自动失效缓存并刷新重取一次。
+pub(crate) async fn fetch_manifest(
+    context: &StorageContext,
+    storage_key: &StorageServiceKey,
+    manifest_failure: StorageSyncError,
+) -> Result<Option<ManifestRecord>, StorageSyncError> {
+    enum ManifestOpError {
+        Auth(StorageSyncError),
+        Service(StorageServiceError),
+    }
+
+    let started = std::time::Instant::now();
+    let result = context
+        .storage_auth
+        .run_with_auth(
+            "manifest",
+            || storage_auth(&context.push),
+            |auth| {
+                let storage = StorageService::with_credentials(
+                    context.push.clone(),
+                    auth,
+                    clone_storage_key(storage_key),
+                );
+                async move {
+                    match storage.manifest().await {
+                        Ok(manifest) => Ok(Some(manifest)),
+                        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => Ok(None),
+                        Err(err) => Err(ManifestOpError::Service(err)),
+                    }
+                }
+            },
+            |err| {
+                matches!(
+                    err,
+                    ManifestOpError::Service(StorageServiceError::Service(
+                        ServiceError::Unauthorized
+                    ))
+                )
+            },
+            ManifestOpError::Auth,
+        )
+        .await;
+    match result {
+        Ok(manifest) => Ok(manifest),
+        Err(ManifestOpError::Auth(sync_err)) => Err(sync_err),
+        Err(ManifestOpError::Service(err)) => {
+            let (class, status) = classify_storage_service_error(&err);
+            warn_storage_failure("manifest", class, status, started);
+            Err(manifest_failure)
+        }
+    }
+}
+
+/// 复用账号缓存的 `/v1/storage/auth` 做条件 manifest 探测（204 → Same，
+/// 404 → NoServerState，401 自动失效缓存并刷新重试一次）。
+pub(crate) async fn fetch_manifest_if_changed(
+    context: &StorageContext,
+    storage_key: &StorageServiceKey,
+    version: u64,
+) -> ManifestVersionProbe {
+    enum ProbeOpError {
+        Auth,
+        Service(StorageServiceError),
+    }
+
+    let started = std::time::Instant::now();
+    let result = context
+        .storage_auth
+        .run_with_auth(
+            "manifest_if_changed",
+            || storage_auth(&context.push),
+            |auth| {
+                let storage = StorageService::with_credentials(
+                    context.push.clone(),
+                    auth,
+                    clone_storage_key(storage_key),
+                );
+                async move {
+                    match storage.manifest_if_changed(version).await {
+                        Ok(None) => Ok(ManifestVersionProbe::Same),
+                        Ok(Some(manifest)) => Ok(ManifestVersionProbe::Newer(manifest.version)),
+                        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
+                            Ok(ManifestVersionProbe::NoServerState)
+                        }
+                        Err(err) => Err(ProbeOpError::Service(err)),
+                    }
+                }
+            },
+            |err| {
+                matches!(
+                    err,
+                    ProbeOpError::Service(StorageServiceError::Service(
+                        ServiceError::Unauthorized
+                    ))
+                )
+            },
+            |_| ProbeOpError::Auth,
+        )
+        .await;
+    match result {
+        Ok(probe) => probe,
+        Err(ProbeOpError::Auth) => ManifestVersionProbe::Unavailable,
+        Err(ProbeOpError::Service(err)) => {
+            let (class, status) = classify_storage_service_error(&err);
+            warn_storage_failure("manifest_if_changed", class, status, started);
+            ManifestVersionProbe::Unavailable
+        }
+    }
+}
+
+/// Storage Service 句柄（复用账号缓存 auth；若需无缓存直连请用 `StorageService::new`）。
+#[allow(dead_code)]
 pub(crate) async fn open_storage_service(
     push: PushService,
     storage_key: StorageServiceKey,
 ) -> Result<StorageService, StorageSyncError> {
-    StorageService::new(push, storage_key)
-        .await
-        .map_err(|_| StorageSyncError::Unavailable)
+    let started = std::time::Instant::now();
+    StorageService::new(push, storage_key).await.map_err(|err| {
+        let (class, status) = classify_service_error(&err);
+        warn_storage_failure("open_storage_service", class, status, started);
+        StorageSyncError::Unavailable
+    })
 }
 
-/// Account item 原样读取（`PUT /v1/storage/read`，storage_auth 显式换取）
+/// Account item 原样读取（`PUT /v1/storage/read`，复用账号缓存 auth）
 /// → 本地 shim 解密 → 官方 vendored proto 解码（字段保真读面；不经 presage
 /// `read_items`——其解出类型缺 AccountRecord 52-60 字段面，读即丢失）。
 /// manifest 无 Account 标识或服务器缺 item → None；解密/解码失败 →
 /// ReadFailed。
 pub(crate) async fn read_account_record(
-    push: &PushService,
+    context: &StorageContext,
     storage_key: &StorageServiceKey,
     manifest: &ManifestRecord,
 ) -> Result<Option<AccountRecord>, StorageSyncError> {
@@ -947,8 +1159,7 @@ pub(crate) async fn read_account_record(
     };
     let ikm = manifest.record_ikm.as_slice();
     let record_ikm = if ikm.is_empty() { None } else { Some(ikm) };
-    let auth = storage_auth(push).await?;
-    let items = read_raw_items(push, auth, vec![key]).await?;
+    let items = read_raw_items_cached(context, vec![key]).await?;
     let Some(item) = items.into_iter().next() else {
         return Ok(None);
     };
@@ -972,24 +1183,12 @@ pub(crate) async fn read_own_account_record(
     else {
         return Ok(None);
     };
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
-    let manifest = match storage.manifest().await {
-        Ok(manifest) => manifest,
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
-            return Ok(None);
-        }
-        Err(_) => return Err(StorageSyncError::Unavailable),
+    let storage_key = StorageServiceKey::from_master_key(&master_key);
+    let Some(manifest) = fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await?
+    else {
+        return Ok(None);
     };
-    read_account_record(
-        &context.push,
-        &StorageServiceKey::from_master_key(&master_key),
-        &manifest,
-    )
-    .await
+    read_account_record(context, &storage_key, &manifest).await
 }
 
 /// 读面编排：master key → manifest → Account item → 引擎会话标识投影
@@ -1008,19 +1207,11 @@ pub(crate) async fn read_pinned(
         return Ok(Vec::new());
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
-    let manifest = match storage.manifest().await {
-        Ok(manifest) => manifest,
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
-            return Ok(Vec::new());
-        }
-        Err(_) => return Err(StorageSyncError::Unavailable),
+    let Some(manifest) = fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await?
+    else {
+        return Ok(Vec::new());
     };
-    let account = match read_account_record(&context.push, &storage_key, &manifest).await? {
+    let account = match read_account_record(context, &storage_key, &manifest).await? {
         Some(account) => account,
         None => return Ok(Vec::new()),
     };
@@ -1112,7 +1303,7 @@ pub(crate) fn blocked_conversation_of(plaintext: &[u8]) -> Option<BlockedConvers
 /// vendored proto 解码 → blocked 位过滤（存储序 = manifest identifiers 首
 /// 现序；单条坏 item 跳过不炸面，与贴纸批量读同纪律）。
 async fn read_blocked_ids(
-    push: &PushService,
+    context: &StorageContext,
     storage_key: &StorageServiceKey,
     manifest: &ManifestRecord,
 ) -> Result<Vec<BlockedConversation>, StorageSyncError> {
@@ -1137,8 +1328,7 @@ async fn read_blocked_ids(
     } else {
         Some(manifest.record_ikm.as_slice())
     };
-    let auth = storage_auth(push).await?;
-    let items = read_raw_items(push, auth, keys.clone()).await?;
+    let items = read_raw_items_cached(context, keys.clone()).await?;
     let mut out = Vec::new();
     for key in keys {
         let Some(item) = items.iter().find(|item| item.key == key) else {
@@ -1170,19 +1360,11 @@ pub(crate) async fn read_blocked_conversations(
         return Ok(Vec::new());
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
-    let manifest = match storage.manifest().await {
-        Ok(manifest) => manifest,
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
-            return Ok(Vec::new());
-        }
-        Err(_) => return Err(StorageSyncError::Unavailable),
+    let Some(manifest) = fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await?
+    else {
+        return Ok(Vec::new());
     };
-    read_blocked_ids(&context.push, &storage_key, &manifest).await
+    read_blocked_ids(context, &storage_key, &manifest).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,20 +1410,11 @@ pub(crate) async fn contact_whitelist_map(
 ) -> Option<HashMap<String, bool>> {
     let master_key = context.store.fetch_master_key().await.ok()??;
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let Ok(storage) = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await
-    else {
-        return None;
-    };
-    let manifest = match storage.manifest().await {
-        Ok(manifest) => manifest,
+    let manifest = match fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await
+    {
+        Ok(Some(manifest)) => manifest,
         // 从未有过 storage 状态 = 真实空面（与 read_blocked_ids 同口径）。
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
-            return Some(HashMap::new())
-        }
+        Ok(None) => return Some(HashMap::new()),
         Err(_) => return None,
     };
     let keys: Vec<Vec<u8>> = manifest
@@ -1264,10 +1437,7 @@ pub(crate) async fn contact_whitelist_map(
     } else {
         Some(manifest.record_ikm.as_slice())
     };
-    let Ok(auth) = storage_auth(&context.push).await else {
-        return None;
-    };
-    let Ok(items) = read_raw_items(&context.push, auth, keys).await else {
+    let Ok(items) = read_raw_items_cached(context, keys).await else {
         return None;
     };
     let mut out = HashMap::new();
@@ -1364,20 +1534,11 @@ fn contact_pni_string(contact: &storage_proto::ContactRecord) -> Option<String> 
 pub(crate) async fn contact_pni_map(context: &StorageContext) -> Option<HashMap<String, String>> {
     let master_key = context.store.fetch_master_key().await.ok()??;
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let Ok(storage) = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await
-    else {
-        return None;
-    };
-    let manifest = match storage.manifest().await {
-        Ok(manifest) => manifest,
+    let manifest = match fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await
+    {
+        Ok(Some(manifest)) => manifest,
         // 从未有过 storage 状态 = 真实空面（与 contact_whitelist_map 同口径）。
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
-            return Some(HashMap::new())
-        }
+        Ok(None) => return Some(HashMap::new()),
         Err(_) => return None,
     };
     let keys: Vec<Vec<u8>> = manifest
@@ -1400,10 +1561,7 @@ pub(crate) async fn contact_pni_map(context: &StorageContext) -> Option<HashMap<
     } else {
         Some(manifest.record_ikm.as_slice())
     };
-    let Ok(auth) = storage_auth(&context.push).await else {
-        return None;
-    };
-    let Ok(items) = read_raw_items(&context.push, auth, keys).await else {
+    let Ok(items) = read_raw_items_cached(context, keys).await else {
         return None;
     };
     let mut out = HashMap::new();
@@ -1610,7 +1768,7 @@ struct ConversationItem {
 }
 
 async fn read_conversation_items(
-    push: &PushService,
+    context: &StorageContext,
     storage_key: &StorageServiceKey,
     manifest: Option<&ManifestRecord>,
 ) -> Result<Vec<ConversationItem>, StorageSyncError> {
@@ -1638,8 +1796,7 @@ async fn read_conversation_items(
     } else {
         Some(manifest.record_ikm.as_slice())
     };
-    let auth = storage_auth(push).await?;
-    let items = read_raw_items(push, auth, keys.clone()).await?;
+    let items = read_raw_items_cached(context, keys.clone()).await?;
     let mut out = Vec::new();
     for key in keys {
         let Some(item) = items.iter().find(|item| item.key == key) else {
@@ -1722,27 +1879,22 @@ pub(crate) async fn write_blocked(
         }
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
-    let mut manifest: Option<ManifestRecord> = match storage.manifest().await {
-        Ok(record) => {
-            // 有 manifest 无 Account 标识 = 非法状态（置顶/贴纸面同口径）。
-            if account_item_key_of(&record).is_none() {
-                return Err(StorageSyncError::WriteFailed);
+    let mut manifest: Option<ManifestRecord> =
+        match fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await? {
+            Some(record) => {
+                // 有 manifest 无 Account 标识 = 非法状态（置顶/贴纸面同口径）。
+                if account_item_key_of(&record).is_none() {
+                    return Err(StorageSyncError::WriteFailed);
+                }
+                Some(record)
             }
-            Some(record)
-        }
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => None,
-        Err(_) => return Err(StorageSyncError::Unavailable),
-    };
+            None => None,
+        };
 
     // 冲突重放循环：每轮从「当前服务器状态 + 本地意图」重建 WriteOperation。
     let mut retries: u32 = 0;
     loop {
-        let items = read_conversation_items(&context.push, &storage_key, manifest.as_ref()).await?;
+        let items = read_conversation_items(context, &storage_key, manifest.as_ref()).await?;
         let found = items
             .iter()
             .find(|item| conversation_record_of(&item.plaintext).as_ref() == Some(&canonical));
@@ -1782,8 +1934,7 @@ pub(crate) async fn write_blocked(
         });
         let planned = plan_record_writes(previous, &upserts, context.device_id, &storage_key);
 
-        let auth = storage_auth(&context.push).await?;
-        match put_write_operation(&context.push, auth, &planned.write_operation).await? {
+        match put_write_operation_cached(context, &planned.write_operation).await? {
             PutOutcome {
                 conflict_manifest: None,
             } => {
@@ -1858,35 +2009,26 @@ pub(crate) async fn update_account_record(
             generated
         }
     };
-    // StorageService::new 按值收 key：句柄持有一份，plan/decrypt 复用另一份
-    // （from_master_key 确定性派生，同 master key 两次派生等价）。
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
 
     // manifest 404（从未有过 storage 状态）：以 version 1 + 最小
     // AccountRecord 建初始 manifest（compat §5 登记分支）。Account item
     // 读面走官方 vendored proto（read_account_record，字段保真）；读失败
     // 归 WriteFailed（写意图未落地）。
-    let (manifest, account) = match storage.manifest().await {
-        Ok(manifest) => {
-            if account_item_key_of(&manifest).is_none() {
-                return Err(StorageSyncError::WriteFailed);
+    let (manifest, account) =
+        match fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await? {
+            Some(manifest) => {
+                if account_item_key_of(&manifest).is_none() {
+                    return Err(StorageSyncError::WriteFailed);
+                }
+                let account = read_account_record(context, &storage_key, &manifest)
+                    .await
+                    .map_err(|_| StorageSyncError::WriteFailed)?
+                    .ok_or(StorageSyncError::WriteFailed)?;
+                (Some(manifest), account)
             }
-            let account = read_account_record(&context.push, &storage_key, &manifest)
-                .await
-                .map_err(|_| StorageSyncError::WriteFailed)?
-                .ok_or(StorageSyncError::WriteFailed)?;
-            Ok((Some(manifest), account))
-        }
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
-            Ok((None, minimal_account_record(Vec::new())))
-        }
-        Err(_) => Err(StorageSyncError::Unavailable),
-    }?;
+            None => (None, minimal_account_record(Vec::new())),
+        };
 
     // 冲突重放循环：每轮从「当前服务器状态 + 本地意图」重建 WriteOperation；
     // adopted = 409 采纳的服务器 (manifest, Account item)。
@@ -1909,8 +2051,7 @@ pub(crate) async fn update_account_record(
             &storage_key,
         );
 
-        let auth = storage_auth(&context.push).await?;
-        match put_write_operation(&context.push, auth, &planned.write_operation).await? {
+        match put_write_operation_cached(context, &planned.write_operation).await? {
             PutOutcome {
                 conflict_manifest: None,
             } => {
@@ -1945,11 +2086,10 @@ pub(crate) async fn update_account_record(
                     if account_item_key_of(&decrypted).is_none() {
                         return Err(StorageSyncError::WriteFailed);
                     }
-                    let server_account =
-                        read_account_record(&context.push, &storage_key, &decrypted)
-                            .await
-                            .map_err(|_| StorageSyncError::WriteFailed)?
-                            .ok_or(StorageSyncError::WriteFailed)?;
+                    let server_account = read_account_record(context, &storage_key, &decrypted)
+                        .await
+                        .map_err(|_| StorageSyncError::WriteFailed)?
+                        .ok_or(StorageSyncError::WriteFailed)?;
                     current = (Some(decrypted), server_account);
                 }
             },
@@ -1965,6 +2105,8 @@ pub(crate) async fn write_pinned(
     target: EngineConversationId,
     pinned: bool,
 ) -> Result<Vec<PinnedEntry>, StorageSyncError> {
+    // 用户主动写入立即清空置顶读面短负缓存，避免写入后刷新仍被旧错误阻塞。
+    context.records.clear_pinned_negative();
     // 本地意图先解析（解析失败 fail-closed，不发请求）：
     // contact → serviceId（ACI 优先，本机号走注册数据）；group → master key。
     let new_pinned_proto: PinnedConversation = match &target {
@@ -2260,19 +2402,11 @@ pub(crate) async fn read_conversation_state(
         return Ok((canonical, ConversationState::default()));
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
-    let manifest = match storage.manifest().await {
-        Ok(manifest) => manifest,
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => {
-            return Ok((canonical, ConversationState::default()));
-        }
-        Err(_) => return Err(StorageSyncError::Unavailable),
+    let Some(manifest) = fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await?
+    else {
+        return Ok((canonical, ConversationState::default()));
     };
-    let items = read_conversation_items(&context.push, &storage_key, Some(&manifest)).await?;
+    let items = read_conversation_items(context, &storage_key, Some(&manifest)).await?;
     let found = items
         .iter()
         .find(|item| conversation_record_of(&item.plaintext).as_ref() == Some(&canonical));
@@ -2324,25 +2458,20 @@ pub(crate) async fn write_conversation_state(
         }
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
-    let mut manifest: Option<ManifestRecord> = match storage.manifest().await {
-        Ok(record) => {
-            if account_item_key_of(&record).is_none() {
-                return Err(StorageSyncError::WriteFailed);
+    let mut manifest: Option<ManifestRecord> =
+        match fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await? {
+            Some(record) => {
+                if account_item_key_of(&record).is_none() {
+                    return Err(StorageSyncError::WriteFailed);
+                }
+                Some(record)
             }
-            Some(record)
-        }
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => None,
-        Err(_) => return Err(StorageSyncError::Unavailable),
-    };
+            None => None,
+        };
 
     let mut retries: u32 = 0;
     loop {
-        let items = read_conversation_items(&context.push, &storage_key, manifest.as_ref()).await?;
+        let items = read_conversation_items(context, &storage_key, manifest.as_ref()).await?;
         let found = items
             .iter()
             .find(|item| conversation_record_of(&item.plaintext).as_ref() == Some(&canonical));
@@ -2399,8 +2528,7 @@ pub(crate) async fn write_conversation_state(
         });
         let planned = plan_record_writes(previous, &upserts, context.device_id, &storage_key);
 
-        let auth = storage_auth(&context.push).await?;
-        match put_write_operation(&context.push, auth, &planned.write_operation).await? {
+        match put_write_operation_cached(context, &planned.write_operation).await? {
             PutOutcome {
                 conflict_manifest: None,
             } => {
@@ -2745,8 +2873,355 @@ fn same_storage_identity(a: &PinnedConversation, b: &PinnedConversation) -> bool
     }
 }
 
+// ---------------------------------------------------------------------------
+// Storage Auth 按账号缓存 + 401 自动失效刷新 + 脱敏错误分类日志
+// ---------------------------------------------------------------------------
+
+/// `/v1/storage/auth` 短生命期凭据本地缓存 TTL（服务端有效 ~24h；本地取 20 分钟
+/// 兼顾少往返与凭据轮换新鲜度，遇到 Storage 401 也会立即失效并重取一次）。
+pub(crate) const STORAGE_AUTH_CACHE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(20 * 60);
+
+struct CachedStorageAuth {
+    auth: presage::libsignal_service::push_service::HttpAuth,
+    fetched_at: std::time::Instant,
+}
+
+struct AuthInFlight {
+    generation: u64,
+    rx: tokio::sync::watch::Receiver<
+        Option<Result<presage::libsignal_service::push_service::HttpAuth, StorageSyncError>>,
+    >,
+}
+
+struct AuthCacheInner {
+    entry: Option<CachedStorageAuth>,
+    inflight: Option<AuthInFlight>,
+    generation: u64,
+}
+
+struct AuthInFlightGuard<'a> {
+    inner: &'a std::sync::Mutex<AuthCacheInner>,
+    generation: u64,
+    active: bool,
+}
+
+impl Drop for AuthInFlightGuard<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner
+                .inflight
+                .as_ref()
+                .is_some_and(|f| f.generation == self.generation)
+            {
+                inner.inflight = None;
+            }
+        }
+    }
+}
+
+/// 单账号 `/v1/storage/auth` 凭据缓存（挂在 `StorageContext` 上，clone 共享，
+/// 账号删除/重链随 `StorageContext` 一并丢弃，绝不跨账号共享）。
+///
+/// 并发未命中时通过广播 single-flight 合并为单次 `/v1/storage/auth` 请求，
+/// 避免并发读同时打爆认证接口或串行放大失败。
+pub(crate) struct StorageAuthCache {
+    ttl: std::time::Duration,
+    inner: std::sync::Mutex<AuthCacheInner>,
+}
+
+impl StorageAuthCache {
+    pub(crate) fn new() -> Self {
+        Self::with_ttl(STORAGE_AUTH_CACHE_TTL)
+    }
+
+    fn with_ttl(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            inner: std::sync::Mutex::new(AuthCacheInner {
+                entry: None,
+                inflight: None,
+                generation: 0,
+            }),
+        }
+    }
+
+    /// 显式失效当前账号的缓存凭据。
+    #[allow(dead_code)]
+    pub(crate) fn invalidate(&self) {
+        let mut inner = self.inner.lock().expect("storage auth cache poisoned");
+        inner.entry = None;
+        inner.inflight = None;
+        inner.generation = inner.generation.wrapping_add(1);
+    }
+
+    /// Compare-and-invalidate：仅当缓存中的凭据仍与本次触发 401 的旧凭据一致时
+    /// 才摘除，防止并发刷新后被晚到的 401 错误误删新凭据。
+    pub(crate) fn invalidate_if_matches(
+        &self,
+        stale: &presage::libsignal_service::push_service::HttpAuth,
+    ) {
+        let mut inner = self.inner.lock().expect("storage auth cache poisoned");
+        if inner.entry.as_ref().is_some_and(|cached| {
+            cached.auth.username == stale.username && cached.auth.password == stale.password
+        }) {
+            inner.entry = None;
+            inner.generation = inner.generation.wrapping_add(1);
+        }
+    }
+
+    /// 取用有效缓存凭据，或在未命中/过期时单飞回源拉取并缓存。
+    pub(crate) async fn get_or_fetch<F, Fut>(
+        &self,
+        fetch: F,
+    ) -> Result<presage::libsignal_service::push_service::HttpAuth, StorageSyncError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<
+            Output = Result<presage::libsignal_service::push_service::HttpAuth, StorageSyncError>,
+        >,
+    {
+        self.get_or_fetch_at(std::time::Instant::now(), fetch).await
+    }
+
+    async fn get_or_fetch_at<F, Fut>(
+        &self,
+        now: std::time::Instant,
+        fetch: F,
+    ) -> Result<presage::libsignal_service::push_service::HttpAuth, StorageSyncError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<
+            Output = Result<presage::libsignal_service::push_service::HttpAuth, StorageSyncError>,
+        >,
+    {
+        use presage::libsignal_service::push_service::HttpAuth;
+        enum Action {
+            Wait(tokio::sync::watch::Receiver<Option<Result<HttpAuth, StorageSyncError>>>),
+            Lead {
+                tx: tokio::sync::watch::Sender<Option<Result<HttpAuth, StorageSyncError>>>,
+                generation: u64,
+            },
+        }
+
+        let mut fetch = Some(fetch);
+        loop {
+            let action = {
+                let mut inner = self.inner.lock().expect("storage auth cache poisoned");
+                if let Some(cached) = inner.entry.as_ref() {
+                    if now.saturating_duration_since(cached.fetched_at) < self.ttl {
+                        return Ok(cached.auth.clone());
+                    }
+                    inner.entry = None;
+                }
+                if let Some(inflight) = inner.inflight.as_ref() {
+                    if inflight.generation == inner.generation {
+                        Action::Wait(inflight.rx.clone())
+                    } else {
+                        let (tx, rx) = tokio::sync::watch::channel(None);
+                        let generation = inner.generation;
+                        inner.inflight = Some(AuthInFlight { generation, rx });
+                        Action::Lead { tx, generation }
+                    }
+                } else {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    let generation = inner.generation;
+                    inner.inflight = Some(AuthInFlight { generation, rx });
+                    Action::Lead { tx, generation }
+                }
+            };
+
+            match action {
+                Action::Wait(mut rx) => {
+                    let outcome = loop {
+                        if let Some(result) = rx.borrow().clone() {
+                            break Some(result);
+                        }
+                        if rx.changed().await.is_err() {
+                            break rx.borrow().clone();
+                        }
+                    };
+                    match outcome {
+                        Some(result) => return result,
+                        None => continue,
+                    }
+                }
+                Action::Lead { tx, generation } => {
+                    let mut guard = AuthInFlightGuard {
+                        inner: &self.inner,
+                        generation,
+                        active: true,
+                    };
+                    let fetch_fn = fetch.take().expect("lead executes at most once");
+                    let result = fetch_fn().await;
+                    guard.active = false;
+                    {
+                        let mut inner = self.inner.lock().expect("storage auth cache poisoned");
+                        if inner
+                            .inflight
+                            .as_ref()
+                            .is_some_and(|f| f.generation == generation)
+                        {
+                            inner.inflight = None;
+                        }
+                        if let Ok(auth) = result.as_ref() {
+                            if inner.generation == generation {
+                                inner.entry = Some(CachedStorageAuth {
+                                    auth: auth.clone(),
+                                    fetched_at: now,
+                                });
+                            }
+                        }
+                    }
+                    let _ = tx.send(Some(result.clone()));
+                    return result;
+                }
+            }
+        }
+    }
+
+    /// 使用缓存凭据执行一次 Storage 操作；若服务端返回 401 Unauthorized，
+    /// 自动失效旧凭据、单次刷新并重试一次（至多一次重试，绝不死循环）。
+    pub(crate) async fn run_with_auth<T, E, Fetch, FetchFut, Op, OpFut>(
+        &self,
+        op_name: &'static str,
+        mut fetch_auth: Fetch,
+        mut op: Op,
+        is_unauthorized: impl Fn(&E) -> bool,
+        map_auth_err: impl Fn(StorageSyncError) -> E,
+    ) -> Result<T, E>
+    where
+        Fetch: FnMut() -> FetchFut,
+        FetchFut: std::future::Future<
+            Output = Result<presage::libsignal_service::push_service::HttpAuth, StorageSyncError>,
+        >,
+        Op: FnMut(presage::libsignal_service::push_service::HttpAuth) -> OpFut,
+        OpFut: std::future::Future<Output = Result<T, E>>,
+    {
+        let auth = self
+            .get_or_fetch(|| fetch_auth())
+            .await
+            .map_err(&map_auth_err)?;
+        match op(auth.clone()).await {
+            Ok(value) => Ok(value),
+            Err(err) if is_unauthorized(&err) => {
+                tracing::warn!(
+                    target: "engine.storage",
+                    op = op_name,
+                    error_class = "unauthorized",
+                    http_status = 401u16,
+                    "storage auth rejected with 401; invalidating cached credentials and refreshing once"
+                );
+                self.invalidate_if_matches(&auth);
+                let fresh = self
+                    .get_or_fetch(|| fetch_auth())
+                    .await
+                    .map_err(&map_auth_err)?;
+                op(fresh).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_cached(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("storage auth cache poisoned")
+            .entry
+            .is_some()
+    }
+}
+
+/// 脱敏 HTTP 状态码分类（固定字面量，不含响应正文/凭据/号码）。
+pub(crate) fn classify_http_status(status: u16) -> &'static str {
+    match status {
+        401 => "unauthorized",
+        403 => "forbidden",
+        404 => "not_found",
+        409 => "conflict",
+        429 => "rate_limited",
+        500..=599 => "http_5xx",
+        400..=499 => "http_4xx",
+        _ => "http_status",
+    }
+}
+
+/// 脱敏 reqwest 传输错误分类（固定字面量 + 可选数值状态码，绝不打印 URL/正文/凭据）。
+pub(crate) fn classify_reqwest_error(err: &reqwest::Error) -> (&'static str, Option<u16>) {
+    let status = err.status().map(|s| s.as_u16());
+    let class = if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect"
+    } else if err.is_decode() || err.is_body() {
+        "decode"
+    } else if err.is_redirect() {
+        "redirect"
+    } else if let Some(code) = status {
+        classify_http_status(code)
+    } else if err.is_request() {
+        "request"
+    } else {
+        "http_transport"
+    };
+    (class, status)
+}
+
+/// 脱敏 `ServiceError` 分类（固定字面量 + 可选数值状态码，严禁输出 body/token/账号）。
+pub(crate) fn classify_service_error(err: &ServiceError) -> (&'static str, Option<u16>) {
+    match err {
+        ServiceError::Timeout { .. } => ("timeout", None),
+        ServiceError::Unauthorized => ("unauthorized", Some(401)),
+        ServiceError::NotFoundError => ("not_found", Some(404)),
+        ServiceError::RateLimitExceeded { .. } => ("rate_limited", Some(429)),
+        ServiceError::UnhandledResponseCode { status, .. } => {
+            let code = status.as_u16();
+            (classify_http_status(code), Some(code))
+        }
+        ServiceError::Http(reqwest_err) => classify_reqwest_error(reqwest_err),
+        ServiceError::JsonDecodeError(_) | ServiceError::ProtobufDecodeError(_) => ("decode", None),
+        ServiceError::IO(_) => ("io", None),
+        ServiceError::SendError { .. } => ("send", None),
+        ServiceError::ServerRejected => ("server_rejected", None),
+        ServiceError::DeprecatedVersion => ("deprecated_version", None),
+        ServiceError::WsError(_) | ServiceError::WsClosing { .. } => ("ws", None),
+        _ => ("service_error", None),
+    }
+}
+
+/// 脱敏 `StorageServiceError` 分类。
+pub(crate) fn classify_storage_service_error(
+    err: &StorageServiceError,
+) -> (&'static str, Option<u16>) {
+    match err {
+        StorageServiceError::Invalid => ("invalid_blob", None),
+        StorageServiceError::Service(service_err) => classify_service_error(service_err),
+    }
+}
+
+fn warn_storage_failure(
+    op: &'static str,
+    error_class: &'static str,
+    http_status: Option<u16>,
+    started: std::time::Instant,
+) {
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::warn!(
+        target: "engine.storage",
+        op,
+        error_class,
+        http_status,
+        duration_ms,
+        "storage request failed"
+    );
+}
+
 /// `GET /v1/storage/auth` 换 short-lived 基本认证（上游
-/// StorageService::new 同款模式；写面 PUT 与贴纸面批量读需显式 auth 透传）。
+/// StorageService::new 同款模式；写面 PUT 与批量读通过 `StorageAuthCache` 复用）。
 pub(crate) async fn storage_auth(
     push: &PushService,
 ) -> Result<presage::libsignal_service::push_service::HttpAuth, StorageSyncError> {
@@ -2756,23 +3231,38 @@ pub(crate) async fn storage_auth(
         username: String,
         password: String,
     }
-    let response = push
+    let started = std::time::Instant::now();
+    let request = push
         .request(
             reqwest::Method::GET,
             Endpoint::service("/v1/storage/auth"),
             HttpAuthOverride::NoOverride,
         )
-        .map_err(|_| StorageSyncError::Unavailable)?
-        .send()
-        .await
-        .map_err(|_| StorageSyncError::Unavailable)?;
+        .map_err(|err| {
+            let (class, status) = classify_service_error(&err);
+            warn_storage_failure("storage_auth", class, status, started);
+            StorageSyncError::Unavailable
+        })?;
+    let response = request.send().await.map_err(|err| {
+        let (class, status) = classify_reqwest_error(&err);
+        warn_storage_failure("storage_auth", class, status, started);
+        StorageSyncError::Unavailable
+    })?;
+    let status = response.status().as_u16();
     if !response.status().is_success() {
+        warn_storage_failure(
+            "storage_auth",
+            classify_http_status(status),
+            Some(status),
+            started,
+        );
         return Err(StorageSyncError::Unavailable);
     }
-    let auth: StorageAuthResponse = response
-        .json()
-        .await
-        .map_err(|_| StorageSyncError::Unavailable)?;
+    let auth: StorageAuthResponse = response.json().await.map_err(|err| {
+        let (class, http_status) = classify_reqwest_error(&err);
+        warn_storage_failure("storage_auth", class, http_status.or(Some(status)), started);
+        StorageSyncError::Unavailable
+    })?;
     Ok(presage::libsignal_service::push_service::HttpAuth {
         username: auth.username,
         password: auth.password,
@@ -4434,5 +4924,244 @@ mod tests {
         assert_eq!(contact_pni_of(&group), None);
         // 坏明文 → None。
         assert_eq!(contact_pni_of(&[0xffu8, 0xff]), None);
+    }
+
+    fn test_auth(tag: &str) -> presage::libsignal_service::push_service::HttpAuth {
+        presage::libsignal_service::push_service::HttpAuth {
+            username: format!("user-{tag}"),
+            password: format!("pass-{tag}"),
+        }
+    }
+
+    /// StorageAuthCache 命中与 TTL 过期：TTL 内连续两次取用（如 manifest +
+    /// read_raw_items）只打一次 `/v1/storage/auth`，过期后再懒刷新。
+    #[tokio::test]
+    async fn storage_auth_cache_hits_within_ttl_and_refreshes_after_expiry() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+
+        let cache = StorageAuthCache::with_ttl(Duration::from_secs(60));
+        let fetches = AtomicU64::new(0);
+        let t0 = Instant::now();
+
+        let first = cache
+            .get_or_fetch_at(t0, || async {
+                let n = fetches.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(test_auth(&n.to_string()))
+            })
+            .await
+            .expect("first fetch");
+        assert_eq!(first.username, "user-1");
+        assert_eq!(fetches.load(Ordering::Relaxed), 1);
+
+        // 59s 后仍命中缓存（模拟同次读的 manifest + read_raw_items 复用）。
+        let second = cache
+            .get_or_fetch_at(t0 + Duration::from_secs(59), || async {
+                fetches.fetch_add(1, Ordering::Relaxed);
+                Ok(test_auth("unexpected"))
+            })
+            .await
+            .expect("cached hit");
+        assert_eq!(second.username, "user-1");
+        assert_eq!(fetches.load(Ordering::Relaxed), 1, "TTL 内不得重复拉取 auth");
+
+        // 满 60s 过期后重新拉取。
+        let third = cache
+            .get_or_fetch_at(t0 + Duration::from_secs(60), || async {
+                let n = fetches.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(test_auth(&n.to_string()))
+            })
+            .await
+            .expect("refreshed fetch");
+        assert_eq!(third.username, "user-2");
+        assert_eq!(fetches.load(Ordering::Relaxed), 2);
+    }
+
+    /// 遇到 Storage 401 时自动失效旧凭据并单次刷新重试；持续 401 至多刷新一次不死循环；
+    /// 并发已刷新新凭据时，晚到 401 不会误删新凭据（compare-and-invalidate）。
+    #[tokio::test]
+    async fn storage_auth_cache_401_invalidates_and_retries_once() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let cache = StorageAuthCache::new();
+        let auth_fetches = AtomicU64::new(0);
+        let op_calls = AtomicU64::new(0);
+
+        // 预热旧凭据 token-1。
+        let seeded = cache
+            .get_or_fetch(|| async {
+                let n = auth_fetches.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(test_auth(&n.to_string()))
+            })
+            .await
+            .expect("seed");
+        assert_eq!(seeded.username, "user-1");
+        assert_eq!(auth_fetches.load(Ordering::Relaxed), 1);
+
+        // 首次执行用缓存的 user-1 遭 401 → 自动失效并拉取 user-2 → 重试成功。
+        let outcome: Result<String, u16> = cache
+            .run_with_auth(
+                "test_op",
+                || async {
+                    let n = auth_fetches.fetch_add(1, Ordering::Relaxed) + 1;
+                    Ok(test_auth(&n.to_string()))
+                },
+                |auth| {
+                    let attempt = op_calls.fetch_add(1, Ordering::Relaxed) + 1;
+                    async move {
+                        if auth.username == "user-1" {
+                            Err(401u16)
+                        } else {
+                            Ok(format!("ok-with-{}-attempt-{}", auth.username, attempt))
+                        }
+                    }
+                },
+                |code| *code == 401,
+                |_| 503u16,
+            )
+            .await;
+        assert_eq!(outcome, Ok("ok-with-user-2-attempt-2".to_owned()));
+        assert_eq!(auth_fetches.load(Ordering::Relaxed), 2, "401 后应刷新一次");
+        assert_eq!(op_calls.load(Ordering::Relaxed), 2, "401 后应重试一次");
+
+        // 晚到旧凭据 user-1 的失效请求不得误删已刷新的 user-2。
+        cache.invalidate_if_matches(&seeded);
+        let still_cached = cache
+            .get_or_fetch(|| async {
+                auth_fetches.fetch_add(1, Ordering::Relaxed);
+                Ok(test_auth("should-not-fetch"))
+            })
+            .await
+            .expect("still cached");
+        assert_eq!(still_cached.username, "user-2");
+        assert_eq!(auth_fetches.load(Ordering::Relaxed), 2);
+
+        // 持续 401 时至多刷新并重试一次，绝不无限循环。
+        let persist_fetches = AtomicU64::new(0);
+        let persist_ops = AtomicU64::new(0);
+        let persistent: Result<(), u16> = cache
+            .run_with_auth(
+                "test_persist_401",
+                || async {
+                    let n = persist_fetches.fetch_add(1, Ordering::Relaxed) + 1;
+                    Ok(test_auth(&format!("p-{n}")))
+                },
+                |_auth| {
+                    persist_ops.fetch_add(1, Ordering::Relaxed);
+                    async { Err(401u16) }
+                },
+                |code| *code == 401,
+                |_| 503u16,
+            )
+            .await;
+        assert_eq!(persistent, Err(401));
+        assert_eq!(persist_fetches.load(Ordering::Relaxed), 1, "仅刷新一次");
+        assert_eq!(persist_ops.load(Ordering::Relaxed), 2, "初次 + 单次重试");
+    }
+
+    /// StorageAuthCache 并发单飞：多个并发未命中只打一次 `/v1/storage/auth`，
+    /// 失败时所有等待者共享同一错误不串行重放。
+    #[tokio::test]
+    async fn storage_auth_cache_single_flight_shares_error_without_replay() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let cache = Arc::new(StorageAuthCache::new());
+        let fetches = Arc::new(AtomicU64::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let leader = {
+            let cache = Arc::clone(&cache);
+            let fetches = Arc::clone(&fetches);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                cache
+                    .get_or_fetch(move || async move {
+                        fetches.fetch_add(1, Ordering::Relaxed);
+                        entered.notify_one();
+                        release.notified().await;
+                        Err(StorageSyncError::Unavailable)
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let cache = Arc::clone(&cache);
+            let fetches = Arc::clone(&fetches);
+            waiters.push(tokio::spawn(async move {
+                cache
+                    .get_or_fetch(move || async move {
+                        fetches.fetch_add(1, Ordering::Relaxed);
+                        Ok(test_auth("unexpected"))
+                    })
+                    .await
+            }));
+        }
+        tokio::task::yield_now().await;
+        release.notify_one();
+
+        assert_eq!(
+            leader.await.expect("leader").unwrap_err(),
+            StorageSyncError::Unavailable
+        );
+        for waiter in waiters {
+            assert_eq!(
+                waiter.await.expect("waiter").unwrap_err(),
+                StorageSyncError::Unavailable
+            );
+        }
+        assert_eq!(fetches.load(Ordering::Relaxed), 1, "并发 auth 失败不得重放");
+        assert!(!cache.has_cached(), "失败不得写入 auth 缓存");
+    }
+
+    /// 脱敏错误分类器覆盖：仅返回固定字面量类别与数值状态码，绝不包含正文/凭据。
+    #[test]
+    fn sanitized_storage_error_classification() {
+        assert_eq!(classify_http_status(401), "unauthorized");
+        assert_eq!(classify_http_status(403), "forbidden");
+        assert_eq!(classify_http_status(404), "not_found");
+        assert_eq!(classify_http_status(409), "conflict");
+        assert_eq!(classify_http_status(429), "rate_limited");
+        assert_eq!(classify_http_status(502), "http_5xx");
+        assert_eq!(classify_http_status(400), "http_4xx");
+
+        assert_eq!(
+            classify_service_error(&ServiceError::Timeout {
+                reason: "dial timeout"
+            }),
+            ("timeout", None)
+        );
+        assert_eq!(
+            classify_service_error(&ServiceError::Unauthorized),
+            ("unauthorized", Some(401))
+        );
+        assert_eq!(
+            classify_service_error(&ServiceError::RateLimitExceeded { retry_after: None }),
+            ("rate_limited", Some(429))
+        );
+        assert_eq!(
+            classify_service_error(&ServiceError::UnhandledResponseCode {
+                status: reqwest::StatusCode::BAD_GATEWAY,
+                body: "secret-token-must-never-leak".to_owned(),
+            }),
+            ("http_5xx", Some(502))
+        );
+        assert_eq!(
+            classify_service_error(&ServiceError::IO(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset"
+            ))),
+            ("io", None)
+        );
+        assert_eq!(
+            classify_storage_service_error(&StorageServiceError::Invalid),
+            ("invalid_blob", None)
+        );
     }
 }

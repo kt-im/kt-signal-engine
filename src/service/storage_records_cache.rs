@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Storage 记录按账号缓存（BUG-6 收尾：sticker/folders/pinned 三类读面）。
+//! Storage 记录按账号缓存（BUG-6 收尾：sticker/folders/pinned 三类读面；
+//! 2026-11-26 防雪崩加固：按槽位广播 single-flight + 短负缓存）。
 //!
 //! 背景：`StorageContextCache`（BUG-6 第一批）消掉的是**开库税**
 //! （open_store + 注册数据 + PushService）。storage.* 读面仍逐次付
@@ -18,12 +19,18 @@
 //!   2) 60s TTL 下限：条目自填充/写穿起 60s 内命中，超过即视为过期，
 //!      下一次读才回源——**不做主动/定时刷新**。
 //! - 写穿：本机写面成功即以返回的全量投影更新对应槽（写后真相 =
-//!   云端真相），不额外回源。
-//! - 错误不缓存：读面失败原样上抛，下一次读重新回源（幂等读面纪律）。
-//!
-//! 并发：命中走 std Mutex 短临界区（毫秒内完成 clone）；未命中由单飞
-//! `AsyncMutex` 串行回源——同账号并发 miss 只打一次网络，其余调用等
-//! 结果后按命中返回。锁序恒为「fill → inner」，`inner` 临界区内无 await。
+//!   云端真相），不额外回源，并立即清空对应槽的失败负缓存。
+//! - 并发与防护航放大：命中走 std Mutex 短临界区（毫秒内完成 clone）；
+//!   未命中按槽位（`pinned` / `records(kind)` / `sticker_packs` 互不互斥）
+//!   走广播型 single-flight——同槽同代并发 miss 只打一次网络，其余等待者
+//!   经 `watch` 共享本次回源的 `Ok`/`Err` 结局，绝不释放锁后串行重放 N 次。
+//!   临界区内无 `.await`，leader 取消时 drop guard 自动清理在飞槽，等待者
+//!   立刻接管或重试。
+//! - 短失败负缓存/退避：单次回源失败后在极短窗口（`STORAGE_RECORD_ERROR_BACKOFF_MS`
+//!   = 2.5s，从回源结束时刻起算）内直接快返错误，避免上游/代理短暂不可达
+//!   时并发读打爆代理；任何写操作（`store_*` / `clear_negative_cache` /
+//!   `clear_*_negative`）或显式 `invalidate()` 立即清空负缓存，不影响用户
+//!   主动写入后的刷新。
 //! 上界 = 账号数（惰性建立、随上下文销毁），无需额外 LRU。
 
 use std::collections::HashMap;
@@ -32,7 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::Value;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::watch;
 
 use crate::service::storage_sticker::StickerPackSync;
 use crate::service::storage_sync::{PinnedEntry, StorageRecordKind, StorageSyncError};
@@ -40,107 +47,322 @@ use crate::service::storage_sync::{PinnedEntry, StorageRecordKind, StorageSyncEr
 /// 条目新鲜度下限（用户裁决：60s TTL 下限；事件失效是另一条独立信号）。
 pub(crate) const STORAGE_RECORD_CACHE_TTL_MS: u64 = 60_000;
 
+/// 读面失败短负缓存/退避窗口（毫秒）：避免上游短暂不可达时并发读打爆代理，
+/// 同时足够短以便上游恢复后快速自愈，且任何写操作或 `invalidate()` 立即清空。
+pub(crate) const STORAGE_RECORD_ERROR_BACKOFF_MS: u64 = 2_500;
+
 /// `(填充时刻毫秒, 投影)`；时刻口径 = 引擎墙钟（`now_ms`）。
 type Stamped<T> = (u64, T);
 
+type InFlightOutcome<T> = Result<Arc<Vec<T>>, StorageSyncError>;
+
+struct InFlight<T> {
+    generation: u64,
+    rx: watch::Receiver<Option<InFlightOutcome<T>>>,
+}
+
+struct Slot<T> {
+    cached: Option<Stamped<Arc<Vec<T>>>>,
+    negative: Option<(u64, StorageSyncError)>,
+    inflight: Option<InFlight<T>>,
+    /// 槽级写穿/失效代数：跨代回源不得覆盖写穿新值或旧错污染新代。
+    generation: u64,
+    /// 槽级负缓存清除代数：写操作清负缓存后，在飞旧失败不得重新落负缓存。
+    negative_generation: u64,
+}
+
+impl<T> Default for Slot<T> {
+    fn default() -> Self {
+        Self {
+            cached: None,
+            negative: None,
+            inflight: None,
+            generation: 0,
+            negative_generation: 0,
+        }
+    }
+}
+
+impl<T> Slot<T> {
+    fn store(&mut self, now_ms: u64, value: Arc<Vec<T>>) {
+        self.cached = Some((now_ms, value));
+        self.negative = None;
+        self.inflight = None;
+        self.generation = self.generation.wrapping_add(1);
+        self.negative_generation = self.negative_generation.wrapping_add(1);
+    }
+
+    fn clear_negative(&mut self) {
+        self.negative = None;
+        self.negative_generation = self.negative_generation.wrapping_add(1);
+    }
+
+    fn invalidate(&mut self) {
+        self.cached = None;
+        self.negative = None;
+        self.inflight = None;
+        self.generation = self.generation.wrapping_add(1);
+        self.negative_generation = self.negative_generation.wrapping_add(1);
+    }
+}
+
 #[derive(Default)]
 struct Inner {
-    pinned: Option<Stamped<Arc<Vec<PinnedEntry>>>>,
-    records: HashMap<StorageRecordKind, Stamped<Arc<Vec<Value>>>>,
-    sticker_packs: Option<Stamped<Arc<Vec<StickerPackSync>>>>,
+    pinned: Slot<PinnedEntry>,
+    records: HashMap<StorageRecordKind, Slot<Value>>,
+    sticker_packs: Slot<StickerPackSync>,
+    /// 全账号 `invalidate()` 代数（防止 `records` map 清理后新建槽代数归零）。
+    invalidate_epoch: u64,
+    /// 全账号 `clear_negative_cache()` 代数。
+    negative_epoch: u64,
 }
 
 impl Inner {
     #[cfg(test)]
     fn slots(&self) -> usize {
-        usize::from(self.pinned.is_some())
-            + self.records.len()
-            + usize::from(self.sticker_packs.is_some())
+        usize::from(self.pinned.cached.is_some())
+            + self
+                .records
+                .values()
+                .filter(|slot| slot.cached.is_some())
+                .count()
+            + usize::from(self.sticker_packs.cached.is_some())
+    }
+}
+
+struct InFlightGuard<'a, T, S>
+where
+    S: Fn(&mut Inner) -> &mut Slot<T>,
+{
+    inner: &'a StdMutex<Inner>,
+    slot_mut: &'a S,
+    slot_gen: u64,
+    invalidate_epoch: u64,
+    active: bool,
+}
+
+impl<T, S> Drop for InFlightGuard<'_, T, S>
+where
+    S: Fn(&mut Inner) -> &mut Slot<T>,
+{
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            if inner.invalidate_epoch == self.invalidate_epoch {
+                let slot = (self.slot_mut)(&mut inner);
+                if slot
+                    .inflight
+                    .as_ref()
+                    .is_some_and(|f| f.generation == self.slot_gen)
+                {
+                    slot.inflight = None;
+                }
+            }
+        }
     }
 }
 
 /// 单账号 storage 记录缓存（挂在 `StorageContext` 上，clone 共享）。
 pub(crate) struct StorageRecordsCache {
     ttl_ms: u64,
+    error_backoff_ms: u64,
     inner: StdMutex<Inner>,
-    /// 回源单飞：同一账号并发 miss 只让一个调用真正走网络。
-    fill: AsyncMutex<()>,
-    /// 命中/回源计数（观测点：测试断言复用，生产只做原子自增）。
+    /// 命中/回源/负缓存命中计数（观测点：测试断言复用，生产只做原子自增）。
     hits: AtomicU64,
     fills: AtomicU64,
-    /// 写穿/失效代数：在飞回源若跨越一次写穿/失效，其结果不得覆盖更新的
-    /// 槽（旧读结果晚到 = 把用户刚写的值打回旧态；TTL ≤60s 兜底但可避免）。
-    generation: AtomicU64,
+    negative_hits: AtomicU64,
 }
 
 impl StorageRecordsCache {
     pub(crate) fn new() -> Self {
-        Self::with_ttl(STORAGE_RECORD_CACHE_TTL_MS)
+        Self::with_ttls(STORAGE_RECORD_CACHE_TTL_MS, STORAGE_RECORD_ERROR_BACKOFF_MS)
     }
 
-    fn with_ttl(ttl_ms: u64) -> Self {
+    fn with_ttls(ttl_ms: u64, error_backoff_ms: u64) -> Self {
         Self {
             ttl_ms,
+            error_backoff_ms,
             inner: StdMutex::new(Inner::default()),
-            fill: AsyncMutex::new(()),
             hits: AtomicU64::new(0),
             fills: AtomicU64::new(0),
-            generation: AtomicU64::new(0),
+            negative_hits: AtomicU64::new(0),
         }
     }
 
-    /// 槽内容变更（写穿/失效）后：在飞回源不落缓存。
-    fn bump_generation(&self) {
-        self.generation.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// 通用取用：命中（未过期）直接 clone 返回；未命中单飞回源后落缓存。
-    async fn get_or_fill<T, F, Fut>(
+    /// 通用取用：正缓存命中直接 clone 返回；短负缓存命中快返错误；否则按槽位
+    /// 走广播型 single-flight，同代并发等待者共享本次回源的 `Ok`/`Err` 结局。
+    async fn get_or_fill<T, S, F, Fut>(
         &self,
         now_ms: u64,
-        probe: impl Fn(&Inner) -> Option<Stamped<Arc<Vec<T>>>>,
-        insert: impl Fn(&mut Inner, u64, Arc<Vec<T>>),
+        slot_mut: S,
         load: F,
     ) -> Result<Vec<T>, StorageSyncError>
     where
         T: Clone,
+        S: Fn(&mut Inner) -> &mut Slot<T>,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Vec<T>, StorageSyncError>>,
     {
-        if let Some(value) = self.fresh(now_ms, &probe) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok((*value).clone());
+        enum Action<T> {
+            Wait(watch::Receiver<Option<InFlightOutcome<T>>>),
+            Lead {
+                tx: watch::Sender<Option<InFlightOutcome<T>>>,
+                slot_gen: u64,
+                slot_neg_gen: u64,
+                invalidate_epoch: u64,
+                negative_epoch: u64,
+            },
         }
-        // 单飞：拿不到锁说明另一调用正在回源；等它落缓存后按命中返回。
-        let _guard = self.fill.lock().await;
-        if let Some(value) = self.fresh(now_ms, &probe) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok((*value).clone());
-        }
-        let generation = self.generation.load(Ordering::Relaxed);
-        let loaded = load().await?;
-        // 回源期间发生过写穿/失效：旧读结果不落缓存（调用方仍拿到本次
-        // 读值，下一次读按新代回源/命中）。
-        if self.generation.load(Ordering::Relaxed) != generation {
-            return Ok(loaded);
-        }
-        let value = Arc::new(loaded);
-        {
-            let mut inner = self.inner.lock().expect("storage record cache poisoned");
-            insert(&mut inner, now_ms, Arc::clone(&value));
-        }
-        self.fills.fetch_add(1, Ordering::Relaxed);
-        Ok((*value).clone())
-    }
 
-    fn fresh<T>(
-        &self,
-        now_ms: u64,
-        probe: &impl Fn(&Inner) -> Option<Stamped<Arc<Vec<T>>>>,
-    ) -> Option<Arc<Vec<T>>> {
-        let inner = self.inner.lock().expect("storage record cache poisoned");
-        let (filled_at, value) = probe(&inner)?;
-        (now_ms.saturating_sub(filled_at) < self.ttl_ms).then_some(value)
+        let mut load = Some(load);
+        loop {
+            let action = {
+                let mut inner = self.inner.lock().expect("storage record cache poisoned");
+                let invalidate_epoch = inner.invalidate_epoch;
+                let negative_epoch = inner.negative_epoch;
+                let slot = slot_mut(&mut inner);
+
+                if let Some((filled_at, value)) = slot.cached.as_ref() {
+                    if now_ms.saturating_sub(*filled_at) < self.ttl_ms {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok((**value).clone());
+                    }
+                }
+                if let Some((failed_at, err)) = slot.negative {
+                    if now_ms.saturating_sub(failed_at) < self.error_backoff_ms {
+                        self.negative_hits.fetch_add(1, Ordering::Relaxed);
+                        return Err(err);
+                    }
+                    slot.negative = None;
+                }
+                if let Some(inflight) = slot.inflight.as_ref() {
+                    if inflight.generation == slot.generation {
+                        Action::Wait(inflight.rx.clone())
+                    } else {
+                        let (tx, rx) = watch::channel(None);
+                        let slot_gen = slot.generation;
+                        let slot_neg_gen = slot.negative_generation;
+                        slot.inflight = Some(InFlight {
+                            generation: slot_gen,
+                            rx,
+                        });
+                        Action::Lead {
+                            tx,
+                            slot_gen,
+                            slot_neg_gen,
+                            invalidate_epoch,
+                            negative_epoch,
+                        }
+                    }
+                } else {
+                    let (tx, rx) = watch::channel(None);
+                    let slot_gen = slot.generation;
+                    let slot_neg_gen = slot.negative_generation;
+                    slot.inflight = Some(InFlight {
+                        generation: slot_gen,
+                        rx,
+                    });
+                    Action::Lead {
+                        tx,
+                        slot_gen,
+                        slot_neg_gen,
+                        invalidate_epoch,
+                        negative_epoch,
+                    }
+                }
+            };
+
+            match action {
+                Action::Wait(mut rx) => {
+                    let outcome = loop {
+                        if let Some(result) = rx.borrow().clone() {
+                            break Some(result);
+                        }
+                        if rx.changed().await.is_err() {
+                            break rx.borrow().clone();
+                        }
+                    };
+                    match outcome {
+                        Some(Ok(value)) => {
+                            self.hits.fetch_add(1, Ordering::Relaxed);
+                            return Ok((*value).clone());
+                        }
+                        Some(Err(err)) => {
+                            return Err(err);
+                        }
+                        None => {
+                            // leader 被取消未产出结局：重新检查缓存或接管回源。
+                            continue;
+                        }
+                    }
+                }
+                Action::Lead {
+                    tx,
+                    slot_gen,
+                    slot_neg_gen,
+                    invalidate_epoch,
+                    negative_epoch,
+                } => {
+                    let mut guard = InFlightGuard {
+                        inner: &self.inner,
+                        slot_mut: &slot_mut,
+                        slot_gen,
+                        invalidate_epoch,
+                        active: true,
+                    };
+                    let started = tokio::time::Instant::now();
+                    let load_fn = load.take().expect("lead executes at most once");
+                    let result = load_fn().await;
+                    let elapsed_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    // 负缓存从回源结束时刻起算，避免 5s 慢失败完成瞬间负缓存已过期。
+                    let finished_ms = now_ms.saturating_add(elapsed_ms);
+
+                    guard.active = false;
+                    let broadcast: InFlightOutcome<T> = {
+                        let mut inner = self.inner.lock().expect("storage record cache poisoned");
+                        let same_invalidate = inner.invalidate_epoch == invalidate_epoch;
+                        let same_negative = inner.negative_epoch == negative_epoch;
+                        let slot = slot_mut(&mut inner);
+                        if same_invalidate
+                            && slot
+                                .inflight
+                                .as_ref()
+                                .is_some_and(|f| f.generation == slot_gen)
+                        {
+                            slot.inflight = None;
+                        }
+                        match result {
+                            Ok(loaded) => {
+                                let value = Arc::new(loaded);
+                                // 回源期间发生过写穿/失效：旧读结果不落缓存（调用方
+                                // 仍拿到本次读值，下一次读按新代回源/命中）。
+                                if same_invalidate && slot.generation == slot_gen {
+                                    slot.cached = Some((now_ms, Arc::clone(&value)));
+                                    slot.negative = None;
+                                    self.fills.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Ok(value)
+                            }
+                            Err(err) => {
+                                if same_invalidate
+                                    && same_negative
+                                    && slot.generation == slot_gen
+                                    && slot.negative_generation == slot_neg_gen
+                                {
+                                    slot.negative = Some((finished_ms, err));
+                                }
+                                Err(err)
+                            }
+                        }
+                    };
+                    let _ = tx.send(Some(broadcast.clone()));
+                    return broadcast.map(|value| (*value).clone());
+                }
+            }
+        }
     }
 
     /// 置顶（getPinnedConversations 读面）命中/回源。
@@ -153,13 +375,8 @@ impl StorageRecordsCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Vec<PinnedEntry>, StorageSyncError>>,
     {
-        self.get_or_fill(
-            now_ms,
-            |inner| inner.pinned.clone(),
-            |inner, at, value| inner.pinned = Some((at, value)),
-            load,
-        )
-        .await
+        self.get_or_fill(now_ms, |inner| &mut inner.pinned, load)
+            .await
     }
 
     /// 置顶写穿（setConversationPinned 成功返回写后全量投影）。
@@ -167,8 +384,17 @@ impl StorageRecordsCache {
         self.inner
             .lock()
             .expect("storage record cache poisoned")
-            .pinned = Some((now_ms, Arc::new(entries)));
-        self.bump_generation();
+            .pinned
+            .store(now_ms, Arc::new(entries));
+    }
+
+    /// 置顶写面触发前/后清空负缓存，确保用户主动写入后不被旧错误阻塞刷新。
+    pub(crate) fn clear_pinned_negative(&self) {
+        self.inner
+            .lock()
+            .expect("storage record cache poisoned")
+            .pinned
+            .clear_negative();
     }
 
     /// Storage 记录读面（chatFolders.list / notificationProfiles.list /
@@ -183,15 +409,8 @@ impl StorageRecordsCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Vec<Value>, StorageSyncError>>,
     {
-        self.get_or_fill(
-            now_ms,
-            |inner| inner.records.get(&kind).cloned(),
-            |inner, at, value| {
-                inner.records.insert(kind, (at, value));
-            },
-            load,
-        )
-        .await
+        self.get_or_fill(now_ms, |inner| inner.records.entry(kind).or_default(), load)
+            .await
     }
 
     /// 记录写穿（setRecords 成功返回写后全量投影）。
@@ -200,8 +419,20 @@ impl StorageRecordsCache {
             .lock()
             .expect("storage record cache poisoned")
             .records
-            .insert(kind, (now_ms, Arc::new(values)));
-        self.bump_generation();
+            .entry(kind)
+            .or_default()
+            .store(now_ms, Arc::new(values));
+    }
+
+    /// 指定记录槽写面触发时立即清空该槽负缓存。
+    pub(crate) fn clear_record_negative(&self, kind: StorageRecordKind) {
+        self.inner
+            .lock()
+            .expect("storage record cache poisoned")
+            .records
+            .entry(kind)
+            .or_default()
+            .clear_negative();
     }
 
     /// 贴纸包安装状态（getStickerPackSyncs 读面）命中/回源。
@@ -214,13 +445,8 @@ impl StorageRecordsCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Vec<StickerPackSync>, StorageSyncError>>,
     {
-        self.get_or_fill(
-            now_ms,
-            |inner| inner.sticker_packs.clone(),
-            |inner, at, value| inner.sticker_packs = Some((at, value)),
-            load,
-        )
-        .await
+        self.get_or_fill(now_ms, |inner| &mut inner.sticker_packs, load)
+            .await
     }
 
     /// 贴纸包写穿（setStickerPackSync 成功返回写后全量投影）。
@@ -228,18 +454,42 @@ impl StorageRecordsCache {
         self.inner
             .lock()
             .expect("storage record cache poisoned")
-            .sticker_packs = Some((now_ms, Arc::new(packs)));
-        self.bump_generation();
+            .sticker_packs
+            .store(now_ms, Arc::new(packs));
+    }
+
+    /// 贴纸包写面触发时立即清空负缓存。
+    pub(crate) fn clear_sticker_packs_negative(&self) {
+        self.inner
+            .lock()
+            .expect("storage record cache poisoned")
+            .sticker_packs
+            .clear_negative();
+    }
+
+    /// 通用写面（如 `storage.write`）清空全账号所有槽的负缓存，不影响有效正缓存。
+    pub(crate) fn clear_negative_cache(&self) {
+        let mut inner = self.inner.lock().expect("storage record cache poisoned");
+        inner.negative_epoch = inner.negative_epoch.wrapping_add(1);
+        inner.pinned.clear_negative();
+        inner.sticker_packs.clear_negative();
+        for slot in inner.records.values_mut() {
+            slot.clear_negative();
+        }
     }
 
     /// 「storage-pull-settled」失效：manifest 两腿落定 = 云上记录可能已被
-    /// 其他设备改写，整账号记录缓存作废（下一轮读懒回源，不主动预取）。
+    /// 其他设备改写，整账号记录缓存（含正/负缓存）作废（下一轮读懒回源，不主动预取）。
     pub(crate) fn invalidate(&self) {
-        *self.inner.lock().expect("storage record cache poisoned") = Inner::default();
-        self.bump_generation();
+        let mut inner = self.inner.lock().expect("storage record cache poisoned");
+        inner.invalidate_epoch = inner.invalidate_epoch.wrapping_add(1);
+        inner.negative_epoch = inner.negative_epoch.wrapping_add(1);
+        inner.pinned.invalidate();
+        inner.sticker_packs.invalidate();
+        inner.records.clear();
     }
 
-    /// 当前缓存槽数（解绑/失效/写穿测试的观测点）。
+    /// 当前正缓存槽数（解绑/失效/写穿测试的观测点）。
     #[cfg(test)]
     pub(crate) fn cached_slots(&self) -> usize {
         self.inner
@@ -257,10 +507,18 @@ impl StorageRecordsCache {
     pub(crate) fn fills(&self) -> u64 {
         self.fills.load(Ordering::Relaxed)
     }
+
+    #[cfg(test)]
+    pub(crate) fn negative_hits(&self) -> u64 {
+        self.negative_hits.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
     use super::*;
     use crate::service::storage_sync::PinnedEntry;
 
@@ -384,27 +642,37 @@ mod tests {
         assert_eq!(loads.load(Ordering::Relaxed), 0, "写穿后无需回源");
     }
 
-    /// 并发未命中单飞：两个调用只打一次回源，另一个等结果后命中。
+    /// 并发未命中单飞（成功）：两个调用只打一次回源，另一个共享广播结果。
     #[tokio::test]
     async fn concurrent_misses_fill_once() {
         let cache = Arc::new(StorageRecordsCache::new());
         let loads = Arc::new(AtomicU64::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
         let first = {
             let cache = Arc::clone(&cache);
             let loads = Arc::clone(&loads);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
             tokio::spawn(async move {
                 cache
                     .sticker_packs(20, move || {
                         let loads = Arc::clone(&loads);
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
                         async move {
                             loads.fetch_add(1, Ordering::Relaxed);
-                            tokio::task::yield_now().await;
+                            entered.notify_one();
+                            release.notified().await;
                             Ok(vec![sticker_pack(7, 1)])
                         }
                     })
                     .await
             })
         };
+        entered.notified().await;
+
         let second = {
             let cache = Arc::clone(&cache);
             let loads = Arc::clone(&loads);
@@ -414,13 +682,15 @@ mod tests {
                         let loads = Arc::clone(&loads);
                         async move {
                             loads.fetch_add(1, Ordering::Relaxed);
-                            tokio::task::yield_now().await;
-                            Ok(vec![sticker_pack(7, 1)])
+                            Ok(vec![sticker_pack(9, 1)])
                         }
                     })
                     .await
             })
         };
+        tokio::task::yield_now().await;
+        release.notify_one();
+
         let (first, second) = (first.await.expect("join"), second.await.expect("join"));
         assert_eq!(first.expect("first").len(), 1);
         assert_eq!(second.expect("second").len(), 1);
@@ -428,36 +698,308 @@ mod tests {
         assert_eq!(cache.hits(), 1);
     }
 
-    /// 错误不缓存：失败后下一次读重新回源。
+    /// 并发未命中单飞（失败）：同槽 N 个并发调用只打一次回源并共享 Err 结局，
+    /// 绝不释放锁后串行重放 N 次造成 5s→10s→15s 护航放大。
     #[tokio::test]
-    async fn error_is_not_cached() {
+    async fn concurrent_failures_share_single_flight_error_without_replay() {
+        let cache = Arc::new(StorageRecordsCache::new());
+        let loads = Arc::new(AtomicU64::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let leader = {
+            let cache = Arc::clone(&cache);
+            let loads = Arc::clone(&loads);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                cache
+                    .pinned(1_000, move || {
+                        let loads = Arc::clone(&loads);
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        async move {
+                            loads.fetch_add(1, Ordering::Relaxed);
+                            entered.notify_one();
+                            release.notified().await;
+                            Err(StorageSyncError::Unavailable)
+                        }
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            let cache = Arc::clone(&cache);
+            let loads = Arc::clone(&loads);
+            waiters.push(tokio::spawn(async move {
+                cache
+                    .pinned(1_000, move || {
+                        let loads = Arc::clone(&loads);
+                        async move {
+                            loads.fetch_add(1, Ordering::Relaxed);
+                            Err(StorageSyncError::ReadFailed)
+                        }
+                    })
+                    .await
+            }));
+        }
+        tokio::task::yield_now().await;
+        release.notify_one();
+
+        assert_eq!(
+            leader.await.expect("leader join"),
+            Err(StorageSyncError::Unavailable)
+        );
+        for waiter in waiters {
+            assert_eq!(
+                waiter.await.expect("waiter join"),
+                Err(StorageSyncError::Unavailable),
+                "同代并发等待者必须共享 leader 的错误结局"
+            );
+        }
+        assert_eq!(
+            loads.load(Ordering::Relaxed),
+            1,
+            "5 个并发失败只能触发 1 次回源，禁止串行重放"
+        );
+        assert_eq!(cache.cached_slots(), 0, "失败不得写入正缓存");
+    }
+
+    /// 不同槽位（pinned vs chatFolders）互相独立，不再被整账号单锁互相阻塞。
+    #[tokio::test]
+    async fn distinct_slots_do_not_block_each_other() {
+        let cache = Arc::new(StorageRecordsCache::new());
+        let pinned_entered = Arc::new(Notify::new());
+        let pinned_release = Arc::new(Notify::new());
+
+        let pinned_task = {
+            let cache = Arc::clone(&cache);
+            let pinned_entered = Arc::clone(&pinned_entered);
+            let pinned_release = Arc::clone(&pinned_release);
+            tokio::spawn(async move {
+                cache
+                    .pinned(100, move || async move {
+                        pinned_entered.notify_one();
+                        pinned_release.notified().await;
+                        Ok(vec![pinned_entry()])
+                    })
+                    .await
+            })
+        };
+        pinned_entered.notified().await;
+
+        // pinned 仍在阻塞中，chatFolders 必须能够立即并发完成，不被 pinned 锁住。
+        let folders = tokio::time::timeout(
+            Duration::from_millis(200),
+            cache.records(StorageRecordKind::ChatFolder, 100, || async {
+                Ok(vec![serde_json::json!({"id": "f1"})])
+            }),
+        )
+        .await
+        .expect("different slot must not wait on pinned inflight")
+        .expect("folders ok");
+        assert_eq!(folders.len(), 1);
+
+        pinned_release.notify_one();
+        assert_eq!(pinned_task.await.expect("join").expect("pinned ok").len(), 1);
+    }
+
+    /// 短负缓存与退避：失败后在退避窗口内快返错误不重打上游；窗口过后允许重新回源；
+    /// 慢失败（例如 5s 代理超时）完成后退避窗口从完成时刻起算，不会当场过期。
+    #[tokio::test(start_paused = true)]
+    async fn short_negative_cache_backs_off_after_slow_failure_and_expires() {
         let cache = StorageRecordsCache::new();
         let attempts = Arc::new(AtomicU64::new(0));
+
+        // 模拟 5s 慢失败（代理 5s 超时现场）。
         let first_attempt = Arc::clone(&attempts);
         let result = cache
-            .records(StorageRecordKind::ChatFolder, 1, || {
+            .records(StorageRecordKind::ChatFolder, 1_000, || {
                 let attempts = Arc::clone(&first_attempt);
                 async move {
                     attempts.fetch_add(1, Ordering::Relaxed);
-                    Err(StorageSyncError::ReadFailed)
+                    tokio::time::sleep(Duration::from_millis(5_000)).await;
+                    Err(StorageSyncError::Unavailable)
                 }
             })
             .await;
-        assert!(result.is_err());
-        assert_eq!(cache.cached_slots(), 0, "失败不落缓存");
+        assert_eq!(result, Err(StorageSyncError::Unavailable));
+        assert_eq!(cache.cached_slots(), 0, "失败不落正缓存");
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
 
-        let second_attempt = Arc::clone(&attempts);
-        let result = cache
-            .records(StorageRecordKind::ChatFolder, 1, || {
-                let attempts = Arc::clone(&second_attempt);
+        // 结束时刻 = 1_000 + 5_000 = 6_000ms；在 6_000 + 2_499ms 内命中负缓存，不再回源。
+        let hit_attempt = Arc::clone(&attempts);
+        let cached_err = cache
+            .records(
+                StorageRecordKind::ChatFolder,
+                6_000 + STORAGE_RECORD_ERROR_BACKOFF_MS - 1,
+                || {
+                    let attempts = Arc::clone(&hit_attempt);
+                    async move {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                        Ok(Vec::new())
+                    }
+                },
+            )
+            .await;
+        assert_eq!(cached_err, Err(StorageSyncError::Unavailable));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1, "退避窗内不得重打上游");
+        assert_eq!(cache.negative_hits(), 1);
+
+        // 满退避窗口（6_000 + 2_500ms）后允许重新回源并恢复成功。
+        let retry_attempt = Arc::clone(&attempts);
+        let recovered = cache
+            .records(
+                StorageRecordKind::ChatFolder,
+                6_000 + STORAGE_RECORD_ERROR_BACKOFF_MS,
+                || {
+                    let attempts = Arc::clone(&retry_attempt);
+                    async move {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                        Ok(vec![serde_json::json!({"ok": true})])
+                    }
+                },
+            )
+            .await
+            .expect("recovered after backoff");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    /// 写操作 / 显式 invalidate / 负缓存清除必须立即清空负缓存，不影响用户主动写入后刷新。
+    #[tokio::test]
+    async fn writes_and_invalidate_immediately_clear_negative_cache() {
+        let cache = StorageRecordsCache::new();
+        let attempts = Arc::new(AtomicU64::new(0));
+
+        // 1) pinned 失败写入负缓存 → clear_pinned_negative 立即清空，同一时刻即可回源。
+        let err = cache
+            .pinned(1_000, || {
+                let attempts = Arc::clone(&attempts);
                 async move {
                     attempts.fetch_add(1, Ordering::Relaxed);
-                    Ok(Vec::new())
+                    Err(StorageSyncError::Unavailable)
                 }
             })
             .await;
-        assert!(result.is_ok());
+        assert_eq!(err, Err(StorageSyncError::Unavailable));
+        cache.clear_pinned_negative();
+        let ok = cache
+            .pinned(1_000, || {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    Ok(vec![pinned_entry()])
+                }
+            })
+            .await
+            .expect("refetch right after clear_pinned_negative");
+        assert_eq!(ok.len(), 1);
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        // 2) chatFolders 失败写入负缓存 → store_records 写穿立即覆盖为正缓存。
+        let err = cache
+            .records(StorageRecordKind::ChatFolder, 1_000, || async {
+                Err(StorageSyncError::ReadFailed)
+            })
+            .await;
+        assert_eq!(err, Err(StorageSyncError::ReadFailed));
+        cache.store_records(
+            StorageRecordKind::ChatFolder,
+            1_000,
+            vec![serde_json::json!({"id": "new"})],
+        );
+        let folders = cache
+            .records(StorageRecordKind::ChatFolder, 1_000, || async {
+                panic!("写穿后必须直接命中，不得落负缓存也不得回源")
+            })
+            .await
+            .expect("write-through hit");
+        assert_eq!(folders, vec![serde_json::json!({"id": "new"})]);
+
+        // 3) sticker_packs 失败写入负缓存 → clear_negative_cache (storage.write) 立即清空，
+        //    且不清空无关正缓存（pinned/chatFolders）。
+        let err = cache
+            .sticker_packs(1_000, || async { Err(StorageSyncError::Unavailable) })
+            .await;
+        assert_eq!(err, Err(StorageSyncError::Unavailable));
+        cache.clear_negative_cache();
+        assert_eq!(cache.cached_slots(), 2, "清负缓存不得抹掉其他槽正缓存");
+        let packs = cache
+            .sticker_packs(1_000, || async { Ok(vec![sticker_pack(3, 1)]) })
+            .await
+            .expect("refetch right after clear_negative_cache");
+        assert_eq!(packs.len(), 1);
+
+        // 4) notificationProfiles 失败写入负缓存 → invalidate() 立即清空。
+        let err = cache
+            .records(StorageRecordKind::NotificationProfile, 1_000, || async {
+                Err(StorageSyncError::Unavailable)
+            })
+            .await;
+        assert_eq!(err, Err(StorageSyncError::Unavailable));
+        cache.invalidate();
+        assert_eq!(cache.cached_slots(), 0);
+        let profiles = cache
+            .records(StorageRecordKind::NotificationProfile, 1_000, || async {
+                Ok(vec![serde_json::json!({"id": "p1"})])
+            })
+            .await
+            .expect("refetch right after invalidate");
+        assert_eq!(profiles.len(), 1);
+    }
+
+    /// Leader 被取消（drop）时，等待中的 follower 不得永久挂起，必须能接管回源。
+    #[tokio::test]
+    async fn cancelled_leader_unblocks_waiter_to_take_over() {
+        let cache = Arc::new(StorageRecordsCache::new());
+        let entered = Arc::new(Notify::new());
+        let loads = Arc::new(AtomicU64::new(0));
+
+        let leader = {
+            let cache = Arc::clone(&cache);
+            let entered = Arc::clone(&entered);
+            let loads = Arc::clone(&loads);
+            tokio::spawn(async move {
+                cache
+                    .pinned(500, move || async move {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        entered.notify_one();
+                        std::future::pending::<Result<Vec<PinnedEntry>, StorageSyncError>>()
+                            .await
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            let loads = Arc::clone(&loads);
+            tokio::spawn(async move {
+                cache
+                    .pinned(500, move || async move {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        Ok(vec![pinned_entry()])
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        leader.abort();
+        let _ = leader.await;
+
+        let result = tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("waiter must not hang when leader cancels")
+            .expect("waiter join")
+            .expect("waiter took over and succeeded");
+        assert_eq!(result.len(), 1);
+        assert_eq!(loads.load(Ordering::Relaxed), 2);
     }
 
     /// 记录槽按 selector 隔离（folder/profile/list 互不覆盖）。

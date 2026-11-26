@@ -25,7 +25,6 @@
 //!   专用读写面（A2/拉黑批），此处不重复。
 
 use presage::libsignal_service::master_key::StorageServiceKey;
-use presage::libsignal_service::prelude::ServiceError;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::{
     IdentityChange, IdentityKey, IdentityKeyStore as _, ProtocolAddress, ServiceId,
@@ -35,7 +34,7 @@ use presage::model::contacts::Contact;
 use presage::store::{ContentsStore as _, StateStore as _, Store as _};
 use prost::Message as _;
 
-use super::storage_sync::{self, decrypt_raw_item, read_raw_items, storage_auth, StorageSyncError};
+use super::storage_sync::{self, decrypt_raw_item, read_raw_items_cached, StorageSyncError};
 use super::{identity, StorageContext};
 use crate::proto::storage as storage_proto;
 
@@ -166,14 +165,10 @@ pub(crate) async fn merge_contacts(
         return Ok((outcome, observed));
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let read_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = storage_sync::open_storage_service(context.push.clone(), read_key).await?;
-    let manifest = match storage.manifest().await {
-        Ok(manifest) => manifest,
-        Err(presage::libsignal_service::StorageServiceError::Service(
-            ServiceError::NotFoundError,
-        )) => return Ok((outcome, observed)),
-        Err(_) => return Err(StorageSyncError::Unavailable),
+    let Some(manifest) =
+        storage_sync::fetch_manifest(&context, &storage_key, StorageSyncError::Unavailable).await?
+    else {
+        return Ok((outcome, observed));
     };
     // 批 R：本腿 manifest version 随行汇总（空 keys 早退前落值——version
     // 是 manifest 面事实，与会话条目有无无关）。
@@ -197,8 +192,7 @@ pub(crate) async fn merge_contacts(
     } else {
         Some(manifest.record_ikm.as_slice())
     };
-    let auth = storage_auth(&context.push).await?;
-    let items = read_raw_items(&context.push, auth, keys.clone()).await?;
+    let items = read_raw_items_cached(&context, keys.clone()).await?;
 
     let mut aci_store = context.store.aci_protocol_store();
     let mut pni_store = context.store.pni_protocol_store();
@@ -400,23 +394,17 @@ pub(crate) async fn import_groups(
         return Ok((outcome, observed));
     };
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let read_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = storage_sync::open_storage_service(context.push.clone(), read_key).await?;
-    let manifest = match storage.manifest().await {
-        Ok(manifest) => manifest,
-        Err(presage::libsignal_service::StorageServiceError::Service(
-            ServiceError::NotFoundError,
-        )) => {
-            tracing::warn!(
-                target: "engine.groupstate",
-                stage = "import_groups_skip",
-                reason = "no_manifest",
-                account = %account8,
-                "group state import skipped (storage manifest not found)"
-            );
-            return Ok((outcome, observed));
-        }
-        Err(_) => return Err(StorageSyncError::Unavailable),
+    let Some(manifest) =
+        storage_sync::fetch_manifest(&context, &storage_key, StorageSyncError::Unavailable).await?
+    else {
+        tracing::warn!(
+            target: "engine.groupstate",
+            stage = "import_groups_skip",
+            reason = "no_manifest",
+            account = %account8,
+            "group state import skipped (storage manifest not found)"
+        );
+        return Ok((outcome, observed));
     };
     // 批 R：本腿 manifest version 随行汇总（merge_contacts 同位）。
     outcome.version = manifest.version;
@@ -447,8 +435,7 @@ pub(crate) async fn import_groups(
     } else {
         Some(manifest.record_ikm.as_slice())
     };
-    let auth = storage_auth(&context.push).await?;
-    let items = read_raw_items(&context.push, auth, keys.clone()).await?;
+    let items = read_raw_items_cached(&context, keys.clone()).await?;
 
     for key in &keys {
         let Some(item) = items.iter().find(|item| &item.key == key) else {

@@ -23,10 +23,9 @@ use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;
 use presage::libsignal_service::master_key::{MasterKey, StorageServiceKey};
-use presage::libsignal_service::prelude::ServiceError;
 use presage::libsignal_service::proto::manifest_record;
 use presage::libsignal_service::proto::{ManifestRecord, WriteOperation};
-use presage::libsignal_service::{StorageService, StorageServiceError};
+use presage::libsignal_service::StorageService;
 use presage::store::StateStore;
 use prost::Message as _;
 use serde_json::{json, Value};
@@ -34,9 +33,9 @@ use serde_json::{json, Value};
 use crate::jsonrpc::RpcError;
 use crate::proto::storage::{self as storage_proto, StorageRecord};
 use crate::service::storage_sync::{
-    account_item_key_of, decrypt_raw_item, encrypt_raw_item, minimal_account_record, new_item_key,
-    open_storage_service, put_write_operation, read_raw_items, save_manifest_state, storage_auth,
-    ManifestState, PutOutcome, StorageRecordKind, StorageSyncError,
+    account_item_key_of, decrypt_raw_item, encrypt_raw_item, fetch_manifest,
+    minimal_account_record, new_item_key, put_write_operation_cached, read_raw_items_cached,
+    save_manifest_state, ManifestState, PutOutcome, StorageRecordKind, StorageSyncError,
 };
 use crate::service::StorageContext;
 
@@ -456,6 +455,8 @@ pub(crate) async fn write_items(
     context: &StorageContext,
     updates: Vec<StorageItemUpdate>,
 ) -> Result<WriteOutcome, StorageSyncError> {
+    // 通用 storage 写面立即清空记录读面短负缓存，不影响用户主动写入后刷新。
+    context.records.clear_negative_cache();
     let has_insert = updates.iter().any(|update| update.op() == ItemOp::Insert);
     let master_key = match context
         .store
@@ -478,25 +479,18 @@ pub(crate) async fn write_items(
             generated
         }
     };
-    // StorageService::new 按值收 key：句柄持有一份，plan/decrypt 复用另一份
-    //（from_master_key 确定性派生，同 master key 两次派生等价）。
     let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
-    let previous = match storage.manifest().await {
-        Ok(record) => {
-            // 有 manifest 无 Account 标识 = 非法状态（置顶/贴纸面同口径）。
-            if account_item_key_of(&record).is_none() {
-                return Err(StorageSyncError::WriteFailed);
+    let previous =
+        match fetch_manifest(context, &storage_key, StorageSyncError::Unavailable).await? {
+            Some(record) => {
+                // 有 manifest 无 Account 标识 = 非法状态（置顶/贴纸面同口径）。
+                if account_item_key_of(&record).is_none() {
+                    return Err(StorageSyncError::WriteFailed);
+                }
+                Some(record)
             }
-            Some(record)
-        }
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => None,
-        Err(_) => return Err(StorageSyncError::Unavailable),
-    };
+            None => None,
+        };
     let Some(previous) = previous else {
         // 服务器无 manifest = 从未有过 storage 状态：无 INSERT → 幂等成功
         // 不播种（version 0）；含 INSERT → version 1 首写播种（无现存
@@ -514,7 +508,7 @@ pub(crate) async fn write_items(
         return finish_write(context, plan).await;
     };
     // 幂等比较预读：批内 INSERT/UPDATE 目标 key ∩ manifest 现存标识 → 批量
-    // 读现存明文（与读面同一 storage_auth + read_raw_items + 解密 shim）。
+    // 读现存明文（与读面同一缓存 auth + read_raw_items_cached + 解密 shim）。
     let ikm = previous.record_ikm.as_slice();
     let record_ikm = if ikm.is_empty() { None } else { Some(ikm) };
     let mut plaintexts: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
@@ -531,8 +525,7 @@ pub(crate) async fn write_items(
         .map(|key| key.to_vec())
         .collect();
     if !wanted.is_empty() {
-        let auth = storage_auth(&context.push).await?;
-        let items = read_raw_items(&context.push, auth, wanted.clone()).await?;
+        let items = read_raw_items_cached(context, wanted.clone()).await?;
         for item in items {
             let plaintext = decrypt_raw_item(&storage_key, &item, record_ikm)
                 .map_err(|_| StorageSyncError::ReadFailed)?;
@@ -557,8 +550,7 @@ pub(crate) async fn write_items(
             results: plan.results,
         });
     };
-    let auth = storage_auth(&context.push).await?;
-    match put_write_operation(&context.push, auth, &write_operation).await? {
+    match put_write_operation_cached(context, &write_operation).await? {
         PutOutcome {
             conflict_manifest: None,
         } => {
@@ -597,8 +589,7 @@ async fn finish_write(
     let write_operation = plan
         .write_operation
         .expect("first-write plan always carries a write operation");
-    let auth = storage_auth(&context.push).await?;
-    match put_write_operation(&context.push, auth, &write_operation).await? {
+    match put_write_operation_cached(context, &write_operation).await? {
         PutOutcome {
             conflict_manifest: None,
         } => {

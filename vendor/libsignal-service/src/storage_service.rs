@@ -127,6 +127,21 @@ impl StorageService {
         })
     }
 
+    /// Construct a [`StorageService`] handle using caller-supplied (e.g.
+    /// per-account cached) basic-auth credentials without issuing
+    /// `GET /v1/storage/auth`.
+    pub fn with_credentials(
+        service: PushService,
+        credentials: HttpAuth,
+        storage_key: StorageServiceKey,
+    ) -> Self {
+        Self {
+            service,
+            credentials,
+            storage_key,
+        }
+    }
+
     /// Fetch and decrypt the latest manifest.
     pub async fn manifest(
         &self,

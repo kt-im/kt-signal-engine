@@ -27,18 +27,16 @@
 
 use base64::Engine as _;
 use presage::libsignal_service::master_key::StorageServiceKey;
-use presage::libsignal_service::prelude::PushService;
-use presage::libsignal_service::prelude::ServiceError;
 use presage::libsignal_service::proto::ManifestRecord;
-use presage::libsignal_service::{StorageService, StorageServiceError};
+use presage::libsignal_service::StorageService;
 use presage::store::StateStore as _;
 use prost::Message as _;
 
 use crate::proto::storage::storage_record::Record;
 use crate::proto::storage::{self as storage_proto};
 use crate::service::storage_sync::{
-    conflict_decision, decrypt_raw_item, new_item_key, open_storage_service, plan_record_writes,
-    put_write_operation, read_raw_items, storage_auth, ConflictDecision, PutOutcome, RecordPayload,
+    conflict_decision, decrypt_raw_item, fetch_manifest, new_item_key, plan_record_writes,
+    put_write_operation_cached, read_raw_items_cached, ConflictDecision, PutOutcome, RecordPayload,
     RecordUpsert, StorageRecordKind, StorageSyncError,
 };
 use crate::service::StorageContext;
@@ -583,7 +581,7 @@ fn record_payload(value: &RecordValue) -> RecordPayload {
 /// manifest（Option；None = 无 storage 状态）→ 本类别全部记录（存储序 =
 /// manifest identifiers 首现序；单条解密/解码失败跳过不炸面）。
 async fn read_cloud_entries(
-    push: &PushService,
+    context: &StorageContext,
     storage_key: &StorageServiceKey,
     manifest: Option<&ManifestRecord>,
     selector: StorageRecordKind,
@@ -606,8 +604,7 @@ async fn read_cloud_entries(
     } else {
         Some(manifest.record_ikm.as_slice())
     };
-    let auth = storage_auth(push).await?;
-    let items = read_raw_items(push, auth, keys.clone()).await?;
+    let items = read_raw_items_cached(context, keys.clone()).await?;
     let mut out = Vec::new();
     for key in keys {
         let Some(item) = items.iter().find(|item| item.key == key) else {
@@ -637,19 +634,6 @@ async fn read_cloud_entries(
     Ok(out)
 }
 
-/// 当前 manifest（Some / NotFound → None / 其余错误 → 调用方指定的失败
-/// 形态：读面 ReadFailed、写面 WriteFailed——写意图未落地贴纸先例）。
-async fn fetch_manifest(
-    storage: &StorageService,
-    failure: StorageSyncError,
-) -> Result<Option<ManifestRecord>, StorageSyncError> {
-    match storage.manifest().await {
-        Ok(manifest) => Ok(Some(manifest)),
-        Err(StorageServiceError::Service(ServiceError::NotFoundError)) => Ok(None),
-        Err(_) => Err(failure),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // 编排（Service 调用入口；网络面，不做网络测试）
 // ---------------------------------------------------------------------------
@@ -669,22 +653,15 @@ pub(crate) async fn read_records(
     else {
         return Ok(Vec::new());
     };
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
+    let storage_key = StorageServiceKey::from_master_key(&master_key);
+    let manifest = fetch_manifest(context, &storage_key, StorageSyncError::ReadFailed).await?;
+    Ok(
+        read_cloud_entries(context, &storage_key, manifest.as_ref(), selector)
+            .await?
+            .iter()
+            .filter_map(|entry| entry.value.project())
+            .collect(),
     )
-    .await?;
-    let manifest = fetch_manifest(&storage, StorageSyncError::ReadFailed).await?;
-    Ok(read_cloud_entries(
-        &context.push,
-        &StorageServiceKey::from_master_key(&master_key),
-        manifest.as_ref(),
-        selector,
-    )
-    .await?
-    .iter()
-    .filter_map(|entry| entry.value.project())
-    .collect())
 }
 
 /// 写面：`chatFolders.setRecords` / `notificationProfiles.setRecords` /
@@ -699,6 +676,8 @@ pub(crate) async fn write_records(
     records: Vec<RecordValue>,
     remove_ids: Vec<Vec<u8>>,
 ) -> Result<Vec<serde_json::Value>, StorageSyncError> {
+    // 用户主动写入立即清空对应槽短负缓存，避免写入后刷新仍被旧错误阻塞。
+    context.records.clear_record_negative(selector);
     // master key 播种分支（贴纸面同构）：账号从未有过 storage 状态时以
     // 新 key 建链，Account 记录随本批首写入 manifest。
     let master_key = match context
@@ -719,13 +698,10 @@ pub(crate) async fn write_records(
             generated
         }
     };
-    let storage = open_storage_service(
-        context.push.clone(),
-        StorageServiceKey::from_master_key(&master_key),
-    )
-    .await?;
+    let storage_key = StorageServiceKey::from_master_key(&master_key);
     let mut manifest = {
-        let candidate = fetch_manifest(&storage, StorageSyncError::WriteFailed).await?;
+        let candidate =
+            fetch_manifest(context, &storage_key, StorageSyncError::WriteFailed).await?;
         // 有 manifest 无 Account 标识 = 非法状态（置顶/贴纸面同口径）。
         if candidate.as_ref().is_some_and(|record| {
             crate::service::storage_sync::account_item_key_of(record).is_none()
@@ -740,14 +716,9 @@ pub(crate) async fn write_records(
     loop {
         // 重放循环内读云态失败归 WriteFailed（写意图未落地；贴纸先例——
         // read_cloud_entries 内部错误按本面语义折叠）。
-        let current = read_cloud_entries(
-            &context.push,
-            &StorageServiceKey::from_master_key(&master_key),
-            manifest.as_ref(),
-            selector,
-        )
-        .await
-        .map_err(|_| StorageSyncError::WriteFailed)?;
+        let current = read_cloud_entries(context, &storage_key, manifest.as_ref(), selector)
+            .await
+            .map_err(|_| StorageSyncError::WriteFailed)?;
         let upserts = plan_record_batch(&current, &records, &remove_ids);
         if upserts.is_empty() {
             // 整批幂等：与云上现存结构全等 → 无 PUT 不 bump version，
@@ -775,15 +746,9 @@ pub(crate) async fn write_records(
             }
         };
         batch.extend(upserts);
-        let planned = plan_record_writes(
-            previous,
-            &batch,
-            context.device_id,
-            &StorageServiceKey::from_master_key(&master_key),
-        );
+        let planned = plan_record_writes(previous, &batch, context.device_id, &storage_key);
 
-        let auth = storage_auth(&context.push).await?;
-        match put_write_operation(&context.push, auth, &planned.write_operation).await? {
+        match put_write_operation_cached(context, &planned.write_operation).await? {
             PutOutcome {
                 conflict_manifest: None,
             } => {
