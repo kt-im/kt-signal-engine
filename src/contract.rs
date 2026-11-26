@@ -13,7 +13,7 @@
 //!
 //! connector O1 握手（`kt-signal-connector/src/engine_contract.rs`）以闭
 //! 区间 `ENGINE_CONTRACT_MIN_REVISION = "1.200"` ..
-//! `ENGINE_CONTRACT_MAX_REVISION = "1.285"` 做数字比较：面内 = `match`，
+//! `ENGINE_CONTRACT_MAX_REVISION = "1.286"` 做数字比较：面内 = `match`，
 //! 无修订 = `legacy`（降级仍服务），面外/畸形 = 不可重试的
 //! `ENGINE_CONTRACT_MISMATCH`。release service 的 `engineContractRevision`
 //! 声明把引擎侧钉成 `min == max ==` 本常量；推进本常量必须同步 connector
@@ -22,9 +22,8 @@
 //! 单源纪律：本常量是唯一事实源，两个自证面都从这里取；改契约修订只改
 //! 这一处（外加 connector 侧区间声明），不得在应答体里各写一份字面量。
 
-/// 引擎实现的共享契约修订。connector 当前支持区间 1.200-1.285，引擎侧
-/// 取区间上界（release 声明 `min == max`）：本批 O1 握手引擎腿即按共享
-/// 契约 1.285 落地。
+/// 引擎实现的共享契约修订。当前实现为 1.285，落在 connector 支持区间
+/// 1.200-1.286 内；release 声明 `min == max` 等于本常量。
 pub(crate) const CONTRACT_REVISION: &str = "1.285";
 
 /// Desktop host API required by the release catalog. Read by release.yml.
@@ -71,13 +70,13 @@ mod tests {
 
     /// 与 connector 当前支持区间对齐（connector
     /// `ENGINE_CONTRACT_MIN_REVISION`/`ENGINE_CONTRACT_MAX_REVISION` 的
-    /// 镜像断言）：常量落在 1.200-1.285 闭区间内，connector O1 判 `match`。
+    /// 镜像断言）：常量落在 1.200-1.286 闭区间内，connector O1 判 `match`。
     /// connector 推进上界时本断言不拦（常量仍在区间内），只有常量被推到
     /// 区间外才红灯。
     #[test]
     fn contract_revision_sits_in_the_connector_supported_interval() {
         let revision = parse(CONTRACT_REVISION);
         assert!(revision >= parse("1.200"), "below the connector floor");
-        assert!(revision <= parse("1.285"), "above the connector ceiling");
+        assert!(revision <= parse("1.286"), "above the connector ceiling");
     }
 }
