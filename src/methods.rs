@@ -1392,7 +1392,9 @@ async fn dispatch(
                         .send_poll_create_group(account, group, &question, &options, allow)
                         .await
                     {
-                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Ok(timestamp) => {
+                            jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                        }
                         Err(error) => send_error(id, error),
                     }
                 }
@@ -1435,7 +1437,9 @@ async fn dispatch(
                         .send_poll_vote_group(account, group, author, target, &indexes, count)
                         .await
                     {
-                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Ok(timestamp) => {
+                            jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                        }
                         Err(error) => send_error(id, error),
                     }
                 }
@@ -1456,7 +1460,9 @@ async fn dispatch(
                         .send_poll_terminate_group(account, group, target)
                         .await
                     {
-                        Ok(()) => jsonrpc::success_response(id, json!({})),
+                        Ok(timestamp) => {
+                            jsonrpc::success_response(id, json!({ "timestamp": timestamp }))
+                        }
                         Err(error) => send_error(id, error),
                     }
                 }

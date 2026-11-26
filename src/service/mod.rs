@@ -5730,9 +5730,9 @@ impl Service {
         question: &str,
         options: &[String],
         allow_multiple: bool,
-    ) -> Result<(), SendError> {
+    ) -> Result<u64, SendError> {
         if !self.real {
-            return Ok(());
+            return Ok(now_ms());
         }
         let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
         let mut manager = lock_registered_for_send(&shared).await;
@@ -5751,7 +5751,7 @@ impl Service {
             GroupSelfSync::Blocking,
         )
         .await
-        .map(|_| ())
+        .map(|_| timestamp)
     }
 
     /// sendPollVote（群组）：官方 DataMessage.pollVote=26。voteCount 由调用
@@ -5765,9 +5765,9 @@ impl Service {
         target_timestamp: u64,
         option_indexes: &[u32],
         vote_count: u32,
-    ) -> Result<(), SendError> {
+    ) -> Result<u64, SendError> {
         if !self.real {
-            return Ok(());
+            return Ok(now_ms());
         }
         let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
         let mut manager = lock_registered_for_send(&shared).await;
@@ -5797,7 +5797,7 @@ impl Service {
             GroupSelfSync::Blocking,
         )
         .await
-        .map(|_| ())
+        .map(|_| timestamp)
     }
 
     /// sendPollTerminate（群组）：官方 DataMessage.pollTerminate=25（终止
@@ -5808,9 +5808,9 @@ impl Service {
         account: &str,
         group_id: &str,
         target_timestamp: u64,
-    ) -> Result<(), SendError> {
+    ) -> Result<u64, SendError> {
         if !self.real {
-            return Ok(());
+            return Ok(now_ms());
         }
         let (shared, timestamp) = self.open_group_sender(account, group_id).await?;
         let mut manager = lock_registered_for_send(&shared).await;
@@ -5829,7 +5829,7 @@ impl Service {
             GroupSelfSync::Blocking,
         )
         .await
-        .map(|_| ())
+        .map(|_| timestamp)
     }
 
     /// 直聊 targeted dataMessage 公共头（pin/unpin 共用）：解析作者 ACI、

@@ -7800,27 +7800,39 @@ fn poll_send_param_faces_and_dispatch_log() {
         "sendPollCreate",
         json!({ "account": number, "groupId": group, "question": "Lunch?", "options": ["Ramen", "Salad"] }),
     );
-    assert_eq!(ok_create["result"], json!({}), "fake create success");
+    assert!(
+        ok_create["result"]["timestamp"].as_u64().is_some(),
+        "create returns its poll timestamp"
+    );
     let ok_create_full = engine.request(
         "sendPollCreate",
         json!({ "account": number, "groupId": group, "question": "Lunch?", "options": ["Ramen", "Salad"], "allowMultiple": true }),
     );
-    assert_eq!(ok_create_full["result"], json!({}));
+    assert!(ok_create_full["result"]["timestamp"].as_u64().is_some());
     let ok_vote = engine.request(
         "sendPollVote",
         json!({ "account": number, "groupId": group, "targetAuthor": "+15555550101", "targetTimestamp": 42, "optionIndexes": [1, 2] }),
     );
-    assert_eq!(ok_vote["result"], json!({}), "fake vote success");
+    assert!(
+        ok_vote["result"]["timestamp"].as_u64().is_some(),
+        "vote returns its send timestamp"
+    );
     let ok_vote_clear = engine.request(
         "sendPollVote",
         json!({ "account": number, "groupId": group, "targetAuthor": "11111111-2222-4333-8444-555555555555", "targetTimestamp": 42, "optionIndexes": [], "voteCount": 3 }),
     );
-    assert_eq!(ok_vote_clear["result"], json!({}), "clearing vote legal");
+    assert!(
+        ok_vote_clear["result"]["timestamp"].as_u64().is_some(),
+        "clearing vote returns its timestamp"
+    );
     let ok_terminate = engine.request(
         "sendPollTerminate",
         json!({ "account": number, "groupId": group, "targetTimestamp": 42 }),
     );
-    assert_eq!(ok_terminate["result"], json!({}), "fake terminate success");
+    assert!(
+        ok_terminate["result"]["timestamp"].as_u64().is_some(),
+        "terminate returns its send timestamp"
+    );
 
     let rejects = [
         // account 缺席（三臂同面，抽 create 代表）。
