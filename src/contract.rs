@@ -64,8 +64,17 @@ mod tests {
         assert!(!workflow.contains("\"min\": \"1.92\""));
         assert!(workflow.contains("rust_constant('src/contract.rs', 'CONTRACT_REVISION')"));
         assert!(workflow.contains("rust_constant('src/contract.rs', 'DESKTOP_API_VERSION')"));
-        assert!(workflow.contains("engine['engineContractRevision'] ="));
-        assert!(workflow.contains("engine['desktopApiVersion'] ="));
+        assert!(workflow.contains(".release/kt-signal-connector/scripts/signal_runtime_catalog.py"));
+        assert!(workflow.contains("repository: kt-im/kt-signal-connector"));
+        assert!(workflow.contains("ref: 3c7ee2ad2e5151a9c5c8c1142334f06322279fd1"));
+        assert!(!workflow.contains("ref: main"));
+        assert!(workflow.contains("matrix.target != 'x86_64-apple-darwin'"));
+        assert!(workflow.contains("bucket.put_object_from_file(key, src"));
+        assert!(workflow.contains(". ./.release-values.env"));
+        assert!(!workflow.contains("os.environ['GITHUB_ENV']"));
+        assert!(workflow.contains("--contract-min \"$ENGINE_CONTRACT_REVISION\""));
+        assert!(workflow.contains("--contract-max \"$ENGINE_CONTRACT_REVISION\""));
+        assert!(workflow.contains("--desktop-api \"$DESKTOP_API_VERSION\""));
     }
 
     /// 与 connector 当前支持区间对齐（connector
