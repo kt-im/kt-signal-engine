@@ -666,6 +666,21 @@
   `stage="ws_frame_to_loop"`；接收语义/ack 时序/错误面零变化，日志不含
   账号与内容。单测：`messagepipe::tests::stamped_envelope_*` /
   `incoming_envelope_carries_the_frame_stamp` / `frame_sampler_*`。
+- `src/websocket/{chat_adapter.rs,mod.rs}`（2026-11-26 official WS 保活收紧
+  与死链自愈批）— ①`chat_adapter.rs` 新增 `OFFICIAL_CHAT_WS_CONFIG`
+  （`local_idle_timeout=20s`、`remote_idle_timeout=30s`，取代
+  `RECOMMENDED_CHAT_WS_CONFIG` 的 `31s/45s`），使空闲半开链早于 30s 探活
+  周期发出 RFC6455 Ping 并在 30s 内收敛；新增 `finish_reason_label` 与
+  `OfficialSocket::last_finish_reason` 保留脱敏结束原因供退出日志消费；
+  ②`websocket/mod.rs` 的 `run_official` 新增
+  `OFFICIAL_REQUEST_RESPONSE_TIMEOUT=12s`（低于连接器 15s 超时预算），
+  并在 `chat.send` 发生超时/断连等传输失败时立即关闭 `requests` 通道（使
+  `slot.rs` 立刻观察到 `is_closed()` 不再复用死链）、按需记录 `3001`/`4409`
+  close code、有界调用 `socket.disconnect()` 并退出循环触发收流重连；
+  `ChatEvent::Finished` 与通道结束路径补齐带 `socket_id`/`close_code`/
+  `reason` 的结构化 `tracing::warn!`。单测：`chat_adapter::tests::
+  official_chat_ws_config_*` / `finish_reason_label_*` 与
+  `websocket::official_ws_tests::*`。
 
 ## 更新纪律
 

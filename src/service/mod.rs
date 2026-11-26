@@ -3033,11 +3033,39 @@ pub(crate) fn is_e164(text: &str) -> bool {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UserStatusError {
     /// 账号在服务器侧已解绑（401）：connector 1.21 靠错误原文识别解绑态。
     Unbound,
-    Internal,
+    /// 账号未在本引擎注册（`open_registered` 缺失）：保持 `-32603` 未知账号面。
+    UnknownAccount,
+    /// `whoami` 触网遇到 WS/超时/5xx 等瞬时上游失败：返回独立 `-1`
+    /// `USER_STATUS_UNAVAILABLE`，不折叠为 `-32603`（避免 connector 误判
+    /// 账号被拒并拉黑 10 分钟）。
+    Unavailable,
+}
+
+/// 将 `manager.whoami().await` 失败归型为 `UserStatusError`：仅 401 判解绑，
+/// 其余 WS/超时/5xx 等瞬时上游失败归 `Unavailable`（绝不折叠为未知账号）。
+fn classify_whoami_error(
+    error: &presage::Error<<SqliteStore as Store>::Error>,
+) -> UserStatusError {
+    match error {
+        presage::Error::ServiceError(
+            presage::libsignal_service::prelude::ServiceError::Unauthorized,
+        ) => UserStatusError::Unbound,
+        _ => UserStatusError::Unavailable,
+    }
+}
+
+/// `getUserStatus` 失败日志的脱敏变体路径（固定字面量，零凭据/号码/正文）。
+fn whoami_error_face(
+    error: &presage::Error<<SqliteStore as Store>::Error>,
+) -> &'static str {
+    match error {
+        presage::Error::ServiceError(service_error) => service_error_variant_face(service_error),
+        other => presage_error_variant_face(other),
+    }
 }
 
 /// engine.deviceCapabilities（D5 设备面注册）错误归型：401 解绑判据与
@@ -7380,7 +7408,10 @@ impl Service {
     }
 
     /// getUserStatus：whoami 轻量鉴权探测（real 模式触网；fake 恒已注册）。
-    /// 仅 401 判解绑——网络等其他失败按内部失败，不误报解绑态。
+    /// 三分面：未知账号（`open_registered` 缺失）→ `UnknownAccount`（-32603）；
+    /// 401 凭据拒收 → `Unbound`（解绑原文零变化）；其余上游/WS/超时失败 →
+    /// `Unavailable`（-1 `USER_STATUS_UNAVAILABLE`，不误报解绑也不折叠为
+    /// 未知账号导致 connector 拉黑 10 分钟）。
     pub(crate) async fn get_user_status(
         self: &Arc<Self>,
         account: &str,
@@ -7390,14 +7421,21 @@ impl Service {
         }
         let shared = open_registered(self, account)
             .await
-            .ok_or(UserStatusError::Internal)?;
+            .ok_or(UserStatusError::UnknownAccount)?;
         let manager = lock_registered_for_send(&shared).await;
         match manager.whoami().await {
             Ok(_) => Ok(()),
-            Err(presage::Error::ServiceError(
-                presage::libsignal_service::prelude::ServiceError::Unauthorized,
-            )) => Err(UserStatusError::Unbound),
-            Err(_) => Err(UserStatusError::Internal),
+            Err(error) => {
+                let classified = classify_whoami_error(&error);
+                if classified == UserStatusError::Unavailable {
+                    tracing::warn!(
+                        target: "engine.user_status",
+                        face = whoami_error_face(&error),
+                        "getUserStatus whoami upstream unavailable"
+                    );
+                }
+                Err(classified)
+            }
         }
     }
 
@@ -33343,6 +33381,63 @@ mod tests {
         service.storage_contexts.invalidate_records(account).await;
         assert_eq!(new.records.cached_slots(), 0);
 
+        drop(service);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// getUserStatus 归型边界：仅 401 归 `Unbound`，WS 超时/断流/5xx 等
+    /// 瞬时上游失败归 `Unavailable`（绝不折叠为 `UnknownAccount`）；未注册
+    /// 账号在 real 模式下不触网直返 `UnknownAccount`。
+    #[tokio::test]
+    async fn get_user_status_separates_unknown_account_unbound_and_unavailable() {
+        use presage::libsignal_service::prelude::ServiceError;
+
+        assert_eq!(
+            classify_whoami_error(&presage::Error::ServiceError(ServiceError::Unauthorized)),
+            UserStatusError::Unbound
+        );
+        assert_eq!(
+            classify_whoami_error(&presage::Error::ServiceError(ServiceError::Timeout {
+                reason: "official chat request timed out",
+            })),
+            UserStatusError::Unavailable
+        );
+        assert_eq!(
+            classify_whoami_error(&presage::Error::ServiceError(ServiceError::WsClosing {
+                reason: "official chat connect failed",
+            })),
+            UserStatusError::Unavailable
+        );
+        assert_eq!(
+            classify_whoami_error(&presage::Error::ServiceError(
+                ServiceError::UnhandledResponseCode {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    body: String::new(),
+                },
+            )),
+            UserStatusError::Unavailable
+        );
+        assert_eq!(
+            whoami_error_face(&presage::Error::ServiceError(ServiceError::Timeout {
+                reason: "official chat request timed out",
+            })),
+            "ServiceError::Timeout"
+        );
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "kt-engine-user-status-unknown-{:016x}",
+            mix_seed_step(mix_seed())
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let state = Arc::new(AsyncMutex::new(
+            EngineState::load(&data_dir).expect("state"),
+        ));
+        let (outbound, _rx) = outbound::test_hub();
+        let service = Service::new(data_dir.clone(), state, outbound);
+        assert_eq!(
+            service.get_user_status("+15559990000").await,
+            Err(UserStatusError::UnknownAccount)
+        );
         drop(service);
         let _ = std::fs::remove_dir_all(&data_dir);
     }

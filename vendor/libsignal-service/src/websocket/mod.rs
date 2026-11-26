@@ -71,6 +71,13 @@ const KEEPALIVE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// silently died (the 2026-10-21 silent-receive incident).
 const REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-request response budget on the official `libsignal-net` chat transport.
+/// Kept strictly shorter than the connector's 15s watchdog/RPC timeout so a
+/// half-open official socket fails fast, actively disconnects, and hands over
+/// before the caller times out.
+#[cfg(feature = "cdsi")]
+const OFFICIAL_REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(12);
+
 /// A single websocket frame write that cannot complete within this budget is
 /// a dead transport. Without it a half-open socket can block the I/O pump
 /// (and every timer in it) forever.
@@ -1150,6 +1157,58 @@ mod keepalive_tests {
 }
 
 #[cfg(feature = "cdsi")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OfficialTaskOutcome {
+    Done,
+    CloseLink {
+        close_code: Option<u16>,
+        reason: &'static str,
+    },
+}
+
+/// Classifies an official `ChatConnection::send` failure into whether the
+/// underlying socket must be torn down so `slot.rs` does not reuse a half-open
+/// dead link. Local request/response formatting errors leave the link open.
+#[cfg(feature = "cdsi")]
+fn official_send_failure_action(
+    error: &libsignal_net::chat::SendError,
+) -> Option<(Option<u16>, &'static str)> {
+    use libsignal_net::chat::SendError;
+    match error {
+        SendError::RequestTimedOut => {
+            Some((Some(CLOSE_CODE_TIMEOUT), "request_timeout"))
+        }
+        SendError::Disconnected => Some((None, "disconnected")),
+        SendError::ConnectedElsewhere => {
+            Some((Some(CLOSE_CODE_CONNECTED_ELSEWHERE), "connected_elsewhere"))
+        }
+        SendError::ConnectionInvalidated => {
+            Some((None, "connection_invalidated"))
+        }
+        SendError::WebSocket(_) => Some((None, "websocket_error")),
+        SendError::IncomingDataInvalid | SendError::RequestHasInvalidHeader => {
+            None
+        }
+    }
+}
+
+#[cfg(feature = "cdsi")]
+fn official_send_service_error(
+    error: &libsignal_net::chat::SendError,
+) -> ServiceError {
+    match error {
+        libsignal_net::chat::SendError::RequestTimedOut => {
+            ServiceError::Timeout {
+                reason: "official chat request timed out",
+            }
+        }
+        _ => ServiceError::Timeout {
+            reason: "official chat request failed",
+        },
+    }
+}
+
+#[cfg(feature = "cdsi")]
 async fn run_official(
     mut socket: crate::websocket::chat_adapter::OfficialSocket,
     mut requests: mpsc::Receiver<(
@@ -1165,16 +1224,25 @@ async fn run_official(
 
     let chat = socket.chat();
     let mut latency = FrameLatencySampler::new();
-    let mut acks: FuturesUnordered<BoxFuture<'static, ()>> =
-        std::iter::once(Box::pin(futures::future::pending()) as BoxFuture<'static, ()>)
-            .collect();
+    let mut acks: FuturesUnordered<BoxFuture<'static, OfficialTaskOutcome>> =
+        std::iter::once(Box::pin(futures::future::pending())
+            as BoxFuture<'static, OfficialTaskOutcome>)
+        .collect();
 
     loop {
         futures::select! {
             _ = kill.notified().fuse() => {
+                requests.close();
+                tracing::warn!(
+                    target: "signal.pipe",
+                    stage = "ws_official_terminated",
+                    socket_id,
+                    close_code = CLOSE_CODE_LOCAL_HANDOVER,
+                    "official websocket terminating by local single-connection discipline"
+                );
                 shared.lock().unwrap().last_close_code =
                     Some(CLOSE_CODE_LOCAL_HANDOVER);
-                socket.disconnect().await;
+                let _ = tokio::time::timeout(CLOSE_TIMEOUT, socket.disconnect()).await;
                 break;
             }
             request = requests.next() => {
@@ -1182,29 +1250,44 @@ async fn run_official(
                     Some((request, responder)) => {
                         let chat = Arc::clone(&chat);
                         acks.push(Box::pin(async move {
-                            let response = chat
-                                .send(
-                                    match request.try_into() {
-                                        Ok(request) => request,
-                                        Err(_) => {
-                                            let _ = responder.send(Err(ServiceError::Timeout {
-                                                reason: "official chat request conversion failed",
-                                            }));
-                                            return;
-                                        }
-                                    },
-                                    REQUEST_RESPONSE_TIMEOUT,
-                                )
+                            let converted = match request.try_into() {
+                                Ok(request) => request,
+                                Err(_) => {
+                                    let _ = responder.send(Err(ServiceError::Timeout {
+                                        reason: "official chat request conversion failed",
+                                    }));
+                                    return OfficialTaskOutcome::Done;
+                                }
+                            };
+                            match chat
+                                .send(converted, OFFICIAL_REQUEST_RESPONSE_TIMEOUT)
                                 .await
-                                .map_err(|_| ServiceError::Timeout {
-                                    reason: "official chat request failed",
-                                })
-                                .and_then(|response| response.try_into().map_err(|_| {
-                                    ServiceError::Timeout {
-                                        reason: "official chat response conversion failed",
+                            {
+                                Ok(response) => {
+                                    let mapped = response.try_into().map_err(|_| {
+                                        ServiceError::Timeout {
+                                            reason: "official chat response conversion failed",
+                                        }
+                                    });
+                                    let _ = responder.send(mapped);
+                                    OfficialTaskOutcome::Done
+                                }
+                                Err(error) => {
+                                    let service_error =
+                                        official_send_service_error(&error);
+                                    let action =
+                                        official_send_failure_action(&error);
+                                    let _ = responder.send(Err(service_error));
+                                    if let Some((close_code, reason)) = action {
+                                        OfficialTaskOutcome::CloseLink {
+                                            close_code,
+                                            reason,
+                                        }
+                                    } else {
+                                        OfficialTaskOutcome::Done
                                     }
-                                }));
-                            let _ = responder.send(response);
+                                }
+                            }
                         }));
                     }
                     None => break,
@@ -1247,17 +1330,107 @@ async fn run_official(
                                     .unwrap_or(reqwest::StatusCode::OK);
                                 let _ = responder.send_response(status);
                             }
+                            OfficialTaskOutcome::Done
                         }));
                     }
                     Some(ChatEvent::Finished(code)) => {
+                        requests.close();
+                        let reason =
+                            socket.last_finish_reason().unwrap_or("unknown");
+                        tracing::warn!(
+                            target: "signal.pipe",
+                            stage = "ws_official_finished",
+                            socket_id,
+                            close_code = ?code,
+                            reason,
+                            "official websocket finished"
+                        );
                         shared.lock().unwrap().last_close_code = code;
                         break;
                     }
                     Some(ChatEvent::Other) => {}
-                    None => break,
+                    None => {
+                        requests.close();
+                        tracing::warn!(
+                            target: "signal.pipe",
+                            stage = "ws_official_finished",
+                            socket_id,
+                            close_code = ?None::<u16>,
+                            reason = "event_channel_closed",
+                            "official websocket event stream ended"
+                        );
+                        break;
+                    }
                 }
             }
-            _ = acks.next() => {}
+            outcome = acks.next() => {
+                if let Some(OfficialTaskOutcome::CloseLink { close_code, reason }) =
+                    outcome
+                {
+                    requests.close();
+                    {
+                        let mut guard = shared.lock().unwrap();
+                        if guard.last_close_code.is_none() {
+                            guard.last_close_code = close_code;
+                        }
+                    }
+                    tracing::warn!(
+                        target: "signal.pipe",
+                        stage = "ws_official_send_failed",
+                        socket_id,
+                        close_code = ?close_code,
+                        reason,
+                        "official chat request failed; disconnecting dead socket"
+                    );
+                    let _ = tokio::time::timeout(
+                        CLOSE_TIMEOUT,
+                        socket.disconnect(),
+                    )
+                    .await;
+                    break;
+                }
+            }
         }
+    }
+}
+
+#[cfg(all(test, feature = "cdsi"))]
+mod official_ws_tests {
+    use super::*;
+    use libsignal_net::chat::SendError;
+
+    #[test]
+    fn official_request_timeout_is_under_fifteen_second_watchdog_budget() {
+        assert_eq!(OFFICIAL_REQUEST_RESPONSE_TIMEOUT, Duration::from_secs(12));
+        assert!(OFFICIAL_REQUEST_RESPONSE_TIMEOUT < Duration::from_secs(15));
+        assert!(OFFICIAL_REQUEST_RESPONSE_TIMEOUT < REQUEST_RESPONSE_TIMEOUT);
+    }
+
+    #[test]
+    fn official_send_failure_action_closes_dead_links_and_preserves_4409() {
+        assert_eq!(
+            official_send_failure_action(&SendError::RequestTimedOut),
+            Some((Some(CLOSE_CODE_TIMEOUT), "request_timeout"))
+        );
+        assert_eq!(
+            official_send_failure_action(&SendError::Disconnected),
+            Some((None, "disconnected"))
+        );
+        assert_eq!(
+            official_send_failure_action(&SendError::ConnectedElsewhere),
+            Some((Some(CLOSE_CODE_CONNECTED_ELSEWHERE), "connected_elsewhere"))
+        );
+        assert_eq!(
+            official_send_failure_action(&SendError::ConnectionInvalidated),
+            Some((None, "connection_invalidated"))
+        );
+        assert_eq!(
+            official_send_failure_action(&SendError::IncomingDataInvalid),
+            None
+        );
+        assert_eq!(
+            official_send_failure_action(&SendError::RequestHasInvalidHeader),
+            None
+        );
     }
 }

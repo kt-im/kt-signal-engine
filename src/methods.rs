@@ -42,6 +42,11 @@ const LINK_ATTEMPT_NOT_FOUND: &str = "LINK_ATTEMPT_NOT_FOUND";
 const USER_UNBOUND_MESSAGE: &str =
     "Failed to send message: Authorization failed! (AuthorizationFailedException)";
 
+/// getUserStatus 瞬时上游/WS/超时失败的结构化错误码（-1，与
+/// STORAGE_UNAVAILABLE / DEVICES_UNAVAILABLE 同风格）：不折叠成 -32603，
+/// 避免 connector 将网络抖动误判为未知账号拒收并拉黑 10 分钟。
+const USER_STATUS_UNAVAILABLE: &str = "USER_STATUS_UNAVAILABLE";
+
 /// 服务端限流错误原文（wire 字面量与 connector 侧配套；锚词
 /// "(RateLimitExceeded)" 供分类器命中）。
 const RATE_LIMITED_MESSAGE: &str = "Failed to send message: Rate limited. (RateLimitExceeded)";
@@ -2491,7 +2496,8 @@ async fn dispatch(
                 Err(error) => send_error(id, error),
             }
         }
-        // getUserStatus：real 模式 whoami 探测（解绑态契约原文见 §3 头）；
+        // getUserStatus：real 模式 whoami 探测（解绑态契约原文见 §3 头；
+        // 未知账号保留 -32603，上游/WS/超时失败返回 -1 USER_STATUS_UNAVAILABLE）；
         // fake 模式恒已注册。
         "getUserStatus" => {
             let account = params
@@ -2500,10 +2506,7 @@ async fn dispatch(
                 .unwrap_or_default();
             match service.get_user_status(account).await {
                 Ok(()) => jsonrpc::success_response(id, json!({ "isRegistered": true })),
-                Err(UserStatusError::Unbound) => {
-                    jsonrpc::error_response(id, &RpcError::new(-32603, USER_UNBOUND_MESSAGE))
-                }
-                Err(UserStatusError::Internal) => internal_error(id),
+                Err(error) => user_status_error(id, error),
             }
         }
         // ---- KT 扩展方法（独立命名空间，非 signal-cli 兼容面）----
@@ -5558,6 +5561,22 @@ fn phone_lookup_error(id: &Value, error: &crate::service::phone::PhoneLookupErro
     }
 }
 
+/// getUserStatus 错误折叠：401 解绑保持 `-32603` + 解绑原文（Contract 1.21
+/// / 1.275 零变化）；未知账号保持 `-32603`（`Internal error`）；whoami 遇到
+/// WS/超时/5xx 等瞬时上游失败返回 `-1` + `USER_STATUS_UNAVAILABLE`，避免
+/// connector 误判为账号被拒并拉黑 10 分钟。
+fn user_status_error(id: &Value, error: UserStatusError) -> Value {
+    match error {
+        UserStatusError::Unbound => {
+            jsonrpc::error_response(id, &RpcError::new(-32603, USER_UNBOUND_MESSAGE))
+        }
+        UserStatusError::UnknownAccount => internal_error(id),
+        UserStatusError::Unavailable => {
+            jsonrpc::error_response(id, &RpcError::new(-1, USER_STATUS_UNAVAILABLE))
+        }
+    }
+}
+
 /// send 系错误 → JSON-RPC 错误码：目标群已终止（官方 shouldSendToConversation
 /// terminated 位硬拒同语义）→ `-1` + `SEND_TARGET_TERMINATED`；服务端凭据
 /// 拒绝（401 解绑，确定性失败不重试）→ `-32603` + getUserStatus 同款解绑
@@ -5853,6 +5872,32 @@ mod tests {
         );
         assert!(USER_UNBOUND_MESSAGE.contains("AuthorizationFailedException"));
         assert!(USER_UNBOUND_MESSAGE.contains("Authorization failed"));
+    }
+
+    /// getUserStatus 错误三分面钉形：Unbound 保持 `-32603` + 解绑原文零变化
+    /// （保护 Contract 1.21/1.275）；UnknownAccount 保持 `-32603` Internal error；
+    /// Unavailable 返回 `-1` + `USER_STATUS_UNAVAILABLE`（无 data 字段），不折叠
+    /// `-32603` 以免 connector 误判账号被拒并拉黑 10 分钟。
+    #[test]
+    fn user_status_error_separates_unbound_unknown_account_and_unavailable() {
+        let unbound = user_status_error(&Value::from(11), UserStatusError::Unbound);
+        assert_eq!(unbound.get("id").and_then(Value::as_i64), Some(11));
+        assert_eq!(unbound["error"]["code"], json!(-32603));
+        assert_eq!(unbound["error"]["message"], json!(USER_UNBOUND_MESSAGE));
+
+        let unknown = user_status_error(&Value::from(12), UserStatusError::UnknownAccount);
+        assert_eq!(unknown.get("id").and_then(Value::as_i64), Some(12));
+        assert_eq!(unknown["error"]["code"], json!(-32603));
+        assert_eq!(unknown["error"]["message"], json!("Internal error"));
+
+        let unavailable = user_status_error(&Value::from(13), UserStatusError::Unavailable);
+        assert_eq!(unavailable.get("id").and_then(Value::as_i64), Some(13));
+        assert_eq!(unavailable["error"]["code"], json!(-1));
+        assert_eq!(
+            unavailable["error"]["message"],
+            json!(USER_STATUS_UNAVAILABLE)
+        );
+        assert!(unavailable["error"].get("data").is_none());
     }
 
     /// send failures additive 面分类一致性：per-recipient 失败条目的

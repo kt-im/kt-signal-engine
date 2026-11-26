@@ -8,6 +8,7 @@
 #![cfg(feature = "cdsi")]
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use prost::Message as _;
 use libsignal_net::chat::{
@@ -21,6 +22,22 @@ use libsignal_net::env::UserAgent;
 use libsignal_net_infra::route::{
     RouteProvider, TransportRoute, UnresolvedHttpsServiceRoute, UsePreconnect,
 };
+
+/// Tighter keepalive and idle-disconnect thresholds for the official chat WS.
+///
+/// Upstream `RECOMMENDED_CHAT_WS_CONFIG` uses `local_idle_timeout = 31s` and
+/// `remote_idle_timeout = 45s`, which never sends an RFC6455 Ping between 30s
+/// watchdog probes and waits `15s + RTT` before closing a half-open socket.
+/// `20s / 30s` probes idle links before the 30s probe cadence while keeping a
+/// 10s Pong window.
+pub const OFFICIAL_CHAT_WS_CONFIG: libsignal_net::chat::ws::Config =
+    libsignal_net::chat::ws::Config {
+        local_idle_timeout: Duration::from_secs(20),
+        post_request_interface_check_timeout: RECOMMENDED_CHAT_WS_CONFIG
+            .post_request_interface_check_timeout,
+        remote_idle_timeout: Duration::from_secs(30),
+        initial_request_id: RECOMMENDED_CHAT_WS_CONFIG.initial_request_id,
+    };
 
 /// Starts an authenticated official chat connection and returns it with a
 /// no-op listener. The caller is expected to supply the real listener.
@@ -43,7 +60,7 @@ where
         route,
         "/v1/websocket/",
         user_agent,
-        RECOMMENDED_CHAT_WS_CONFIG,
+        OFFICIAL_CHAT_WS_CONFIG,
         Some(headers),
         "kt-signal-chat",
     )
@@ -156,15 +173,60 @@ pub fn finish_close_code(
     }
 }
 
+/// Classifies an official finish result into a sanitized static label for
+/// structured disconnect logs.
+pub fn finish_reason_label(
+    result: &Result<FinishReason, FinishError>,
+) -> &'static str {
+    match result {
+        Ok(FinishReason::LocalDisconnect) => "local_disconnect",
+        Ok(FinishReason::RemoteDisconnect) => "remote_disconnect",
+        Err(FinishError::Unknown) => "unknown",
+        Err(FinishError::Error(TaskExitError::SendIo(_))) => "send_io",
+        Err(FinishError::Error(TaskExitError::SendTooLarge { .. })) => {
+            "send_too_large"
+        }
+        Err(FinishError::Error(TaskExitError::SendProtocol(_))) => {
+            "send_protocol"
+        }
+        Err(FinishError::Error(TaskExitError::WebsocketError(error))) => {
+            match error {
+                NextEventError::PingFailed(_) => "ping_failed",
+                NextEventError::CloseFailed(_) => "close_failed",
+                NextEventError::AbnormalServerClose { .. } => {
+                    "abnormal_server_close"
+                }
+                NextEventError::ReceiveError(_) => "receive_error",
+                NextEventError::ServerIdleTimeout(_) => "server_idle_timeout",
+                NextEventError::UnexpectedConnectionClose => {
+                    "unexpected_connection_close"
+                }
+            }
+        }
+    }
+}
+
 /// Builds the official listener closure. It only classifies and forwards;
 /// no decryption, database work or network calls are allowed here.
 pub fn listener(sender: UnboundedSender<ChatEvent>) -> EventListener {
+    listener_with_reason(sender, None)
+}
+
+fn listener_with_reason(
+    sender: UnboundedSender<ChatEvent>,
+    finish_reason: Option<Arc<Mutex<Option<&'static str>>>>,
+) -> EventListener {
     Box::new(move |event| {
         let mapped = match event {
             ListenerEvent::ReceivedMessage(request, responder) => {
                 ChatEvent::Incoming(map_incoming(request, responder))
             }
             ListenerEvent::Finished(result) => {
+                if let Some(slot) = &finish_reason {
+                    if let Ok(mut guard) = slot.lock() {
+                        *guard = Some(finish_reason_label(&result));
+                    }
+                }
                 ChatEvent::Finished(finish_close_code(&result))
             }
             _ => ChatEvent::Other,
@@ -182,6 +244,7 @@ pub fn listener(sender: UnboundedSender<ChatEvent>) -> EventListener {
 pub struct OfficialSocket {
     chat: std::sync::Arc<ChatConnection>,
     events: tokio::sync::mpsc::UnboundedReceiver<ChatEvent>,
+    finish_reason: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl OfficialSocket {
@@ -189,11 +252,27 @@ impl OfficialSocket {
         chat: ChatConnection,
         events: tokio::sync::mpsc::UnboundedReceiver<ChatEvent>,
     ) -> Self {
-        Self { chat: std::sync::Arc::new(chat), events }
+        Self::new_with_finish_reason(chat, events, Arc::new(Mutex::new(None)))
+    }
+
+    fn new_with_finish_reason(
+        chat: ChatConnection,
+        events: tokio::sync::mpsc::UnboundedReceiver<ChatEvent>,
+        finish_reason: Arc<Mutex<Option<&'static str>>>,
+    ) -> Self {
+        Self {
+            chat: std::sync::Arc::new(chat),
+            events,
+            finish_reason,
+        }
     }
 
     pub fn chat(&self) -> std::sync::Arc<ChatConnection> {
         std::sync::Arc::clone(&self.chat)
+    }
+
+    pub fn last_finish_reason(&self) -> Option<&'static str> {
+        self.finish_reason.lock().ok().and_then(|guard| *guard)
     }
 
     pub async fn send(
@@ -269,13 +348,14 @@ where
     R: RouteProvider<Route = UnresolvedHttpsServiceRoute>,
 {
     let (sender, events) = tokio::sync::mpsc::unbounded_channel();
+    let finish_reason = Arc::new(Mutex::new(None));
     let pending = ChatConnection::start_connect_with(
         resources,
         service,
         route,
         "/v1/websocket/",
         user_agent,
-        RECOMMENDED_CHAT_WS_CONFIG,
+        OFFICIAL_CHAT_WS_CONFIG,
         Some(headers),
         "kt-signal-chat",
     )
@@ -285,9 +365,13 @@ where
         tokio::runtime::Handle::current(),
         pending,
         HashMap::new(),
-        listener(sender),
+        listener_with_reason(sender, Some(Arc::clone(&finish_reason))),
     );
-    Ok(OfficialSocket::new(chat, events))
+    Ok(OfficialSocket::new_with_finish_reason(
+        chat,
+        events,
+        finish_reason,
+    ))
 }
 
 #[cfg(test)]
@@ -311,6 +395,66 @@ mod tests {
             None
         );
         assert_eq!(finish_close_code(&Err(FinishError::Unknown)), None);
+    }
+
+    #[test]
+    fn official_chat_ws_config_probes_before_thirty_second_watchdog() {
+        assert_eq!(
+            OFFICIAL_CHAT_WS_CONFIG.local_idle_timeout,
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            OFFICIAL_CHAT_WS_CONFIG.remote_idle_timeout,
+            Duration::from_secs(30)
+        );
+        assert!(
+            OFFICIAL_CHAT_WS_CONFIG.local_idle_timeout
+                < OFFICIAL_CHAT_WS_CONFIG.remote_idle_timeout
+        );
+        assert!(
+            OFFICIAL_CHAT_WS_CONFIG.remote_idle_timeout
+                - OFFICIAL_CHAT_WS_CONFIG.local_idle_timeout
+                >= Duration::from_secs(10)
+        );
+        assert!(
+            OFFICIAL_CHAT_WS_CONFIG.remote_idle_timeout
+                < RECOMMENDED_CHAT_WS_CONFIG.remote_idle_timeout
+        );
+    }
+
+    #[test]
+    fn finish_reason_label_classifies_idle_timeout_and_transport_errors() {
+        assert_eq!(
+            finish_reason_label(&Ok(FinishReason::LocalDisconnect)),
+            "local_disconnect"
+        );
+        assert_eq!(
+            finish_reason_label(&Ok(FinishReason::RemoteDisconnect)),
+            "remote_disconnect"
+        );
+        assert_eq!(finish_reason_label(&Err(FinishError::Unknown)), "unknown");
+        assert_eq!(
+            finish_reason_label(&Err(FinishError::Error(
+                TaskExitError::WebsocketError(
+                    NextEventError::ServerIdleTimeout(Duration::from_secs(30)),
+                ),
+            ))),
+            "server_idle_timeout"
+        );
+        assert_eq!(
+            finish_reason_label(&Err(FinishError::Error(
+                TaskExitError::WebsocketError(
+                    NextEventError::UnexpectedConnectionClose,
+                ),
+            ))),
+            "unexpected_connection_close"
+        );
+        assert_eq!(
+            finish_reason_label(&Err(FinishError::Error(
+                TaskExitError::SendIo(std::io::ErrorKind::BrokenPipe),
+            ))),
+            "send_io"
+        );
     }
 
     #[test]
